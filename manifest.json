@@ -1,0 +1,84 @@
+{
+  "manifest_version": 2,
+  "name": "Workspaces",
+  "version": "2.6.14",
+  "description": "A workspace manager for Firefox \u00e2\u20ac\u201d Hardfox edition",
+  "icons": {
+    "64": "icons/layered-dark.svg",
+    "128": "icons/layered-dark.svg"
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "workspaces@hardfox",
+      "strict_min_version": "140.0",
+      "data_collection_permissions": {
+        "required": [
+          "none"
+        ]
+      }
+    }
+  },
+  "permissions": [
+    "tabs",
+    "tabHide",
+    "tabGroups",
+    "storage",
+    "menus",
+    "sessions",
+    "contextualIdentities",
+    "cookies",
+    "theme"
+  ],
+  "commands": {
+    "workspace-next": {
+      "suggested_key": {
+        "default": "Alt+Period"
+      },
+      "description": "Switch to next workspace"
+    },
+    "workspace-prev": {
+      "suggested_key": {
+        "default": "Alt+Comma"
+      },
+      "description": "Switch to previous workspace"
+    },
+    "_execute_browser_action": {
+      "suggested_key": {
+        "default": "Alt+W"
+      },
+      "description": "Open Workspaces popup"
+    }
+  },
+  "content_security_policy": "script-src 'self'; object-src 'self'",
+  "omnibox": {
+    "keyword": "ws"
+  },
+  "browser_action": {
+    "browser_style": false,
+    "default_area": "tabstrip",
+    "default_icon": {
+      "64": "icons/layered-dark.svg"
+    },
+    "default_title": "Workspaces",
+    "default_popup": "popup/wsp.html",
+    "theme_icons": [
+      {
+        "light": "icons/layered-light.svg",
+        "dark": "icons/layered-dark.svg",
+        "size": 64
+      }
+    ]
+  },
+  "background": {
+    "scripts": [
+      "backend/storage.js",
+      "backend/workspace.js",
+      "backend/ui-service.js",
+      "backend/menu-service.js",
+      "backend/workspace-service.js",
+      "backend/tab-service.js",
+      "backend/brainer.js",
+      "backend/handler.js"
+    ]
+  }
+}

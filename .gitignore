@@ -1,0 +1,19 @@
+# Build artifacts
+web-ext-artifacts/
+*.xpi
+.amo-upload-uuid
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment
+.env
+.env.local

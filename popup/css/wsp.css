@@ -1,0 +1,1202 @@
+/* ============================================================
+   Firefox Workspaces — Native Firefox Panel Stylesheet
+   Uses CSS system colors to inherit the user's Firefox/OS theme.
+   Falls back gracefully in non-supporting contexts.
+   ============================================================ */
+
+/* ----------------------------------------------------------
+   1. CSS Custom Properties (mapped to CSS system colors)
+   ---------------------------------------------------------- */
+:root {
+  /* Panel colors — injected by applyFirefoxTheme() from the browser.theme API
+     as --ff-popup-* custom properties; fall back to CSS system colors for
+     themes that omit specific popup color keys. */
+  --wsp-bg:             var(--ff-popup-bg,    -moz-Dialog);
+  --wsp-color:          var(--ff-popup-text,  -moz-DialogText);
+  --wsp-border:         var(--ff-popup-border, ThreeDShadow);
+  --wsp-text-secondary: GrayText;
+  --wsp-hover:          var(--ff-popup-highlight, color-mix(in srgb, var(--wsp-color) 8%, transparent));
+  --wsp-active:         color-mix(in srgb, var(--ff-popup-highlight, var(--wsp-color)) 20%, transparent);
+  --wsp-primary:        AccentColor;
+  --wsp-primary-hover:  color-mix(in srgb, AccentColor 85%, CanvasText);
+  --wsp-primary-active: color-mix(in srgb, AccentColor 72%, CanvasText);
+  --wsp-btn-bg:         ButtonFace;
+  --wsp-btn-hover:      color-mix(in srgb, ButtonFace 80%, ButtonText);
+  --wsp-input-bg:       var(--ff-popup-bg, Field);
+  --wsp-input-border:   var(--ff-popup-border, ThreeDShadow);
+  --wsp-focus:          AccentColor;
+
+  /* Geometry — Firefox Proton uses a 4px grid */
+  --wsp-radius-sm: 4px;
+  --wsp-radius-md: 8px;
+
+  /* Layout dimensions (extracted from inline values) */
+  --wsp-popup-max-height: 520px;
+  --wsp-preview-max-width: 340px;
+  --wsp-icon-picker-max-height: 340px;
+  --wsp-dialog-max-width: 388px;
+
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--wsp-color) 18%, transparent) transparent;
+
+  /* Tooltip scrollbar thumb */
+  --wsp-preview-thumb: color-mix(in srgb, var(--wsp-color) 15%, transparent);
+
+  /* Initial color-scheme before JS applies data-theme; 'light dark' lets the
+     browser pick the correct system-color palette from OS preference until the
+     theme detection resolves. The [data-theme] rules below override this. */
+  color-scheme: light dark;
+}
+
+/* Fallback for browsers that do not support -moz-Dialog:
+   Use standard CSS system colors (Canvas/CanvasText).
+   Firefox supports -moz-Dialog, so this is a safety net only. */
+@supports not (background: -moz-Dialog) {
+  :root {
+    --wsp-bg:           var(--ff-popup-bg,    Canvas);
+    --wsp-color:        var(--ff-popup-text,  CanvasText);
+    --wsp-border:       var(--ff-popup-border, color-mix(in srgb, CanvasText 20%, transparent));
+    --wsp-input-bg:     var(--ff-popup-bg, Field);
+    --wsp-input-border: var(--ff-popup-border, color-mix(in srgb, CanvasText 25%, transparent));
+  }
+}
+
+/* color-scheme tells the browser which system color palette to use,
+   so -moz-Dialog and other system colors resolve to the correct theme. */
+:root[data-theme="light"] { color-scheme: light; }
+:root[data-theme="dark"]  { color-scheme: dark;  }
+
+/* SVG icons use fill="currentColor" which resolves to black in <img>;
+   invert them when the Firefox theme is dark (detected via JS -> data-theme). */
+:root[data-theme="dark"] .icon-picker-btn img,
+:root[data-theme="dark"] .icon-grid button img,
+:root[data-theme="dark"] li.wsp-list-item img.wsp-icon {
+  filter: invert(1);
+}
+
+/* ----------------------------------------------------------
+   2. Reset
+   ---------------------------------------------------------- */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+/* Explicit display values (e.g. display:flex) override the HTML hidden
+   attribute's UA-level display:none.  This global rule ensures [hidden]
+   always wins, matching normalize.css / modern-normalize convention. */
+[hidden] { display: none !important; }
+
+html {
+  font-size: 13px;
+  background: var(--wsp-bg);
+}
+
+body {
+  font-family: system-ui, -apple-system, sans-serif;
+  inline-size: 400px;
+  max-inline-size: 400px;
+  background: var(--wsp-bg);
+  color: var(--wsp-color);
+  line-height: 1.4;
+  -webkit-font-smoothing: antialiased;
+  overflow: visible;
+}
+
+/* ----------------------------------------------------------
+   3. Container & Header
+   ---------------------------------------------------------- */
+.container {
+  overflow-x: hidden;
+  overflow-y: auto;
+  background: var(--wsp-bg);
+  max-height: var(--wsp-popup-max-height);
+  position: relative;
+}
+
+.title {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  padding: 10px 14px;
+  background: var(--wsp-bg);
+  color: var(--wsp-color);
+  border-bottom: 1px solid var(--wsp-border);
+}
+
+.title::before {
+  content: "";
+  display: inline-block;
+  width: 16px;
+  height: 16px;
+  background: var(--wsp-text-secondary);
+  mask-image: url("../img/workspace-icon.svg");
+  mask-repeat: no-repeat;
+  mask-position: center;
+  mask-size: contain;
+  -webkit-mask-image: url("../img/workspace-icon.svg");
+  -webkit-mask-repeat: no-repeat;
+  -webkit-mask-position: center;
+  -webkit-mask-size: contain;
+  flex-shrink: 0;
+}
+
+/* Color mode toggle button in the title bar */
+#wsp-color-toggle {
+  margin-inline-start: auto;
+  width: 20px;
+  height: 20px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  border-radius: var(--wsp-radius-sm);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0.45;
+  transition: opacity 0.1s, background-color 0.1s;
+  padding: 0;
+  flex-shrink: 0;
+}
+
+#wsp-color-toggle::after {
+  content: "";
+  display: block;
+  width: 14px;
+  height: 14px;
+  background: var(--wsp-text-secondary);
+  mask-image: url("../img/palette.svg");
+  mask-repeat: no-repeat;
+  mask-position: center;
+  mask-size: contain;
+  -webkit-mask-image: url("../img/palette.svg");
+  -webkit-mask-repeat: no-repeat;
+  -webkit-mask-position: center;
+  -webkit-mask-size: contain;
+}
+
+#wsp-color-toggle:hover { opacity: 0.85; background: var(--wsp-hover); }
+#wsp-color-toggle.active { opacity: 1; }
+#wsp-color-toggle.active::after { background: var(--wsp-primary); }
+
+/* ----------------------------------------------------------
+   4. Tab Search (Tier 3)
+   ---------------------------------------------------------- */
+.wsp-search {
+  padding: 6px 8px;
+  background: var(--wsp-bg);
+  border-bottom: 1px solid var(--wsp-border);
+}
+
+#wsp-search-input {
+  width: 100%;
+  padding: 5px 8px;
+  border: 1px solid var(--wsp-input-border);
+  border-radius: var(--wsp-radius-sm);
+  background: var(--wsp-input-bg);
+  color: var(--wsp-color);
+  font-family: inherit;
+  font-size: 12px;
+  outline: none;
+  transition: border-color 0.12s ease-out;
+}
+
+#wsp-search-input:focus {
+  outline: 2px solid var(--wsp-focus);
+  outline-offset: -2px;
+  border-color: transparent;
+}
+
+#wsp-search-input::placeholder {
+  color: var(--wsp-text-secondary);
+  opacity: 0.8;
+}
+
+.wsp-search-results {
+  padding: 4px;
+}
+
+.wsp-search-result {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 10px;
+  margin: 2px 4px;
+  border-radius: var(--wsp-radius-sm);
+  cursor: default;
+  transition: background-color 0.08s ease-out;
+}
+
+.wsp-search-result:hover {
+  background: var(--wsp-hover);
+}
+
+.wsp-search-result-title {
+  flex: 1;
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.wsp-search-result-wsp {
+  font-size: 11px;
+  color: var(--wsp-text-secondary);
+  white-space: nowrap;
+}
+
+.wsp-search-empty {
+  padding: 16px;
+  text-align: center;
+  color: var(--wsp-text-secondary);
+  font-size: 12px;
+}
+
+/* ----------------------------------------------------------
+   5. Workspace List
+   ---------------------------------------------------------- */
+#wsp-list {
+  list-style: none;
+  min-height: 100px;
+  background: var(--wsp-bg);
+  padding: 4px;
+}
+
+li.wsp-list-item {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  padding-inline-end: 56px;
+  margin: 2px 4px;
+  border-radius: var(--wsp-radius-sm);
+  background: transparent;
+  color: var(--wsp-color);
+  font-size: 13px;
+  font-weight: 400;
+  cursor: default;
+  transition: background-color 0.08s ease-out, opacity 0.15s ease-out, transform 0.15s ease-out;
+  user-select: none;
+}
+
+li.wsp-list-item:hover {
+  background: var(--wsp-hover);
+}
+
+li.wsp-list-item:active {
+  background: var(--wsp-active);
+}
+
+/* Workspace color bar — inactive items with a color get a subtle 2px bar.
+   border-left-color is set via inline style by _applyColorBar() in JS. */
+li.wsp-list-item.has-color {
+  border-left: 2px solid transparent;
+  padding-left: 8px;
+}
+
+/* Active workspace highlight bar */
+li.wsp-list-item.active {
+  background: var(--wsp-hover);
+  font-weight: 600;
+  border-left: 3px solid var(--wsp-primary);
+  padding-left: 7px;
+}
+
+/* Active with a color — bold 3px bar using workspace color.
+   border-left-color is set via inline style by _applyColorBar() in JS.
+   The .active shorthand above sets color to AccentColor, but the inline
+   style has highest specificity and overrides it. Do NOT convert .active
+   to longhand or add a shorthand here — it would break the override. */
+li.wsp-list-item.active.has-color {
+  border-left-width: 3px;
+  border-left-style: solid;
+}
+
+li.wsp-list-item img.wsp-icon {
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+  opacity: 0.85;
+}
+
+li.wsp-list-item .wsp-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+li.wsp-list-item .tabs-qty {
+  font-size: 11.5px;
+  font-weight: 400;
+  color: var(--wsp-text-secondary);
+  white-space: nowrap;
+  margin-inline-start: auto;
+}
+
+/* Container color dot (Tier 2) */
+.wsp-container-dot {
+  flex-shrink: 0;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+/* Drag and Drop (Tier 3) */
+li.wsp-list-item.dragging {
+  opacity: 0.4;
+}
+
+li.wsp-list-item.drag-over {
+  box-shadow: inset 0 2px 0 var(--wsp-primary);
+}
+
+/* ----------------------------------------------------------
+   6. Action Buttons (Rename / Delete)
+   ---------------------------------------------------------- */
+li.wsp-list-item .edit-btn {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 22px;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  padding: 0;
+  cursor: pointer;
+  border-radius: var(--wsp-radius-sm);
+  transition: opacity 0.1s, background-color 0.1s;
+  opacity: 0;
+}
+
+li.wsp-list-item:hover .edit-btn {
+  opacity: 0.7;
+}
+
+li.wsp-list-item .edit-btn:hover {
+  opacity: 1;
+  background: var(--wsp-active);
+}
+
+li.wsp-list-item .rename-btn {
+  inset-inline-end: 30px;
+}
+
+li.wsp-list-item .rename-btn::after {
+  content: "";
+  display: block;
+  width: 14px;
+  height: 14px;
+  background: var(--wsp-text-secondary);
+  mask-image: url("../img/edit.svg");
+  mask-repeat: no-repeat;
+  mask-position: center;
+  mask-size: contain;
+  -webkit-mask-image: url("../img/edit.svg");
+  -webkit-mask-repeat: no-repeat;
+  -webkit-mask-position: center;
+  -webkit-mask-size: contain;
+}
+
+li.wsp-list-item .delete-btn {
+  inset-inline-end: 6px;
+}
+
+li.wsp-list-item .delete-btn::after {
+  content: "";
+  display: block;
+  width: 14px;
+  height: 14px;
+  background: var(--wsp-text-secondary);
+  mask-image: url("../img/delete.svg");
+  mask-repeat: no-repeat;
+  mask-position: center;
+  mask-size: contain;
+  -webkit-mask-image: url("../img/delete.svg");
+  -webkit-mask-repeat: no-repeat;
+  -webkit-mask-position: center;
+  -webkit-mask-size: contain;
+}
+
+li.wsp-list-item .rename-btn:hover::after {
+  background: var(--wsp-primary);
+}
+
+li.wsp-list-item .delete-btn:hover::after {
+  background: color-mix(in srgb, red 80%, var(--wsp-color));
+}
+
+/* Empty state */
+li.no-wsp {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  min-height: 100px;
+  padding: 24px;
+  color: var(--wsp-text-secondary);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+/* ----------------------------------------------------------
+   7. Tab Preview Tooltip (Tier 3)
+   ---------------------------------------------------------- */
+.wsp-tab-preview {
+  /* Position set inline by JS (fixed, appended to body) */
+  max-width: var(--wsp-preview-max-width);
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  background: var(--wsp-bg);
+  outline: 0.5px solid var(--wsp-border);
+  border: none;
+  border-radius: var(--wsp-radius-md);
+  padding: 6px 4px 6px 10px;
+  box-shadow:
+    0 0.5px 1px rgba(0, 0, 0, 0.06),
+    0 2px 6px rgba(0, 0, 0, 0.08),
+    0 8px 24px rgba(0, 0, 0, 0.14);
+  z-index: 100;
+  pointer-events: none;
+  line-height: 1.3;
+  --wsp-preview-slide: -5px;
+  animation: wsp-preview-in 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+
+  /* Custom scrollbar for the tooltip */
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+}
+
+/* Reveal scrollbar track on hover/scroll via JS class */
+.wsp-tab-preview.scrollable {
+  scrollbar-color: var(--wsp-preview-thumb) transparent;
+}
+
+/* Flip animation when tooltip appears above the item */
+.wsp-tab-preview.above {
+  --wsp-preview-slide: 5px;
+}
+
+.wsp-tab-preview.exiting {
+  animation: wsp-preview-out 0.12s ease-in forwards;
+}
+
+@keyframes wsp-preview-in {
+  from { opacity: 0; transform: translateY(var(--wsp-preview-slide)) scale(0.97); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+@keyframes wsp-preview-out {
+  from { opacity: 1; transform: translateY(0) scale(1); }
+  to   { opacity: 0; transform: translateY(calc(var(--wsp-preview-slide) * 0.6)) scale(0.98); }
+}
+
+/* Scroll fade indicators -- top/bottom edges when content overflows */
+.wsp-tab-preview.scroll-top::before,
+.wsp-tab-preview.scroll-bottom::after {
+  content: "";
+  position: sticky;
+  display: block;
+  left: 0;
+  right: 0;
+  height: 16px;
+  pointer-events: none;
+  z-index: 1;
+  opacity: 1;
+  transition: opacity 0.15s ease;
+}
+.wsp-tab-preview.scroll-top::before {
+  top: 0;
+  margin-bottom: -16px;
+  background: linear-gradient(
+    to bottom,
+    var(--wsp-bg) 0%,
+    transparent 100%
+  );
+}
+.wsp-tab-preview.scroll-bottom::after {
+  bottom: 0;
+  margin-top: -16px;
+  background: linear-gradient(
+    to top,
+    var(--wsp-bg) 0%,
+    transparent 100%
+  );
+}
+
+.wsp-tab-preview-row {
+  font-size: 11.5px;
+  padding: 3.5px 6px 3.5px 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--wsp-color);
+  border-radius: var(--wsp-radius-sm);
+  transition: background 0.1s ease;
+}
+
+/* Subtle alternating row tint for readability in long lists */
+.wsp-tab-preview-row:nth-child(even) {
+  background: color-mix(in srgb, var(--wsp-color) 3%, transparent);
+}
+
+.wsp-tab-preview-row::before {
+  content: "";
+  display: inline-block;
+  width: 3.5px;
+  height: 3.5px;
+  border-radius: 50%;
+  background: var(--wsp-text-secondary);
+  opacity: 0.35;
+  vertical-align: middle;
+  margin-right: 7px;
+  flex-shrink: 0;
+}
+
+/* ----------------------------------------------------------
+   8. Closed Tabs (Tier 2)
+   ---------------------------------------------------------- */
+.wsp-closed-tabs {
+  border-top: 1px solid var(--wsp-border);
+  padding: 4px;
+}
+
+.wsp-closed-tabs-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 10px 4px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--wsp-text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.wsp-closed-tabs-clear {
+  border: none;
+  background: transparent;
+  color: var(--wsp-text-secondary);
+  font-size: 10px;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: var(--wsp-radius-sm);
+  font-family: inherit;
+  transition: background-color 0.1s ease-out, color 0.1s ease-out;
+}
+
+.wsp-closed-tabs-clear:hover {
+  background: var(--wsp-hover);
+  color: var(--wsp-color);
+}
+
+.wsp-closed-tabs-list {
+  list-style: none;
+  padding: 0;
+  min-height: auto;
+}
+
+.wsp-closed-tab-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  margin: 1px 4px;
+  border-radius: var(--wsp-radius-sm);
+  cursor: default;
+  transition: background-color 0.08s ease-out;
+}
+
+.wsp-closed-tab-item:hover {
+  background: var(--wsp-hover);
+}
+
+.wsp-closed-tab-title {
+  flex: 1;
+  font-size: 11.5px;
+  color: var(--wsp-text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.wsp-closed-tab-item:hover .wsp-closed-tab-title {
+  color: var(--wsp-color);
+}
+
+.wsp-closed-tab-restore {
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.1s ease-out;
+  padding: 0;
+}
+
+.wsp-closed-tab-restore::after {
+  content: "";
+  display: block;
+  width: 14px;
+  height: 14px;
+  background: var(--wsp-text-secondary);
+  mask-image: url("../img/plus.svg");
+  mask-repeat: no-repeat;
+  mask-position: center;
+  mask-size: contain;
+  -webkit-mask-image: url("../img/plus.svg");
+  -webkit-mask-repeat: no-repeat;
+  -webkit-mask-position: center;
+  -webkit-mask-size: contain;
+}
+
+.wsp-closed-tab-item:hover .wsp-closed-tab-restore {
+  opacity: 0.7;
+}
+
+.wsp-closed-tab-restore:hover {
+  opacity: 1 !important;
+}
+
+/* ----------------------------------------------------------
+   9. Footer / Create Button
+   ---------------------------------------------------------- */
+.footer-container {
+  position: sticky;
+  bottom: 0;
+  padding: 4px;
+  background: var(--wsp-bg);
+  border-top: 1px solid var(--wsp-border);
+}
+
+.footer {
+  display: none;
+}
+
+.footer#createNewWsp {
+  display: block;
+  width: auto;
+  padding: 6px 10px;
+  background: transparent;
+  color: var(--wsp-color);
+  font-size: 13px;
+  font-weight: 400;
+  text-decoration: none;
+  text-align: start;
+  border: none;
+  border-radius: var(--wsp-radius-sm);
+  cursor: default;
+  transition: background-color 0.08s ease-out;
+  appearance: none;
+}
+
+.footer#createNewWsp::before {
+  content: "";
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  background: var(--wsp-text-secondary);
+  mask-image: url("../img/plus.svg");
+  mask-repeat: no-repeat;
+  mask-position: center;
+  mask-size: contain;
+  -webkit-mask-image: url("../img/plus.svg");
+  -webkit-mask-repeat: no-repeat;
+  -webkit-mask-position: center;
+  -webkit-mask-size: contain;
+  flex-shrink: 0;
+  vertical-align: -2px;
+  margin-inline-end: 6px;
+}
+
+.footer#createNewWsp:hover {
+  background: var(--wsp-hover);
+}
+
+.footer#createNewWsp:active {
+  background: var(--wsp-active);
+}
+
+/* ----------------------------------------------------------
+   10. Custom Dialog
+   ---------------------------------------------------------- */
+#custom-dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.4);
+  display: none;
+  place-items: center;
+  z-index: 9999;
+  backdrop-filter: blur(4px);
+}
+
+@supports not (backdrop-filter: blur(4px)) {
+  #custom-dialog-backdrop {
+    background: rgba(0, 0, 0, 0.55);
+  }
+}
+
+#custom-dialog-backdrop.show {
+  display: grid;
+}
+
+.custom-dialog {
+  background: var(--wsp-bg);
+  color: var(--wsp-color);
+  padding: 20px;
+  border-radius: var(--wsp-radius-md);
+  width: calc(100vw - 16px);
+  max-width: var(--wsp-dialog-max-width);
+  overflow: hidden;
+  box-shadow: 0 20px 38px rgb(0 0 0 / 0.23), 0 5px 9px rgb(0 0 0 / 0.22);
+  outline: 0.5px solid var(--wsp-border);
+  animation: dialog-enter 0.2s ease-out;
+}
+
+@keyframes dialog-enter {
+  from {
+    opacity: 0;
+    transform: scale(0.96) translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
+}
+
+.custom-dialog-message {
+  margin-bottom: 12px;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+/* Input row with icon button */
+.custom-dialog-input-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.icon-picker-btn {
+  width: 36px;
+  height: 36px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--wsp-input-border);
+  border-radius: var(--wsp-radius-sm);
+  background: var(--wsp-input-bg);
+  cursor: pointer;
+  padding: 0;
+  transition: background-color 0.12s ease-out, border-color 0.12s ease-out,
+              transform 0.1s ease-out, opacity 0.15s ease-out;
+}
+
+.icon-picker-btn img {
+  width: 20px;
+  height: 20px;
+}
+
+.icon-picker-btn:hover {
+  background: var(--wsp-hover);
+}
+
+.icon-picker-btn:active {
+  transform: scale(0.92);
+  background: var(--wsp-active);
+}
+
+.icon-picker-btn:not(.has-icon) {
+  opacity: 0.45;
+}
+
+.icon-picker-btn:not(.has-icon):hover {
+  opacity: 0.7;
+}
+
+.icon-picker-btn.has-icon {
+  opacity: 1;
+}
+
+.icon-picker-btn.picker-open {
+  border-color: transparent;
+  outline: 2px solid var(--wsp-focus);
+  outline-offset: -2px;
+  opacity: 1;
+}
+
+.custom-dialog-input {
+  flex: 1;
+  min-width: 0;
+  padding: 7px 10px;
+  border: 1px solid var(--wsp-input-border);
+  border-radius: var(--wsp-radius-sm);
+  background: var(--wsp-input-bg);
+  color: var(--wsp-color);
+  font-family: inherit;
+  font-size: 13px;
+  outline: none;
+  transition: border-color 0.12s ease-out, outline-color 0.12s ease-out;
+}
+
+.custom-dialog-input:focus {
+  outline: 2px solid var(--wsp-focus);
+  outline-offset: -2px;
+  border-color: transparent;
+}
+
+/* Container picker row */
+.custom-dialog-container-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 14px;
+  font-size: 12px;
+}
+
+.custom-dialog-container-row label {
+  color: var(--wsp-text-secondary);
+  white-space: nowrap;
+}
+
+.custom-dialog-select {
+  flex: 1;
+  min-width: 0;
+  padding: 5px 8px;
+  border: 1px solid var(--wsp-input-border);
+  border-radius: var(--wsp-radius-sm);
+  background: var(--wsp-input-bg);
+  color: var(--wsp-color);
+  font-family: inherit;
+  font-size: 12px;
+  outline: none;
+  cursor: pointer;
+}
+
+.custom-dialog-select:focus {
+  outline: 2px solid var(--wsp-focus);
+  outline-offset: -2px;
+  border-color: transparent;
+}
+
+/* Force container checkbox row */
+.custom-dialog-force-container-row {
+  display: flex;
+  align-items: center;
+  margin-bottom: 14px;
+  font-size: 12px;
+}
+
+.custom-dialog-force-container-row label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--wsp-text-secondary);
+  cursor: pointer;
+  user-select: none;
+}
+
+.custom-dialog-force-container-row input[type="checkbox"] {
+  width: 14px;
+  height: 14px;
+  cursor: pointer;
+  accent-color: var(--wsp-primary);
+}
+
+/* Color picker row */
+.custom-dialog-color-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 14px;
+  font-size: 12px;
+}
+
+.custom-dialog-color-row label {
+  color: var(--wsp-text-secondary);
+  white-space: nowrap;
+  line-height: 1;
+}
+
+.color-swatches {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.color-swatch {
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  border: 1.5px solid transparent;
+  cursor: pointer;
+  padding: 0;
+  appearance: none;
+  -webkit-appearance: none;
+  transition: transform 0.1s ease-out, border-color 0.12s ease-out, box-shadow 0.12s ease-out;
+  flex-shrink: 0;
+}
+
+.color-swatch:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 1px var(--wsp-bg), 0 0 0 2.5px var(--wsp-focus);
+}
+
+.color-swatch:hover {
+  transform: scale(1.15);
+}
+
+.color-swatch:active {
+  transform: scale(0.92);
+}
+
+.color-swatch.selected {
+  border-color: var(--wsp-color);
+  box-shadow: 0 0 0 1px var(--wsp-bg), 0 0 0 2px currentColor;
+}
+
+/* "Remove color" swatch — subtle slash through a neutral circle */
+.color-swatch-remove {
+  background: transparent;
+  border: 1.5px solid color-mix(in srgb, var(--wsp-color) 25%, transparent);
+  position: relative;
+}
+
+.color-swatch-remove::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 9px;
+  height: 1.5px;
+  background: var(--wsp-text-secondary);
+  transform: translate(-50%, -50%) rotate(-45deg);
+  border-radius: 1px;
+}
+
+.color-swatch-remove:hover {
+  border-color: color-mix(in srgb, var(--wsp-color) 50%, transparent);
+}
+
+.color-swatch-remove.selected {
+  border-color: var(--wsp-color);
+  box-shadow: 0 0 0 1px var(--wsp-bg), 0 0 0 2px var(--wsp-color);
+}
+
+/* Icon picker grid */
+.icon-picker {
+  border: 1px solid transparent;
+  border-radius: var(--wsp-radius-md);
+  background: var(--wsp-input-bg);
+  padding: 0 8px;
+  overflow: hidden;
+  max-height: 0;
+  margin-bottom: 0;
+  opacity: 0;
+  transform: translateY(-4px);
+  transition: max-height 0.25s cubic-bezier(0.4, 0, 0.2, 1),
+              opacity 0.2s cubic-bezier(0.4, 0, 0.2, 1),
+              transform 0.25s cubic-bezier(0.4, 0, 0.2, 1),
+              margin-bottom 0.25s cubic-bezier(0.4, 0, 0.2, 1),
+              padding 0.25s cubic-bezier(0.4, 0, 0.2, 1),
+              border-color 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.icon-picker.open {
+  max-height: var(--wsp-icon-picker-max-height);
+  opacity: 1;
+  transform: translateY(0);
+  margin-bottom: 14px;
+  padding-top: 8px;
+  padding-bottom: 8px;
+  border-color: var(--wsp-input-border);
+}
+
+.icon-grid {
+  display: grid;
+  grid-template-columns: repeat(8, 1fr);
+  gap: 2px;
+  max-width: 100%;
+}
+
+.icon-grid button {
+  width: 100%;
+  aspect-ratio: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1.5px solid transparent;
+  border-radius: var(--wsp-radius-sm);
+  background: transparent;
+  cursor: pointer;
+  padding: 0;
+  transition: background-color 0.12s ease-out,
+              transform 0.1s cubic-bezier(0.4, 0, 0.2, 1),
+              border-color 0.12s ease-out,
+              box-shadow 0.12s ease-out;
+}
+
+.icon-grid button img {
+  width: 20px;
+  height: 20px;
+  opacity: 0.78;
+  transition: opacity 0.12s ease-out;
+}
+
+.icon-grid button:hover {
+  background: var(--wsp-hover);
+}
+
+.icon-grid button:hover img {
+  opacity: 1;
+}
+
+.icon-grid button:active {
+  transform: scale(0.88);
+}
+
+.icon-grid button.selected {
+  background: color-mix(in srgb, var(--wsp-primary) 14%, transparent);
+  border-color: var(--wsp-primary);
+}
+
+.icon-grid button.selected img {
+  opacity: 1;
+}
+
+.icon-clear-btn {
+  width: 100%;
+  margin-top: 6px;
+  padding: 5px 0;
+  border: none;
+  border-radius: var(--wsp-radius-sm);
+  background: transparent;
+  color: var(--wsp-text-secondary);
+  font-family: inherit;
+  font-size: 11px;
+  cursor: pointer;
+  transition: background-color 0.1s ease-out, color 0.1s ease-out;
+}
+
+.icon-clear-btn:hover {
+  background: var(--wsp-hover);
+  color: var(--wsp-color);
+}
+
+.icon-clear-btn:active {
+  background: var(--wsp-active);
+}
+
+.custom-dialog-buttons {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.custom-dialog-buttons button {
+  padding: 6px 16px;
+  border: none;
+  border-radius: var(--wsp-radius-sm);
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background-color 0.1s ease-out, transform 0.08s ease-out;
+}
+
+.custom-dialog-buttons button:active:not(:disabled) {
+  transform: scale(0.97);
+}
+
+.custom-dialog-buttons button#custom-dialog-ok {
+  background: var(--wsp-primary);
+  color: AccentColorText;
+}
+
+.custom-dialog-buttons button#custom-dialog-ok:hover {
+  background: var(--wsp-primary-hover);
+}
+
+.custom-dialog-buttons button#custom-dialog-ok:active {
+  background: var(--wsp-primary-active);
+}
+
+.custom-dialog-buttons button#custom-dialog-cancel {
+  background: var(--wsp-btn-bg);
+  color: var(--wsp-color);
+}
+
+.custom-dialog-buttons button#custom-dialog-cancel:hover {
+  background: var(--wsp-btn-hover);
+}
+
+.custom-dialog-buttons button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* ----------------------------------------------------------
+   11. Misc
+   ---------------------------------------------------------- */
+:focus-visible {
+  outline: 2px solid var(--wsp-focus);
+  outline-offset: -2px;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--wsp-primary) 30%, transparent);
+}
+
+/* ----------------------------------------------------------
+   12. Reduced Motion
+   ---------------------------------------------------------- */
+@media (prefers-reduced-motion: reduce) {
+  .custom-dialog {
+    animation: none;
+  }
+
+  .icon-picker {
+    transition: none;
+  }
+
+  .icon-grid button,
+  .icon-picker-btn {
+    transition: none;
+  }
+
+  .wsp-tab-preview,
+  .wsp-tab-preview.exiting {
+    animation: none;
+  }
+
+  li.wsp-list-item {
+    transition: none;
+  }
+
+  .color-swatch {
+    transition: none;
+  }
+}
