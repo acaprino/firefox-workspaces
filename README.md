@@ -37,7 +37,7 @@ A lightweight workspace manager that organizes your tabs into switchable groups 
 npm install -g web-ext
 
 # Run in development mode with hot-reload
-cd hardfox/extensions/firefox-workspaces
+cd firefox-workspaces
 web-ext run --firefox="path/to/firefox"
 ```
 
@@ -125,7 +125,7 @@ firefox-workspaces/
 
 ```bash
 # Package as .xpi for distribution
-web-ext build --source-dir=hardfox/extensions/firefox-workspaces
+web-ext build
 
 # Sign via AMO (requires API credentials)
 # See scripts/sign-workspaces.bat

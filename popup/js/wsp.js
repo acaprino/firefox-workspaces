@@ -1,6 +1,6 @@
 /* ============================================================
    Firefox Workspaces — Popup Script
-   Hardfox edition (theme-agnostic, styled via CSS custom properties)
+   (theme-agnostic, styled via CSS custom properties)
    ============================================================ */
 
 // ── Theme detection ──────────────────────────────────────────

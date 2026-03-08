@@ -2,7 +2,7 @@
   "manifest_version": 2,
   "name": "Workspaces",
   "version": "2.6.14",
-  "description": "A workspace manager for Firefox \u00e2\u20ac\u201d Hardfox edition",
+  "description": "A workspace manager for Firefox",
   "icons": {
     "64": "icons/layered-dark.svg",
     "128": "icons/layered-dark.svg"
