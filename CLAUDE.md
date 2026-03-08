@@ -109,3 +109,4 @@ No build step required — load directly via `about:debugging` → "Load Tempora
 - Do NOT bump the version in `manifest.json` unless explicitly asked — AMO rejects re-submissions of the same version.
 - Do NOT invent workarounds (enterprise policies, proxy files). Follow the established workflow.
 - Always verify file paths exist before referencing them.
+- NEVER use the `—` (em dash) character anywhere — in code, comments, commit messages, or documentation. Use a regular hyphen `-` or double hyphen `--` instead.
