@@ -204,7 +204,13 @@ class WorkspaceService {
         .filter(tab => freshTabIds.has(tab.id))
         .map(tab => tab.url);
       freshWsp.active = false;
-      freshWsp.lastActiveTabId = (await browser.tabs.query({active: true, windowId}))[0]?.id || null;
+      // Only save lastActiveTabId if the currently active tab belongs to this
+      // workspace. If the user clicked a tab from another workspace (triggering
+      // the switch), the browser's active tab already belongs to the destination
+      // workspace, not the one being deactivated.
+      const browserActiveTabId = (await browser.tabs.query({active: true, windowId}))[0]?.id || null;
+      const fallback = freshWsp.tabs.includes(freshWsp.lastActiveTabId) ? freshWsp.lastActiveTabId : null;
+      freshWsp.lastActiveTabId = freshWsp.tabs.includes(browserActiveTabId) ? browserActiveTabId : fallback;
       console.log("[WorkspaceService][_deactivateCurrentWspFromList] deactivating",
         freshWsp.id, "| tabs:", freshWsp.tabs.length,
         "| lastActiveTabId:", freshWsp.lastActiveTabId,
@@ -253,20 +259,49 @@ class WorkspaceService {
   static async _hideInactiveFromList(workspaces, windowId, activeWspId = null) {
     console.log("[WorkspaceService][_hideInactiveFromList] windowId:", windowId,
       "activeWspId:", activeWspId, "totalWorkspaces:", workspaces.length);
-    // Collect tabs from inactive workspaces to hide.
-    // No _saveState here — avoids overwriting fresh state written by
-    // deactivateCurrentWsp/activate. Stale tab cleanup deferred to activate().
+    // Query open tabs once for stale-tab detection across all workspaces.
+    // NOTE: This method now writes to storage (stale-tab cleanup).
+    // Safe within activateWsp (guarded by _activating), but tab add/remove
+    // events from concurrent TabService calls may still race.
+    const allOpenTabs = await browser.tabs.query({ windowId });
+    const openTabIds = new Set(allOpenTabs.map(tab => tab.id));
+
     const allTabsToHide = [];
+    const toClean = [];
 
     for (const wsp of workspaces) {
       const isActive = activeWspId != null ? (wsp.id === activeWspId) : wsp.active;
       if (!isActive) {
-        const validTabs = await Workspace._filterValidTabs(wsp.tabs, wsp.windowId);
+        const validTabs = await Workspace._filterValidTabs(wsp.tabs, wsp.windowId, openTabIds);
         if (validTabs.length > 0) {
           console.log("[WorkspaceService][_hideInactiveFromList] workspace:", wsp.name,
             "scheduling", validTabs.length, "tabs for hide");
           allTabsToHide.push(...validTabs);
         }
+        // Mark workspaces with stale tab IDs for cleanup after the loop.
+        // Firefox reuses tab IDs, so stale IDs can cause a newly created tab
+        // to be misidentified as belonging to the wrong workspace.
+        if (validTabs.length !== wsp.tabs.length) {
+          toClean.push(wsp);
+        }
+      }
+    }
+
+    // Batch stale-tab cleanup: one fresh-read + save per workspace.
+    for (const wsp of toClean) {
+      const freshWsp = await WSPStorageManager.getWorkspace(wsp.id);
+      const freshValid = freshWsp.tabs.filter(id => openTabIds.has(id));
+      if (freshValid.length !== freshWsp.tabs.length) {
+        console.log("[WorkspaceService][_hideInactiveFromList] cleaning",
+          freshWsp.tabs.length - freshValid.length,
+          "stale tab IDs from workspace:", wsp.name);
+        freshWsp.tabs = freshValid;
+        for (const group of freshWsp.groups) {
+          group.tabs = group.tabs.filter(id => openTabIds.has(id));
+        }
+        await freshWsp._saveState();
+        // Sync in-memory object so catch-all orphan detection below uses clean data
+        wsp.tabs = freshValid;
       }
     }
 
