@@ -481,6 +481,8 @@ class Brainer {
     if (activeWspData) {
       const activeWspObj = await WSPStorageManager.getWorkspace(activeWspData.id);
       await activeWspObj.activate();
+      // Populate active cache so onTabActivated fast-path works immediately after restore
+      WorkspaceService._updateActiveCache(window.id, activeWspObj.tabs);
     }
 
     // Re-hide tabs in inactive workspaces immediately after restore

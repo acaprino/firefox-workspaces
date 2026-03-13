@@ -102,8 +102,17 @@ class Workspace {
         isValid ? "(lastActive/requested)" : "(fallback: first tab)");
       await browser.tabs.update(tabToFocus, {active: true});
     } else {
-      console.log("[Workspace][activate] no tabs at all — creating fallback tab");
-      await this._createTabFallback();
+      console.log("[Workspace][activate] no tabs at all -- creating fallback tab");
+      // Guard against onCreated racing with the manual tabs.push below:
+      // _isReopening tells addTabToWorkspace to skip this tab.
+      TabService._isReopening = true;
+      try {
+        const fallbackTab = await this._createTabFallback();
+        this.tabs.push(fallbackTab.id);
+        await TabService.setTabSessionValue(fallbackTab.id, this.id);
+      } finally {
+        TabService._isReopening = false;
+      }
     }
 
     // Save tab URL snapshot for restart resilience

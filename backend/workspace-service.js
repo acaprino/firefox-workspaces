@@ -402,7 +402,8 @@ class WorkspaceService {
     );
 
     // Filter to tabs that need migration (wrong container)
-    const toMigrate = liveTabs.filter(tab => tab && tab.cookieStoreId !== containerId);
+    const toMigrate = liveTabs.filter(tab => tab && tab.cookieStoreId !== containerId
+      && TabService._canReopenInContainer(tab.url));
     if (toMigrate.length === 0) {
       console.log("[WorkspaceService][_migrateTabsToContainer] no tabs need migration");
       return;

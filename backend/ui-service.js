@@ -127,9 +127,9 @@ class UIService {
   }
 
   static async _setDefaultIcon() {
-    // Reset to manifest default — Firefox applies theme_icons automatically.
-    // setIcon() with a hardcoded path overrides theme_icons and causes the wrong
-    // icon (e.g. white on a light toolbar) when _isThemeDark() mis-detects the theme.
+    // Reset to manifest default -- Firefox applies theme_icons automatically.
+    // Do NOT hardcode a path here: that overrides theme_icons and causes the
+    // wrong icon when _isThemeDark() mis-detects (background has no rendering context).
     console.log("[UIService][_setDefaultIcon] resetting icon to manifest default (theme_icons)");
     await browser.browserAction.setIcon({ path: null });
     console.log("[UIService][_setDefaultIcon] done");

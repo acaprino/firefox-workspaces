@@ -121,13 +121,45 @@ class TabService {
       if (!alreadyAssigned) {
         console.log("[TabService][addTabToWorkspace] tab not yet assigned — adding to active workspace:",
           activeWsp.id, activeWsp.name);
+
+        // Session-value check: a tab may already belong to a specific workspace
+        // (e.g., late session-restore tab arriving after extension restore completed).
+        // Honour the session tag instead of blindly adding to the active workspace.
+        let sessionWspId;
+        try { sessionWspId = await browser.sessions.getTabValue(tab.id, "wspId"); }
+        catch (e) { console.debug("[TabService][addTabToWorkspace] session lookup failed:", e.message); }
+        const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+        if (sessionWspId && UUID_RE.test(sessionWspId) && sessionWspId !== activeWsp.id) {
+          const targetWsp = workspaces.find(wsp => wsp.id === sessionWspId);
+          if (targetWsp) {
+            console.log("[TabService][addTabToWorkspace] session value points to workspace:",
+              sessionWspId, "- honouring instead of active workspace");
+            const freshTarget = await WSPStorageManager.getWorkspace(sessionWspId);
+            if (!freshTarget.tabs.includes(tab.id)) {
+              freshTarget.tabs.push(tab.id);
+              await freshTarget._saveState();
+            }
+            if (freshTarget.active) {
+              WorkspaceService._activeCache?.tabIds.add(tab.id);
+            } else {
+              try { await browser.tabs.hide(tab.id); } catch (e) { /* tab may have closed */ }
+            }
+            await TabService.setTabSessionValue(tab.id, sessionWspId);
+            await MenuService.refreshTabMenu();
+            await UIService.updateToolbarButton(tab.windowId);
+            return false;
+          }
+        }
+
         // Force-container: if the workspace has a container, any new tab must match it.
         // suppressOnCreated=false so the new tab's onCreated fires normally and
         // re-enters addTabToWorkspace with a matching cookieStoreId, completing
         // workspace assignment. Returns false here; that re-entrant call does the work.
+        // Skip for privileged about: URLs that can't be opened in containers.
         let clearContainerId = false;
         if (!skipForceContainer && activeWsp.containerId
-            && tab.cookieStoreId !== activeWsp.containerId) {
+            && tab.cookieStoreId !== activeWsp.containerId
+            && TabService._canReopenInContainer(tab.url)) {
           console.log("[TabService][addTabToWorkspace] container mismatch — tab:", tab.cookieStoreId,
             "workspace wants:", activeWsp.containerId, "— reopening in container");
           const reopened = await TabService._reopenInContainer(tab, activeWsp.containerId, { suppressOnCreated: false });
@@ -227,7 +259,8 @@ class TabService {
     const toWsp = await WSPStorageManager.getWorkspace(toWspId);
     console.log("[Workspaces] moveTabToWsp: containerId=%s tab.cookieStoreId=%s",
       toWsp.containerId, tab.cookieStoreId);
-    if (toWsp.containerId && tab.cookieStoreId !== toWsp.containerId) {
+    if (toWsp.containerId && tab.cookieStoreId !== toWsp.containerId
+        && TabService._canReopenInContainer(tab.url)) {
       console.log("[TabService][moveTabToWsp] container mismatch — reopening tab in:", toWsp.containerId);
       try {
         TabService._isReopening = true;
@@ -355,6 +388,16 @@ class TabService {
     } catch {
       return false;
     }
+  }
+
+  // Check if a URL can be meaningfully reopened in a different container.
+  // Delegates to _isUrlAllowed for protocol checks. Additionally allows
+  // null/about:blank/about:newtab since those are just empty/new tabs that
+  // can adopt any container. (_isUrlAllowed rejects those because they are
+  // not valid for session-restore purposes.)
+  static _canReopenInContainer(url) {
+    if (!url || url === "about:blank" || url === "about:newtab") return true;
+    return TabService._isUrlAllowed(url);
   }
 
   static async restoreClosedTab(wspId, index, windowId) {
