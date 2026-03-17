@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "Workspaces",
-  "version": "2.6.20",
+  "version": "2.6.25",
   "description": "A workspace manager for Firefox",
   "icons": {
     "64": "icons/layered-light.svg",
@@ -63,8 +63,8 @@
     "default_popup": "popup/wsp.html",
     "theme_icons": [
       {
-        "light": "icons/layered-light.svg",
-        "dark": "icons/layered-dark.svg",
+        "light": "icons/layered-dark.svg",
+        "dark": "icons/layered-light.svg",
         "size": 64
       }
     ]

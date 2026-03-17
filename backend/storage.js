@@ -31,6 +31,9 @@ class AsyncMutex {
 
 const _storageMutex = new AsyncMutex();
 
+// Shared UUID regex - used by restore, tab assignment, and session-value validation
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 const STORAGE_KEYS = {
   wspState: (id) => `ld-wsp-${id}`,
   windowWsps: (id) => `ld-wsp-window-${id}`,
@@ -205,6 +208,13 @@ class WSPStorageManager {
       closedTabs.splice(index, 1);
       await browser.storage.local.set({[key]: closedTabs});
     }
+  }
+
+  // Per-workspace mutex for read-modify-write cycles.
+  // Prevents addTabToWorkspace and removeTabFromWorkspace from overwriting
+  // each other's changes when they interleave at await points.
+  static async withWorkspaceLock(wspId, fn) {
+    return _storageMutex.run(`wsp-${wspId}`, fn);
   }
 
   // ── Workspace Order (Tier 3) ──

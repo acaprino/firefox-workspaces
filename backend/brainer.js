@@ -2,9 +2,11 @@
 class Brainer {
   // Lifecycle states: 'uninitialized' -> 'restoring' -> 'ready'
   static _state = 'uninitialized';
+  static _initStarted = false;
   static _lastFocusedWindowId = null;
 
   static async initialize() {
+    Brainer._initStarted = true;
     console.log("[Brainer][initialize] starting — current state:", Brainer._state);
     await WSPStorageManager.ensureSchemaVersion();
     this._registerWindowListeners();
@@ -29,6 +31,10 @@ class Brainer {
         await Brainer._restoreWorkspaces(currentWindow);
         Brainer._state = 'ready';
         console.log("[Brainer][initialize] restore complete — state: ready");
+        // Reconcile tabs that Firefox session-restored during the 'restoring' window.
+        // Their onTabCreated was blocked, so they need explicit assignment.
+        await new Promise(r => setTimeout(r, 500));
+        await Brainer._reconcileLateTabs(currentWindow.id);
       } catch (e) {
         Brainer._state = 'uninitialized';
         console.error("[Brainer][initialize] restore failed — state reset to uninitialized:", e);
@@ -126,8 +132,8 @@ class Brainer {
         console.log("[Brainer][onStartup] fired — state:", Brainer._state);
         // initialize() already handles restart restore directly;
         // this is kept as a fallback for edge cases only.
-        if (Brainer._state === 'ready') {
-          console.log("[Brainer][onStartup] skipped — already ready");
+        if (Brainer._state === 'ready' || Brainer._state === 'restoring' || Brainer._initStarted) {
+          console.log("[Brainer][onStartup] skipped — state:", Brainer._state, "initStarted:", Brainer._initStarted);
           return;
         }
         const windowsOnLoad = await browser.windows.getAll();
@@ -322,7 +328,6 @@ class Brainer {
     // If storage was wiped (e.g. extension reinstall cleared data) but session values
     // still reference workspace IDs, reconstruct minimal stub workspaces so tabs
     // don't all collapse into a single default workspace.
-    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
     if (wspData.length === 0 && sessionMap.size > 0) {
       console.warn("[Workspaces] Restore: no workspaces in storage but session values exist — reconstructing from session");
       const seenIds = new Set();
@@ -491,6 +496,74 @@ class Brainer {
     // Clean up: remove stale lastId so subsequent restarts don't re-read it
     await WSPStorageManager.removePrimaryWindowLastId();
     console.log("[Brainer][_restoreWorkspaces] done");
+  }
+
+  // Catch tabs that Firefox session-restored during the 'restoring' phase.
+  // Their onTabCreated events were blocked, so they need explicit assignment.
+  static async _reconcileLateTabs(windowId) {
+    const allTabs = await browser.tabs.query({ windowId, pinned: false });
+    const workspaces = await WSPStorageManager.getWorkspaces(windowId);
+    const allTrackedIds = new Set(workspaces.flatMap(w => w.tabs));
+    const untracked = allTabs.filter(t => !allTrackedIds.has(t.id)
+      && !t.url?.startsWith("about:firefoxview"));
+
+    if (untracked.length === 0) {
+      console.log("[Brainer][_reconcileLateTabs] all tabs accounted for");
+      return;
+    }
+
+    console.log("[Brainer][_reconcileLateTabs]", untracked.length, "untracked tabs found");
+
+    const activeWsp = workspaces.find(w => w.active);
+    const byWsp = new Map();
+    const noSession = [];
+
+    for (const tab of untracked) {
+      let wspId;
+      try { wspId = await browser.sessions.getTabValue(tab.id, "wspId"); } catch {}
+      const target = wspId ? workspaces.find(w => w.id === wspId) : null;
+      if (target) {
+        if (!byWsp.has(wspId)) byWsp.set(wspId, []);
+        byWsp.get(wspId).push(tab);
+      } else {
+        noSession.push(tab);
+      }
+    }
+
+    // Assign session-tagged tabs to their correct workspaces
+    const toHide = [];
+    for (const [wspId, tabs] of byWsp) {
+      const wsp = await WSPStorageManager.getWorkspace(wspId);
+      for (const tab of tabs) {
+        if (!wsp.tabs.includes(tab.id)) wsp.tabs.push(tab.id);
+        await TabService.setTabSessionValue(tab.id, wspId);
+      }
+      await wsp._saveState();
+      if (!wsp.active) {
+        toHide.push(...tabs.map(t => t.id));
+      } else {
+        for (const tab of tabs) WorkspaceService._activeCache?.tabIds.add(tab.id);
+      }
+      console.log("[Brainer][_reconcileLateTabs] assigned", tabs.length, "tabs to workspace", wsp.name);
+    }
+
+    // Assign untagged tabs to active workspace (last resort)
+    if (noSession.length > 0 && activeWsp) {
+      const fresh = await WSPStorageManager.getWorkspace(activeWsp.id);
+      for (const tab of noSession) {
+        if (!fresh.tabs.includes(tab.id)) fresh.tabs.push(tab.id);
+        await TabService.setTabSessionValue(tab.id, activeWsp.id);
+        WorkspaceService._activeCache?.tabIds.add(tab.id);
+      }
+      await fresh._saveState();
+      console.log("[Brainer][_reconcileLateTabs] assigned", noSession.length, "untagged tabs to active workspace");
+    }
+
+    if (toHide.length > 0) {
+      try { await browser.tabs.hide(toHide); } catch {}
+      try { await browser.tabs.ungroup(toHide); } catch {}
+      console.log("[Brainer][_reconcileLateTabs] hidden", toHide.length, "inactive-workspace tabs");
+    }
   }
 
   // ── Tab Listeners ──

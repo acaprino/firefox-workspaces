@@ -114,6 +114,9 @@ async function _handleMessage(message) {
     case "setDarkModeHint":
       UIService._darkModeHint = message.isDark === true;
       UIService._isDarkCache = UIService._darkModeHint;
+      // Persist to storage so the hint survives across popup closings and is
+      // available even before the popup is opened (e.g. keyboard shortcut switch).
+      browser.storage.local.set({ "ld-wsp-dark-hint": UIService._darkModeHint }).catch(() => {});
       console.log("[Handler] setDarkModeHint ->", UIService._darkModeHint);
       return { success: true };
 

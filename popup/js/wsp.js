@@ -207,7 +207,7 @@ class WorkspaceUI {
       this.getWorkspaces(this.currentWindowId)
     ]);
     this.containers = containers || [];
-    this.workspaces.push(...workspaces);
+    this.workspaces.push(...(workspaces || []));
     console.log("[WorkspaceUI][initialize] containers:", this.containers.length,
       "workspaces:", this.workspaces.length,
       this.workspaces.map(w => `"${w.name}"(${w.tabs.length}t,active:${w.active})`));

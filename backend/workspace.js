@@ -48,8 +48,14 @@ class Workspace {
     console.log("[Workspace][destroy] valid tabs to remove:", this.tabs.length);
 
     if (this.tabs.length > 0) {
-      await browser.tabs.remove(this.tabs);
-      console.log("[Workspace][destroy] removed", this.tabs.length, "tabs");
+      try {
+        await browser.tabs.remove(this.tabs);
+        console.log("[Workspace][destroy] removed", this.tabs.length, "tabs");
+      } catch (e) {
+        // Tabs may have closed between _filterValidTabs and remove (TOCTOU).
+        // Continue cleanup so the workspace doesn't become a ghost in storage.
+        console.warn("[Workspace][destroy] tabs.remove failed (tabs may have closed):", e.message);
+      }
     }
     await WSPStorageManager.deleteWspState(this.id);
     await WSPStorageManager.removeWsp(this.id, this.windowId);

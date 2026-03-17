@@ -128,7 +128,6 @@ class TabService {
         let sessionWspId;
         try { sessionWspId = await browser.sessions.getTabValue(tab.id, "wspId"); }
         catch (e) { console.debug("[TabService][addTabToWorkspace] session lookup failed:", e.message); }
-        const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
         if (sessionWspId && UUID_RE.test(sessionWspId) && sessionWspId !== activeWsp.id) {
           const targetWsp = workspaces.find(wsp => wsp.id === sessionWspId);
           if (targetWsp) {
@@ -174,22 +173,24 @@ class TabService {
             activeWsp.containerId, activeWsp.name);
           clearContainerId = true;
         }
-        // Re-read fresh state to avoid overwriting concurrent changes.
-        const freshWsp = await WSPStorageManager.getWorkspace(activeWsp.id);
-        if (clearContainerId) {
-          console.log("[TabService][addTabToWorkspace] clearing stale containerId on workspace:", freshWsp.id);
-          freshWsp.containerId = null;
-        }
-        if (!freshWsp.tabs.includes(tab.id)) {
-          freshWsp.tabs.push(tab.id);
-          await freshWsp._saveState();
-          // Keep active-workspace cache consistent so onTabActivated fast-path stays accurate
-          WorkspaceService._activeCache?.tabIds.add(tab.id);
-          console.log("[TabService][addTabToWorkspace] tab", tab.id, "added to workspace",
-            freshWsp.id, "| workspace now has", freshWsp.tabs.length, "tabs");
-        } else {
-          console.log("[TabService][addTabToWorkspace] tab", tab.id, "already in fresh workspace — no-op");
-        }
+        // Lock the workspace to prevent concurrent add/remove from overwriting each other
+        await WSPStorageManager.withWorkspaceLock(activeWsp.id, async () => {
+          const freshWsp = await WSPStorageManager.getWorkspace(activeWsp.id);
+          if (clearContainerId) {
+            console.log("[TabService][addTabToWorkspace] clearing stale containerId on workspace:", freshWsp.id);
+            freshWsp.containerId = null;
+          }
+          if (!freshWsp.tabs.includes(tab.id)) {
+            freshWsp.tabs.push(tab.id);
+            await freshWsp._saveState();
+            // Keep active-workspace cache consistent so onTabActivated fast-path stays accurate
+            WorkspaceService._activeCache?.tabIds.add(tab.id);
+            console.log("[TabService][addTabToWorkspace] tab", tab.id, "added to workspace",
+              freshWsp.id, "| workspace now has", freshWsp.tabs.length, "tabs");
+          } else {
+            console.log("[TabService][addTabToWorkspace] tab", tab.id, "already in fresh workspace — no-op");
+          }
+        });
         await TabService.setTabSessionValue(tab.id, activeWsp.id);
         await MenuService.refreshTabMenu();
         await UIService.updateToolbarButton(tab.windowId);
@@ -216,16 +217,18 @@ class TabService {
       if (wsp.tabs.includes(tabId)) {
         console.log("[TabService][removeTabFromWorkspace] found tab", tabId,
           "in workspace:", wsp.id, wsp.name, "| before:", wsp.tabs.length, "tabs");
-        // Re-read fresh state to avoid overwriting concurrent changes
-        const freshWsp = await WSPStorageManager.getWorkspace(wsp.id);
-        freshWsp.tabs = freshWsp.tabs.filter(id => id !== tabId);
-        for (const group of freshWsp.groups) {
-          group.tabs = group.tabs.filter(id => id !== tabId);
-        }
-        await freshWsp._saveState();
-        // Keep active-workspace cache consistent
-        WorkspaceService._activeCache?.tabIds.delete(tabId);
-        console.log("[TabService][removeTabFromWorkspace] removed — workspace now has", freshWsp.tabs.length, "tabs");
+        // Lock the workspace to prevent concurrent add/remove from overwriting each other
+        await WSPStorageManager.withWorkspaceLock(wsp.id, async () => {
+          const freshWsp = await WSPStorageManager.getWorkspace(wsp.id);
+          freshWsp.tabs = freshWsp.tabs.filter(id => id !== tabId);
+          for (const group of freshWsp.groups) {
+            group.tabs = group.tabs.filter(id => id !== tabId);
+          }
+          await freshWsp._saveState();
+          // Keep active-workspace cache consistent
+          WorkspaceService._activeCache?.tabIds.delete(tabId);
+          console.log("[TabService][removeTabFromWorkspace] removed — workspace now has", freshWsp.tabs.length, "tabs");
+        });
         await MenuService.refreshTabMenu();
         return;
       }
@@ -252,6 +255,8 @@ class TabService {
         group.tabs = group.tabs.filter(id => id !== tab.id);
       }
       await fromWsp._saveState();
+      // Keep active-workspace cache consistent when moving OUT of active workspace
+      WorkspaceService._activeCache?.tabIds.delete(tab.id);
       console.log("[TabService][moveTabToWsp] removed from source, fromWsp now has", fromWsp.tabs.length, "tabs");
     }
 
@@ -323,8 +328,16 @@ class TabService {
 
   // ── Tab info cache helpers ──
 
+  static _TAB_INFO_CACHE_MAX = 500;
+
   static cacheTabInfo(tab) {
     if (tab.url && tab.url !== "about:blank" && tab.url !== "about:newtab") {
+      // Evict oldest entry (FIFO via Map insertion order) to prevent unbounded growth
+      if (TabService._tabInfoCache.size >= TabService._TAB_INFO_CACHE_MAX
+          && !TabService._tabInfoCache.has(tab.id)) {
+        const firstKey = TabService._tabInfoCache.keys().next().value;
+        TabService._tabInfoCache.delete(firstKey);
+      }
       TabService._tabInfoCache.set(tab.id, {
         url: tab.url,
         title: tab.title || tab.url,

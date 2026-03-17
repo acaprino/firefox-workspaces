@@ -179,11 +179,43 @@ class WorkspaceService {
       const trackableTabs = currentTabs.filter(tab => !tab.url?.startsWith("about:firefoxview"));
       const currentTabIds = trackableTabs.map(tab => tab.id);
       const tabsToAdd = currentTabIds.filter(tabId => workspaces.every(wsp => !wsp.tabs.includes(tabId)));
+      // Declared at outer scope so the freshWsp merge loop below can access them
+      let toActiveWsp = [];
       if (tabsToAdd.length > 0) {
-        console.log(`[WorkspaceService][_deactivateCurrentWspFromList] adding ${tabsToAdd.length} untracked tabs to active workspace "${activeWsp.name}":`, tabsToAdd);
-        activeWsp.tabs.unshift(...tabsToAdd);
-        await activeWsp.updateTabGroups();
-        await Promise.all(tabsToAdd.map(tabId => TabService.setTabSessionValue(tabId, activeWsp.id)));
+        // Check session values: late session-restored tabs may belong to a different workspace
+        const toOtherWsp = new Map(); // wspId -> [tabId, ...]
+        for (const tabId of tabsToAdd) {
+          let sessionWspId;
+          try { sessionWspId = await browser.sessions.getTabValue(tabId, "wspId"); } catch {}
+          const target = sessionWspId ? workspaces.find(w => w.id === sessionWspId) : null;
+          if (target && target.id !== activeWsp.id) {
+            if (!toOtherWsp.has(target.id)) toOtherWsp.set(target.id, []);
+            toOtherWsp.get(target.id).push(tabId);
+          } else {
+            toActiveWsp.push(tabId);
+          }
+        }
+
+        if (toActiveWsp.length > 0) {
+          console.log(`[WorkspaceService][_deactivateCurrentWspFromList] adding ${toActiveWsp.length} untracked tabs to active workspace "${activeWsp.name}":`, toActiveWsp);
+          activeWsp.tabs.unshift(...toActiveWsp);
+          await activeWsp.updateTabGroups();
+          await Promise.all(toActiveWsp.map(tabId => TabService.setTabSessionValue(tabId, activeWsp.id)));
+        }
+
+        // Route session-tagged tabs to their correct workspaces
+        for (const [wspId, tabIds] of toOtherWsp) {
+          const wsp = await WSPStorageManager.getWorkspace(wspId);
+          for (const tabId of tabIds) {
+            if (!wsp.tabs.includes(tabId)) wsp.tabs.push(tabId);
+          }
+          await wsp._saveState();
+          console.log(`[WorkspaceService][_deactivateCurrentWspFromList] routed ${tabIds.length} late tab(s) to workspace "${wsp.name}"`);
+        }
+
+        if (toActiveWsp.length === 0 && toOtherWsp.size === 0) {
+          console.log("[WorkspaceService][_deactivateCurrentWspFromList] no untracked tabs to add");
+        }
       } else {
         console.log("[WorkspaceService][_deactivateCurrentWspFromList] no untracked tabs to add");
       }
@@ -192,8 +224,8 @@ class WorkspaceService {
       // addTabToWorkspace or removeTabFromWorkspace that may have fired
       // during the awaits above.
       const freshWsp = await WSPStorageManager.getWorkspace(activeWsp.id);
-      // Merge any untracked tabs that we added above
-      for (const tabId of tabsToAdd) {
+      // Merge only tabs assigned to this workspace (not those routed elsewhere by session value)
+      for (const tabId of toActiveWsp) {
         if (!freshWsp.tabs.includes(tabId)) {
           freshWsp.tabs.unshift(tabId);
         }
@@ -322,21 +354,46 @@ class WorkspaceService {
 
       const toHide = [];
       const toAssign = [];
+      const toRouteBySession = new Map(); // wspId -> [tab, ...]
 
       for (const tab of visibleTabs) {
         if (activeTabIds.has(tab.id) || tab.active) continue;
         if (tab.url?.startsWith("about:firefoxview")) continue; // never hide Firefox View
 
         if (!allTrackedIds.has(tab.id)) {
-          // Truly orphaned — assign to active workspace so it's tracked
-          toAssign.push(tab);
+          // Orphaned tab - check session value before defaulting to active workspace.
+          // Late session-restored tabs retain their workspace tag from the previous session.
+          let sessionWspId;
+          try { sessionWspId = await browser.sessions.getTabValue(tab.id, "wspId"); } catch {}
+          const sessionTarget = sessionWspId ? workspaces.find(w => w.id === sessionWspId) : null;
+
+          if (sessionTarget && sessionTarget.id !== activeWspId) {
+            // Tab belongs to a different workspace per session data - route there and hide
+            if (!toRouteBySession.has(sessionTarget.id)) toRouteBySession.set(sessionTarget.id, []);
+            toRouteBySession.get(sessionTarget.id).push(tab);
+            toHide.push(tab.id);
+          } else {
+            // No session value or belongs to active workspace - assign to active
+            toAssign.push(tab);
+          }
         } else {
-          // Belongs to an inactive workspace — hide it
+          // Belongs to an inactive workspace - hide it
           toHide.push(tab.id);
         }
       }
 
-      // Assign orphaned tabs to the active workspace before they get lost
+      // Route session-tagged orphans to their correct workspaces
+      for (const [wspId, tabs] of toRouteBySession) {
+        console.log(`[Workspaces] Routing ${tabs.length} late-restored tab(s) to workspace ${wspId}`);
+        const freshWsp = await WSPStorageManager.getWorkspace(wspId);
+        for (const tab of tabs) {
+          if (!freshWsp.tabs.includes(tab.id)) freshWsp.tabs.push(tab.id);
+          await TabService.setTabSessionValue(tab.id, wspId);
+        }
+        await freshWsp._saveState();
+      }
+
+      // Assign remaining orphaned tabs to the active workspace
       if (toAssign.length > 0) {
         console.log(`[Workspaces] Assigning ${toAssign.length} orphaned tab(s) to active workspace`,
           toAssign.map(t => t.id));
