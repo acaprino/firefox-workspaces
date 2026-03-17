@@ -142,8 +142,20 @@ function showCustomDialog({ message, withInput = false, defaultValue = "", defau
 
     // Expand popup viewport so Firefox doesn't clip the dialog
     function syncPopupHeight() {
+      if (!withInput) {
+        document.body.style.minHeight = "140px";
+        return;
+      }
       const pickerOpen = iconPicker.classList.contains("open");
-      document.body.style.minHeight = pickerOpen ? "520px" : "220px";
+      document.body.style.minHeight = pickerOpen ? "520px" : "280px";
+    }
+
+    // Toggle confirm mode class for delete dialogs
+    const dialog = backdrop.querySelector(".custom-dialog");
+    if (withInput) {
+      dialog.classList.remove("dialog-confirm");
+    } else {
+      dialog.classList.add("dialog-confirm");
     }
 
     syncPopupHeight();
@@ -227,9 +239,7 @@ function showCustomDialog({ message, withInput = false, defaultValue = "", defau
     }
 
     function cleanup(result) {
-      backdrop.classList.remove("show");
-      closePicker();
-      document.body.style.minHeight = "";
+      // Remove listeners immediately to prevent double-fire
       okBtn.removeEventListener("click", onOk);
       cancelBtn.removeEventListener("click", onCancel);
       inputEl.removeEventListener("input", updateOkButtonState);
@@ -238,7 +248,25 @@ function showCustomDialog({ message, withInput = false, defaultValue = "", defau
       iconGrid.removeEventListener("click", onIconGridClick);
       iconClearBtn.removeEventListener("click", onIconClear);
       colorSwatches.removeEventListener("click", onColorSwatchClick);
-      resolve(result);
+
+      // Exit animation
+      backdrop.classList.add("hiding");
+      function onAnimEnd() {
+        backdrop.removeEventListener("animationend", onAnimEnd);
+        backdrop.classList.remove("show", "hiding");
+        dialog.classList.remove("dialog-confirm");
+        closePicker();
+        document.body.style.minHeight = "";
+        resolve(result);
+      }
+      backdrop.addEventListener("animationend", onAnimEnd);
+
+      // Fallback if animation is skipped (reduced motion)
+      const prefersReducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+      if (prefersReducedMotion) {
+        backdrop.removeEventListener("animationend", onAnimEnd);
+        onAnimEnd();
+      }
     }
 
     function onOk() {

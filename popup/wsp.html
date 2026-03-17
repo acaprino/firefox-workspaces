@@ -9,27 +9,31 @@
 <div id="custom-dialog-backdrop">
     <div class="custom-dialog">
         <div class="custom-dialog-message" id="custom-dialog-message"></div>
-        <div class="custom-dialog-input-row" id="custom-dialog-input-row" hidden>
-            <button type="button" id="custom-dialog-icon-btn" class="icon-picker-btn" title="Choose icon"></button>
-            <input type="text" id="custom-dialog-input" class="custom-dialog-input"/>
+        <div class="custom-dialog-body">
+            <div class="custom-dialog-input-row" id="custom-dialog-input-row" hidden>
+                <button type="button" id="custom-dialog-icon-btn" class="icon-picker-btn" title="Choose icon"></button>
+                <input type="text" id="custom-dialog-input" class="custom-dialog-input"/>
+            </div>
+            <!-- Color picker row -->
+            <div class="custom-dialog-color-row" id="custom-dialog-color-row" hidden>
+                <label id="color-picker-label">Color</label>
+                <div class="color-swatches" id="color-swatches" role="radiogroup" aria-labelledby="color-picker-label"></div>
+            </div>
+            <!-- Container picker row (shown in create/rename dialog) -->
+            <div class="custom-dialog-container-row" id="custom-dialog-container-row" hidden>
+                <label for="custom-dialog-container-select">Container</label>
+                <select id="custom-dialog-container-select" class="custom-dialog-select"></select>
+            </div>
+            <div id="icon-picker" class="icon-picker">
+                <div class="icon-grid" id="icon-grid"></div>
+                <button type="button" id="icon-clear-btn" class="icon-clear-btn">Remove icon</button>
+            </div>
         </div>
-        <!-- Color picker row -->
-        <div class="custom-dialog-color-row" id="custom-dialog-color-row" hidden>
-            <label id="color-picker-label">Color:</label>
-            <div class="color-swatches" id="color-swatches" role="radiogroup" aria-labelledby="color-picker-label"></div>
-        </div>
-        <!-- Container picker row (shown in create/rename dialog) -->
-        <div class="custom-dialog-container-row" id="custom-dialog-container-row" hidden>
-            <label for="custom-dialog-container-select">Container:</label>
-            <select id="custom-dialog-container-select" class="custom-dialog-select"></select>
-        </div>
-        <div id="icon-picker" class="icon-picker">
-            <div class="icon-grid" id="icon-grid"></div>
-            <button type="button" id="icon-clear-btn" class="icon-clear-btn">Remove icon</button>
-        </div>
-        <div class="custom-dialog-buttons">
-            <button id="custom-dialog-cancel">Cancel</button>
-            <button id="custom-dialog-ok">OK</button>
+        <div class="custom-dialog-footer">
+            <div class="custom-dialog-buttons">
+                <button id="custom-dialog-cancel">Cancel</button>
+                <button id="custom-dialog-ok">OK</button>
+            </div>
         </div>
     </div>
 </div>

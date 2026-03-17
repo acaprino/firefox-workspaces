@@ -1,4 +1,4 @@
-# Firefox Workspaces — Extension
+# Firefox Workspaces - Extension
 
 **Type:** MV2 WebExtension for Firefox 140+
 **Language:** Vanilla JavaScript (no build step, no bundler)
@@ -10,14 +10,14 @@
 
 ```
 backend/          # Background scripts (loaded in order by manifest.json)
-├── storage.js    # WSPStorageManager — browser.storage.local wrapper
+├── storage.js    # WSPStorageManager - browser.storage.local wrapper
 ├── workspace.js  # Workspace entity (create, activate, hide, destroy)
 ├── ui-service.js       # Toolbar button icon, badge, SVG cache, theme detection
 ├── menu-service.js     # Tab context menu ("Move Tab to…") + omnibox
 ├── workspace-service.js # Workspace CRUD, activate/deactivate, container binding
 ├── tab-service.js      # Tab add/remove/move, search, closed tabs, sessions, container reopen
-├── brainer.js          # Orchestrator — init, event listener registration, restart recovery
-└── handler.js          # Message router (popup ↔ background)
+├── brainer.js          # Orchestrator - init, event listener registration, restart recovery
+└── handler.js          # Message router (popup <-> background)
 
 popup/            # Browser action popup
 ├── wsp.html      # Popup markup
@@ -28,10 +28,10 @@ popup/            # Browser action popup
     ├── tooltip.js   # Tab preview tooltips on workspace hover
     └── drag-drop.js # Workspace reorder via drag & drop
 
-icons/            # Toolbar icons (light/dark SVG + PNG fallbacks)
+icons/            # Toolbar icons (layered-dark/light SVG + PNG fallbacks)
 ```
 
-**Load order matters:** `manifest.json` → `background.scripts` array defines the order. `storage.js` must load first (others depend on `WSPStorageManager`). `brainer.js` and `handler.js` last.
+**Load order matters:** `manifest.json` `background.scripts` array defines the order. `storage.js` must load first (others depend on `WSPStorageManager`). `brainer.js` and `handler.js` last.
 
 ---
 
@@ -50,7 +50,7 @@ Each workspace can optionally bind to a Firefox Container (`contextualIdentities
 
 ### Theme Detection
 The popup adapts to Firefox themes via a cascade:
-1. `browser.theme.getCurrent()` → extract popup colors
+1. `browser.theme.getCurrent()` -- extract popup colors
 2. CSS system colors (`-moz-Dialog`, `AccentColor`, etc.) as fallbacks
 3. `-moz-Dialog` luminance probe for dark/light detection
 4. Manual toggle (LWT colors vs system colors)
@@ -60,22 +60,31 @@ Workspace-to-tab mapping survives restarts via `browser.sessions.setTabValue()`.
 
 ---
 
-## Messaging Protocol (popup ↔ background)
+## Messaging Protocol (popup -> background)
 
-Messages use `browser.runtime.sendMessage({ msg, ... })`. Key message types:
+Messages use `browser.runtime.sendMessage({ action, ... })`. Handler dispatches on `message.action`:
 
-| `msg` | Direction | Purpose |
-|---|---|---|
-| `getWorkspaces` | popup → bg | Get ordered workspace list |
-| `activateWsp` | popup → bg | Switch to a workspace |
-| `createWsp` | popup → bg | Create new workspace |
-| `renameWsp` | popup → bg | Rename + update icon/color/container |
-| `deleteWsp` | popup → bg | Destroy workspace and its tabs |
-| `moveTabToWsp` | popup → bg | Move a tab between workspaces |
-| `reorderWorkspaces` | popup → bg | Persist new workspace order |
-| `searchTabs` | popup → bg | Search tabs across all workspaces |
-| `getClosedTabs` | popup → bg | Get recently closed tabs for a workspace |
-| `setDarkModeHint` | popup → bg | Forward popup's dark mode detection to background |
+| `action` | Purpose |
+|---|---|
+| `getWorkspaces` | Get ordered workspace list for a window |
+| `activateWorkspace` | Switch to a workspace |
+| `createWorkspace` | Create new workspace |
+| `createWorkspaceWithTab` | Create workspace and move a tab into it |
+| `renameWorkspace` | Rename + update icon/color |
+| `destroyWsp` | Destroy workspace and close its tabs |
+| `getNumWorkspaces` | Get workspace count for a window |
+| `getWorkspaceName` | Generate a default workspace name |
+| `getPrimaryWindowId` | Get the tracked primary window ID |
+| `hideInactiveWspTabs` | Hide tabs not in active workspace |
+| `saveWorkspaceOrder` | Persist new workspace order (orderedIds array) |
+| `getContainers` | List available Firefox containers |
+| `setWorkspaceContainer` | Bind a workspace to a container |
+| `getClosedTabs` | Get recently closed tabs for a workspace |
+| `restoreClosedTab` | Reopen a closed tab in a workspace |
+| `clearClosedTabs` | Clear closed-tab history for a workspace |
+| `searchTabs` | Search tabs across all workspaces |
+| `getTabPreviews` | Get tab title/URL previews for tooltip |
+| `setDarkModeHint` | Forward popup's dark mode detection to background |
 
 ---
 
@@ -87,9 +96,12 @@ web-ext run --source-dir=. --firefox="path/to/firefox"
 
 # Package for distribution
 web-ext build
+
+# Sign for distribution (requires .env with WEB_EXT_API_KEY/WEB_EXT_API_SECRET)
+web-ext sign --channel=unlisted
 ```
 
-No build step required — load directly via `about:debugging` → "Load Temporary Add-on" → select `manifest.json`.
+No build step required - load directly via `about:debugging` -> "Load Temporary Add-on" -> select `manifest.json`.
 
 ---
 
@@ -98,9 +110,9 @@ No build step required — load directly via `about:debugging` → "Load Tempora
 1. **Extension signing:** Release Firefox ignores `xpinstall.signatures.required=false`. Must sign via AMO for distribution. Version in `manifest.json` must be bumped before each AMO submission (duplicates are rejected).
 2. **`data_collection_permissions`:** Required in `manifest.json` for Firefox 140+. Omitting it causes AMO validation failure.
 3. **`tabHide` API:** Must be enabled (default in Firefox 140+). Without it, inactive workspace tabs remain visible.
-4. **Container reopen race:** `TabService._reopenInContainer()` uses `_isReopening` + `_forceReopenIds` guards to prevent `onCreated` from double-assigning tabs during the close→reopen window.
+4. **Container reopen race:** `TabService._reopenInContainer()` uses `_isReopening` + `_forceReopenIds` guards to prevent `onCreated` from double-assigning tabs during the close-reopen window.
 5. **Background page has no rendering context:** Theme dark/light detection via `-moz-Dialog` probe only works in the popup (which has a DOM). The popup forwards the result to background via `setDarkModeHint`.
-6. **MV2 only:** This extension uses `browser_action`, `background.scripts`, and `tabHide` — all MV2 APIs. No MV3 migration planned (Firefox still supports MV2).
+6. **MV2 only:** This extension uses `browser_action`, `background.scripts`, and `tabHide` - all MV2 APIs. No MV3 migration planned (Firefox still supports MV2).
 
 ---
 
@@ -109,4 +121,4 @@ No build step required — load directly via `about:debugging` → "Load Tempora
 - Always bump the patch version in `manifest.json` before building/signing for AMO - AMO rejects re-submissions of the same version.
 - Do NOT invent workarounds (enterprise policies, proxy files). Follow the established workflow.
 - Always verify file paths exist before referencing them.
-- NEVER use the `—` (em dash) character anywhere — in code, comments, commit messages, or documentation. Use a regular hyphen `-` or double hyphen `--` instead.
+- NEVER use the em dash character anywhere - in code, comments, commit messages, or documentation. Use a regular hyphen `-` or double hyphen `--` instead.

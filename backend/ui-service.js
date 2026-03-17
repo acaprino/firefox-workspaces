@@ -191,23 +191,24 @@ class UIService {
         console.log("[UIService][updateToolbarButton] no custom icon -> _setDefaultIcon()");
         await UIService._setDefaultIcon();
       } else {
-        // Custom icon: use extension-relative SVG path.
-        // Firefox applies context-fill automatically for extension icons,
-        // so we replace currentColor with context-fill to let Firefox
-        // handle theme-aware coloring natively.
+        // Custom icon: fetch the SVG, replace currentColor with a concrete
+        // theme-appropriate color, and set via data URL.
+        // context-fill only works for SVGs loaded by file path, not data URLs,
+        // so we resolve the fill color ourselves based on the detected theme.
         console.log("[UIService][updateToolbarButton] custom icon path for:", validIcon);
         try {
-          const cacheKey = `${validIcon}:context-fill`;
+          const isDark = await UIService._isThemeDark();
+          const fillColor = isDark ? "#ffffff" : "#1a1a1a";
+          const cacheKey = `${validIcon}:${fillColor}`;
           let dataUrl = UIService._svgCache.get(cacheKey);
 
           if (!dataUrl) {
-            console.log("[UIService][updateToolbarButton] SVG cache miss -- fetching SVG for:", validIcon);
+            console.log("[UIService][updateToolbarButton] SVG cache miss -- fetching SVG for:", validIcon, "fill:", fillColor);
             const url = browser.runtime.getURL(`popup/img/workspace-icons/${validIcon}.svg`);
             const resp = await fetch(url);
             console.log("[UIService][updateToolbarButton] fetch status:", resp.status, "for", url);
             let svgText = await resp.text();
-            // context-fill lets Firefox pick the right color for the toolbar theme
-            svgText = svgText.replace(/fill="currentColor"/g, 'fill="context-fill"');
+            svgText = svgText.replace(/fill="currentColor"/g, `fill="${fillColor}"`);
             dataUrl = "data:image/svg+xml," + encodeURIComponent(svgText);
             if (UIService._svgCache.size >= UIService._SVG_CACHE_MAX) {
               UIService._svgCache.delete(UIService._svgCache.keys().next().value);
@@ -221,16 +222,8 @@ class UIService {
           await browser.browserAction.setIcon({ path: { 16: dataUrl, 32: dataUrl, 64: dataUrl } });
           console.log("[UIService][updateToolbarButton] custom icon set OK");
         } catch (e) {
-          console.warn("[UIService][updateToolbarButton] data URL failed, trying file path:", e);
-          // Fallback: use file path directly (currentColor defaults to black)
-          try {
-            const iconPath = `popup/img/workspace-icons/${validIcon}.svg`;
-            await browser.browserAction.setIcon({ path: { 16: iconPath, 32: iconPath, 64: iconPath } });
-            console.log("[UIService][updateToolbarButton] file path fallback OK");
-          } catch (e2) {
-            console.warn("[UIService][updateToolbarButton] file path also failed, using default:", e2);
-            await UIService._setDefaultIcon();
-          }
+          console.warn("[UIService][updateToolbarButton] data URL failed, using default:", e);
+          await UIService._setDefaultIcon();
         }
       }
     } else {
