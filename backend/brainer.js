@@ -43,6 +43,16 @@ class Brainer {
     } else {
       console.log("[Brainer][initialize] first-start or already-running path");
       await this._ensureDefaultWorkspace();
+      // Remove stale tab IDs from all workspaces. After a non-clean shutdown
+      // (crash, kill, power loss) the restart is not detected because
+      // onWindowRemoved never fired, so stale IDs from the previous session
+      // linger. Firefox reuses tab IDs across sessions, so a newly created
+      // tab can match a stale ID and trigger an unwanted workspace switch.
+      const pid = await WSPStorageManager.getPrimaryWindowId();
+      if (pid) {
+        await Brainer._cleanStaleTabIds(pid);
+        await Brainer._reconcileLateTabs(pid);
+      }
       // Ensure state is 'ready' even if onInstalled fired before its listener
       // was registered (during the ensureSchemaVersion() await above).
       if (Brainer._state !== 'ready') {
@@ -173,14 +183,14 @@ class Brainer {
 
     browser.theme.onUpdated.addListener(async ({ theme, windowId: themeWindowId } = {}) => {
       try {
-        console.log("[Brainer][onThemeUpdated] fired — themeWindowId:", themeWindowId,
+        console.log("[Brainer][onThemeUpdated] fired -- themeWindowId:", themeWindowId,
           "| colors:", JSON.stringify(theme?.colors ?? null));
         // Invalidate caches: custom icons must be regenerated with the new theme colors
         UIService._svgCache.clear();
         UIService.clearThemeCache();
         const primaryWindowId = await WSPStorageManager.getPrimaryWindowId();
         console.log("[Brainer][onThemeUpdated] primaryWindowId:", primaryWindowId);
-        if (primaryWindowId) await UIService.updateToolbarButton(primaryWindowId);
+        if (primaryWindowId) await UIService.updateToolbarButton(primaryWindowId, theme?.colors);
         await MenuService.refreshTabMenu();
       } catch (e) { console.error("[Workspaces] onThemeUpdated error:", e); }
     });
@@ -496,6 +506,39 @@ class Brainer {
     // Clean up: remove stale lastId so subsequent restarts don't re-read it
     await WSPStorageManager.removePrimaryWindowLastId();
     console.log("[Brainer][_restoreWorkspaces] done");
+  }
+
+  // Remove tab IDs from workspaces that no longer correspond to open tabs.
+  // Called during the "already-running" init path to handle non-clean restarts
+  // where onWindowRemoved never fired (crash, kill, power loss).
+  static async _cleanStaleTabIds(windowId) {
+    const allTabs = await browser.tabs.query({ windowId });
+    const openTabIds = new Set(allTabs.map(t => t.id));
+    const workspaces = await WSPStorageManager.getWorkspaces(windowId);
+    let totalCleaned = 0;
+
+    for (const wsp of workspaces) {
+      const validTabs = wsp.tabs.filter(id => openTabIds.has(id));
+      if (validTabs.length < wsp.tabs.length) {
+        const staleCount = wsp.tabs.length - validTabs.length;
+        console.log("[Brainer][_cleanStaleTabIds] workspace:", wsp.name,
+          "removing", staleCount, "stale tab IDs:",
+          wsp.tabs.filter(id => !openTabIds.has(id)));
+        const fresh = await WSPStorageManager.getWorkspace(wsp.id);
+        fresh.tabs = fresh.tabs.filter(id => openTabIds.has(id));
+        for (const group of fresh.groups) {
+          group.tabs = group.tabs.filter(id => openTabIds.has(id));
+        }
+        await fresh._saveState();
+        totalCleaned += staleCount;
+      }
+    }
+
+    if (totalCleaned > 0) {
+      console.log("[Brainer][_cleanStaleTabIds] total stale IDs removed:", totalCleaned);
+    } else {
+      console.log("[Brainer][_cleanStaleTabIds] no stale tab IDs found");
+    }
   }
 
   // Catch tabs that Firefox session-restored during the 'restoring' phase.

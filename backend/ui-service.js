@@ -28,6 +28,39 @@ class UIService {
     return [128, 128, 128];
   }
 
+  // Extract dark/light from a theme.colors object without any DOM or async calls.
+  // Returns true (dark), false (light), or null (indeterminate).
+  static _detectDarkFromColors(colors) {
+    if (!colors) return null;
+    const iconColor    = colors.icons;
+    const toolbarText  = colors.toolbar_text ?? colors.bookmark_text;
+    const tabBgText    = colors.tab_background_text;
+    const fieldText    = colors.toolbar_field_text;
+    const popupText    = colors.popup_text;
+    const textColor    = iconColor ?? toolbarText ?? tabBgText ?? fieldText ?? popupText;
+    if (textColor !== undefined && textColor !== null) {
+      const [r, g, b] = UIService._parseRgb(textColor);
+      const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+      console.log("[UIService][_detectDarkFromColors] text rgb:", r, g, b, "lum:", lum.toFixed(1));
+      return lum > 128;
+    }
+    const toolbarColor = colors.toolbar;
+    if (toolbarColor !== undefined && toolbarColor !== null) {
+      const [r, g, b] = UIService._parseRgb(toolbarColor);
+      const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+      console.log("[UIService][_detectDarkFromColors] toolbar rgb:", r, g, b, "lum:", lum.toFixed(1));
+      return lum < 128;
+    }
+    const frameColor = colors.frame;
+    if (frameColor !== undefined && frameColor !== null) {
+      const [r, g, b] = UIService._parseRgb(frameColor);
+      const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+      console.log("[UIService][_detectDarkFromColors] frame rgb:", r, g, b, "lum:", lum.toFixed(1));
+      return lum < 128;
+    }
+    return null;
+  }
+
   static clearThemeCache() {
     console.log("[UIService][clearThemeCache] invalidating _isDarkCache (was:", UIService._isDarkCache,
       ") _darkModeHint (was:", UIService._darkModeHint, ")");
@@ -37,7 +70,7 @@ class UIService {
     browser.storage.local.remove("ld-wsp-dark-hint").catch(() => {});
   }
 
-  static async _isThemeDark() {
+  static async _isThemeDark(themeColors) {
     if (UIService._isDarkCache !== null) {
       console.log("[UIService][_isThemeDark] returning cached result:", UIService._isDarkCache);
       return UIService._isDarkCache;
@@ -63,52 +96,29 @@ class UIService {
     } catch (e) {
       console.warn("[UIService][_isThemeDark] storage read failed:", e);
     }
-    console.log("[UIService][_isThemeDark] cache miss — querying theme...");
+    console.log("[UIService][_isThemeDark] cache miss -- detecting theme...");
     let result;
-    try {
-      const theme = await browser.theme.getCurrent();
-      const colors = theme?.colors ?? null;
-      console.log("[UIService][_isThemeDark] full theme.colors:", JSON.stringify(colors));
-
-      const iconColor    = colors?.icons;
-      const toolbarColor = colors?.toolbar;
-      const toolbarText  = colors?.toolbar_text ?? colors?.bookmark_text;
-      const frameColor   = colors?.frame;
-      // Additional text color fields for system/auto themes that may omit toolbar_text
-      const tabBgText      = colors?.tab_background_text;
-      const toolbarFieldTx = colors?.toolbar_field_text;
-      const popupText      = colors?.popup_text;
-      console.log("[UIService][_isThemeDark] key colors — icons:", iconColor,
-        "| toolbar:", toolbarColor, "| toolbar_text:", toolbarText, "| frame:", frameColor,
-        "| tab_background_text:", tabBgText, "| toolbar_field_text:", toolbarFieldTx);
-
-      if (colors) {
-        // Light text on toolbar = dark theme (check text colors first - most reliable)
-        const textColor = iconColor ?? toolbarText ?? tabBgText ?? toolbarFieldTx ?? popupText;
-        if (textColor !== undefined && textColor !== null) {
-          const [r, g, b] = UIService._parseRgb(textColor);
-          const lum = 0.299 * r + 0.587 * g + 0.114 * b;
-          result = lum > 128;
-          console.log("[UIService][_isThemeDark] branch=textColor  rgb:", r, g, b, " lum:", lum.toFixed(1), "-> isDark:", result);
-        } else if (toolbarColor !== undefined && toolbarColor !== null) {
-          // Dark toolbar background = dark theme
-          const [r, g, b] = UIService._parseRgb(toolbarColor);
-          const lum = 0.299 * r + 0.587 * g + 0.114 * b;
-          result = lum < 128;
-          console.log("[UIService][_isThemeDark] branch=toolbar  rgb:", r, g, b, " lum:", lum.toFixed(1), "-> isDark:", result);
-        } else if (frameColor !== undefined && frameColor !== null) {
-          const [r, g, b] = UIService._parseRgb(frameColor);
-          const lum = 0.299 * r + 0.587 * g + 0.114 * b;
-          result = lum < 128;
-          console.log("[UIService][_isThemeDark] branch=frame  rgb:", r, g, b, " lum:", lum.toFixed(1), "-> isDark:", result);
-        } else {
-          console.log("[UIService][_isThemeDark] colors object present but all key fields are null/undefined — falling through");
+    // If the caller supplied theme colors (e.g. from theme.onUpdated callback),
+    // use them directly instead of re-querying browser.theme.getCurrent().
+    // This avoids races and works even in the background page which has no
+    // rendering context for DOM-based probes.
+    if (themeColors) {
+      result = UIService._detectDarkFromColors(themeColors) ?? undefined;
+      console.log("[UIService][_isThemeDark] branch=callerColors -> isDark:", result);
+    }
+    if (result === undefined) {
+      try {
+        const theme = await browser.theme.getCurrent();
+        const colors = theme?.colors ?? null;
+        console.log("[UIService][_isThemeDark] queried theme.colors:", JSON.stringify(colors));
+        const detected = UIService._detectDarkFromColors(colors);
+        if (detected !== null) {
+          result = detected;
+          console.log("[UIService][_isThemeDark] branch=getCurrent -> isDark:", result);
         }
-      } else {
-        console.log("[UIService][_isThemeDark] theme.colors is null/undefined — falling through");
+      } catch (e) {
+        console.warn("[UIService][_isThemeDark] browser.theme.getCurrent() threw:", e);
       }
-    } catch (e) {
-      console.warn("[UIService][_isThemeDark] browser.theme.getCurrent() threw:", e);
     }
     // Before matchMedia (which privacy.resistFingerprinting forces to 'light'),
     // probe the OS dialog background via the -moz-Dialog system color.
@@ -152,13 +162,13 @@ class UIService {
     return result;
   }
 
-  static async _setDefaultIcon() {
+  static async _setDefaultIcon(themeColors) {
     // Explicitly pick the correct layered icon for the current theme.
     // path:null should delegate to theme_icons, but Firefox does not always
     // re-evaluate theme_icons after a runtime setIcon() call, so we resolve
     // it ourselves -- same approach used for custom workspace icons.
     try {
-      const isDark = await UIService._isThemeDark();
+      const isDark = await UIService._isThemeDark(themeColors);
       const iconPath = isDark ? "icons/layered-dark.svg" : "icons/layered-light.svg";
       console.log("[UIService][_setDefaultIcon] isDark:", isDark, "-> iconPath:", iconPath);
       await browser.browserAction.setIcon({ path: { 16: iconPath, 32: iconPath, 64: iconPath } });
@@ -169,7 +179,7 @@ class UIService {
     console.log("[UIService][_setDefaultIcon] done");
   }
 
-  static async updateToolbarButton(windowId) {
+  static async updateToolbarButton(windowId, themeColors) {
     console.log("[UIService][updateToolbarButton] called for windowId:", windowId);
     const activeWsp = await WorkspaceService.getActiveWsp(windowId);
 
@@ -189,7 +199,7 @@ class UIService {
 
       if (!validIcon) {
         console.log("[UIService][updateToolbarButton] no custom icon -> _setDefaultIcon()");
-        await UIService._setDefaultIcon();
+        await UIService._setDefaultIcon(themeColors);
       } else {
         // Custom icon: fetch the SVG, replace currentColor with a concrete
         // theme-appropriate color, and set via data URL.
@@ -197,7 +207,7 @@ class UIService {
         // so we resolve the fill color ourselves based on the detected theme.
         console.log("[UIService][updateToolbarButton] custom icon path for:", validIcon);
         try {
-          const isDark = await UIService._isThemeDark();
+          const isDark = await UIService._isThemeDark(themeColors);
           const fillColor = isDark ? "#ffffff" : "#1a1a1a";
           const cacheKey = `${validIcon}:${fillColor}`;
           let dataUrl = UIService._svgCache.get(cacheKey);
@@ -223,14 +233,14 @@ class UIService {
           console.log("[UIService][updateToolbarButton] custom icon set OK");
         } catch (e) {
           console.warn("[UIService][updateToolbarButton] data URL failed, using default:", e);
-          await UIService._setDefaultIcon();
+          await UIService._setDefaultIcon(themeColors);
         }
       }
     } else {
       console.log("[UIService][updateToolbarButton] no active workspace for windowId:", windowId, "-> default icon + clear badge");
       await browser.browserAction.setTitle({ title: "Workspaces" });
       await browser.browserAction.setBadgeText({ text: "" });
-      await UIService._setDefaultIcon();
+      await UIService._setDefaultIcon(themeColors);
     }
     console.log("[UIService][updateToolbarButton] done for windowId:", windowId);
   }
