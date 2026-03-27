@@ -8,6 +8,17 @@ browser.runtime.onMessage.addListener(async (message, sender) => {
   }
 });
 
+function _validateWspId(id) {
+  if (typeof id !== "string" || !UUID_RE.test(id)) {
+    throw new Error("Invalid wspId: " + String(id));
+  }
+}
+function _validateWindowId(id) {
+  if (typeof id !== "number" || id <= 0 || !Number.isInteger(id)) {
+    throw new Error("Invalid windowId: " + String(id));
+  }
+}
+
 async function _handleMessage(message) {
   const { action, ...args } = message;
   // Summarize args to avoid dumping large workspace objects in logs
@@ -23,35 +34,44 @@ async function _handleMessage(message) {
 
   switch (action) {
     case "getWorkspaces":
+      _validateWindowId(message.windowId);
       result = await WorkspaceService.getOrderedWorkspaces(message.windowId);
       console.log("[Handler] getWorkspaces -> count:", result?.length);
       return result;
     case "createWorkspace":
+      _validateWindowId(message.windowId);
       await WorkspaceService.createWorkspace(message);
       console.log("[Handler] createWorkspace -> success");
       return { success: true };
     case "createWorkspaceWithTab":
+      _validateWindowId(message.windowId);
       result = await WorkspaceService.createWorkspaceWithTab(message);
       console.log("[Handler] createWorkspaceWithTab -> wspId:", result?.wspId, "tabId:", result?.tabId);
       return result;
     case "renameWorkspace":
+      _validateWspId(message.wspId);
       await WorkspaceService.renameWorkspace(message.wspId, { name: message.wspName, icon: message.wspIcon, color: message.wspColor });
       console.log("[Handler] renameWorkspace -> success");
       return { success: true };
     case "getNumWorkspaces":
+      _validateWindowId(message.windowId);
       result = await WSPStorageManager.getNumWorkspaces(message.windowId);
       console.log("[Handler] getNumWorkspaces -> count:", result);
       return result;
     case "hideInactiveWspTabs":
+      _validateWindowId(message.windowId);
       await WorkspaceService.hideInactiveWspTabs(message.windowId, message.activeWspId ?? null);
       console.log("[Handler] hideInactiveWspTabs -> success");
       return { success: true };
     case "destroyWsp":
+      _validateWspId(message.wspId);
       await WorkspaceService.destroyWsp(message.wspId);
       console.log("[Handler] destroyWsp -> success");
       return { success: true };
     case "activateWorkspace":
-      await WorkspaceService.activateWsp(message.wspId, message.windowId, message.tabId || null);
+      _validateWspId(message.wspId);
+      _validateWindowId(message.windowId);
+      await WorkspaceService.activateWsp(message.wspId, message.windowId, message.tabId ?? null);
       console.log("[Handler] activateWorkspace -> success");
       return { success: true };
     case "getWorkspaceName":
@@ -69,25 +89,31 @@ async function _handleMessage(message) {
       console.log("[Handler] getContainers -> count:", result?.length);
       return result;
     case "setWorkspaceContainer":
+      _validateWspId(message.wspId);
       await WorkspaceService.setWorkspaceContainer(message.wspId, message.containerId);
       console.log("[Handler] setWorkspaceContainer -> success");
       return { success: true };
     // Tier 2: Closed tabs
     case "getClosedTabs":
+      _validateWspId(message.wspId);
       result = await TabService.getClosedTabs(message.wspId);
       console.log("[Handler] getClosedTabs -> count:", result?.length);
       return result;
     case "restoreClosedTab":
+      _validateWspId(message.wspId);
+      _validateWindowId(message.windowId);
       result = await TabService.restoreClosedTab(message.wspId, message.index, message.windowId);
       console.log("[Handler] restoreClosedTab -> url:", result?.url);
       return result;
     case "clearClosedTabs":
+      _validateWspId(message.wspId);
       await TabService.clearClosedTabs(message.wspId);
       console.log("[Handler] clearClosedTabs -> success");
       return { success: true };
 
     // Tier 3: Workspace order
     case "saveWorkspaceOrder": {
+      _validateWindowId(message.windowId);
       const ids = message.orderedIds;
       if (!Array.isArray(ids) || !ids.every(id => typeof id === "string")) {
         console.warn("[Handler] saveWorkspaceOrder -> invalid orderedIds:", ids);
@@ -100,12 +126,14 @@ async function _handleMessage(message) {
 
     // Tier 3: Tab search
     case "searchTabs":
+      _validateWindowId(message.windowId);
       result = await TabService.searchTabs(message.query, message.windowId);
       console.log("[Handler] searchTabs -> results:", result?.length);
       return result;
 
     // Tier 3: Tab previews
     case "getTabPreviews":
+      _validateWspId(message.wspId);
       result = await TabService.getTabPreviews(message.wspId, message.limit);
       console.log("[Handler] getTabPreviews -> previews:", result?.previews?.length, "total:", result?.total);
       return result;

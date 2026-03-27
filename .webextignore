@@ -1,0 +1,15 @@
+.env
+.env.*
+.env.example
+scripts/
+.git/
+.gitignore
+.full-review-pipeline/
+docs/
+web-ext-artifacts/
+*.md
+!popup/**/*.md
+amo-metadata.json
+claude_.bat
+.claude/
+node_modules/

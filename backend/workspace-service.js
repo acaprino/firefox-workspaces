@@ -5,14 +5,15 @@
 // (destroyWsp, activateWsp, hideInactiveWspTabs, getActiveWsp, _buildDefaultWspData,
 // createWorkspace, getOrderedWorkspaces). Both are singletons in the same MV2 scope.
 class WorkspaceService {
-  static _activating = false;
+  static _activationChain = Promise.resolve();
+  static _activationInProgress = false;
   // In-memory cache of the active workspace's tab IDs for fast onTabActivated lookups.
   // Avoids a storage read on every tab click in the common case (tab already in active workspace).
   // Invalidated by activateWsp (replaced) and tab add/remove ops (updated or cleared).
   static _activeCache = null; // { windowId: number, tabIds: Set<number> } | null
 
   static isActivating() {
-    return this._activating;
+    return this._activationInProgress;
   }
 
   // Returns true/false if the tab's membership is known, or null if cache is cold/mismatched window.
@@ -186,7 +187,8 @@ class WorkspaceService {
         const toOtherWsp = new Map(); // wspId -> [tabId, ...]
         for (const tabId of tabsToAdd) {
           let sessionWspId;
-          try { sessionWspId = await browser.sessions.getTabValue(tabId, "wspId"); } catch {}
+          try { sessionWspId = await browser.sessions.getTabValue(tabId, "wspId"); }
+          catch (e) { console.debug("[WorkspaceService][_deactivateCurrentWspFromList] session lookup failed for tab", tabId, ":", e.message); }
           const target = sessionWspId ? workspaces.find(w => w.id === sessionWspId) : null;
           if (target && target.id !== activeWsp.id) {
             if (!toOtherWsp.has(target.id)) toOtherWsp.set(target.id, []);
@@ -251,18 +253,22 @@ class WorkspaceService {
     }
   }
 
-  // Concurrency-guarded workspace activation
+  // Serialized workspace activation via promise chain.
+  // If a second activation arrives while one is in flight, it queues after it
+  // instead of being silently dropped (old boolean guard behavior).
   static async activateWsp(wspId, windowId, activeTabId = null) {
     console.log("[WorkspaceService][activateWsp] wspId:", wspId,
       "windowId:", windowId, "activeTabId:", activeTabId,
-      "_activating:", WorkspaceService._activating);
-    if (this._activating) {
-      console.log("[WorkspaceService][activateWsp] skipped — already activating");
-      return;
-    }
-    this._activating = true;
+      "_activationInProgress:", WorkspaceService._activationInProgress);
+    WorkspaceService._activationChain = WorkspaceService._activationChain
+      .catch(() => {})
+      .then(() => WorkspaceService._doActivateWsp(wspId, windowId, activeTabId));
+    return WorkspaceService._activationChain;
+  }
+
+  static async _doActivateWsp(wspId, windowId, activeTabId) {
+    WorkspaceService._activationInProgress = true;
     try {
-      // Read workspace list once and reuse across deactivate + hide (saves 2 storage reads)
       const workspaces = await WSPStorageManager.getWorkspaces(windowId);
       console.log("[WorkspaceService][activateWsp] deactivating current workspace...");
       await WorkspaceService._deactivateCurrentWspFromList(workspaces, windowId);
@@ -271,14 +277,13 @@ class WorkspaceService {
       console.log("[WorkspaceService][activateWsp] activating:", wsp.id, wsp.name,
         "tabs:", wsp.tabs.length);
       await wsp.activate(activeTabId);
-      // Update cache immediately so onTabActivated fast-paths work after this point
       WorkspaceService._updateActiveCache(windowId, wsp.tabs);
       await WorkspaceService._hideInactiveFromList(workspaces, windowId, wspId);
       await MenuService.refreshTabMenu();
       await UIService.updateToolbarButton(windowId);
-      console.log("[WorkspaceService][activateWsp] done — wspId:", wspId);
+      console.log("[WorkspaceService][activateWsp] done -- wspId:", wspId);
     } finally {
-      this._activating = false;
+      WorkspaceService._activationInProgress = false;
     }
   }
 
@@ -339,8 +344,10 @@ class WorkspaceService {
 
     console.log("[WorkspaceService][_hideInactiveFromList] total tabs to hide:", allTabsToHide.length);
     if (allTabsToHide.length > 0) {
-      try { await browser.tabs.hide(allTabsToHide); } catch (e) { /* tabs may have closed */ }
-      try { await browser.tabs.ungroup(allTabsToHide); } catch (e) { /* tabs may have closed */ }
+      try { await browser.tabs.hide(allTabsToHide); }
+      catch (e) { console.debug("[WorkspaceService][_hideInactiveFromList] tabs.hide failed:", e.message); }
+      try { await browser.tabs.ungroup(allTabsToHide); }
+      catch (e) { console.debug("[WorkspaceService][_hideInactiveFromList] tabs.ungroup failed:", e.message); }
     }
 
     // Catch-all: handle visible tabs not belonging to the active workspace
@@ -364,7 +371,8 @@ class WorkspaceService {
           // Orphaned tab - check session value before defaulting to active workspace.
           // Late session-restored tabs retain their workspace tag from the previous session.
           let sessionWspId;
-          try { sessionWspId = await browser.sessions.getTabValue(tab.id, "wspId"); } catch {}
+          try { sessionWspId = await browser.sessions.getTabValue(tab.id, "wspId"); }
+          catch (e) { console.debug("[WorkspaceService][_hideInactiveFromList] session lookup failed for tab", tab.id, ":", e.message); }
           const sessionTarget = sessionWspId ? workspaces.find(w => w.id === sessionWspId) : null;
 
           if (sessionTarget && sessionTarget.id !== activeWspId) {
@@ -409,7 +417,8 @@ class WorkspaceService {
 
       if (toHide.length > 0) {
         console.log(`[Workspaces] Hiding ${toHide.length} orphaned visible tab(s):`, toHide);
-        try { await browser.tabs.hide(toHide); } catch (e) { /* tabs may have closed */ }
+        try { await browser.tabs.hide(toHide); }
+        catch (e) { console.debug("[WorkspaceService][_hideInactiveFromList] orphan tabs.hide failed:", e.message); }
       }
     }
     console.log("[WorkspaceService][_hideInactiveFromList] done");
@@ -485,7 +494,7 @@ class WorkspaceService {
 
     // Reopen tabs in the new container
     const oldToNew = new Map();
-    TabService._isReopening = true;
+    TabService._reopeningCount++;
     try {
       for (const tab of toMigrate) {
         const newTab = await TabService._reopenInContainer(tab, containerId);
@@ -494,7 +503,7 @@ class WorkspaceService {
         }
       }
     } finally {
-      TabService._isReopening = false;
+      TabService._reopeningCount--;
     }
     console.log("[WorkspaceService][_migrateTabsToContainer] reopened", oldToNew.size,
       "tabs, failed:", toMigrate.length - oldToNew.size);
@@ -532,7 +541,8 @@ class WorkspaceService {
     } else {
       // Inactive workspace: new tabs are created visible by default — hide them
       if (newTabIds.length > 0) {
-        try { await browser.tabs.hide(newTabIds); } catch (e) { /* tabs may have closed */ }
+        try { await browser.tabs.hide(newTabIds); }
+        catch (e) { console.debug("[WorkspaceService][_migrateTabsToContainer] tabs.hide failed:", e.message); }
         console.log("[WorkspaceService][_migrateTabsToContainer] hid", newTabIds.length,
           "tabs (inactive workspace)");
       }

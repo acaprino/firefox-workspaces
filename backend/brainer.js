@@ -4,6 +4,13 @@ class Brainer {
   static _state = 'uninitialized';
   static _initStarted = false;
   static _lastFocusedWindowId = null;
+  static _primaryWindowId = null;
+
+  static async getCachedPrimaryWindowId() {
+    if (Brainer._primaryWindowId != null) return Brainer._primaryWindowId;
+    Brainer._primaryWindowId = await WSPStorageManager.getPrimaryWindowId();
+    return Brainer._primaryWindowId;
+  }
 
   static async initialize() {
     Brainer._initStarted = true;
@@ -33,7 +40,7 @@ class Brainer {
         console.log("[Brainer][initialize] restore complete — state: ready");
         // Reconcile tabs that Firefox session-restored during the 'restoring' window.
         // Their onTabCreated was blocked, so they need explicit assignment.
-        await new Promise(r => setTimeout(r, 500));
+        await new Promise(r => setTimeout(r, LIMITS.RESTORE_DELAY_MS));
         await Brainer._reconcileLateTabs(currentWindow.id);
       } catch (e) {
         Brainer._state = 'uninitialized';
@@ -63,6 +70,7 @@ class Brainer {
 
     // Warm tab info cache so closed-tab tracking works from the start
     const primaryWindowId = await WSPStorageManager.getPrimaryWindowId();
+    Brainer._primaryWindowId = primaryWindowId;
     console.log("[Brainer][initialize] primaryWindowId after init:", primaryWindowId);
     if (primaryWindowId) await TabService.warmTabInfoCache(primaryWindowId);
 
@@ -89,6 +97,7 @@ class Brainer {
       const currentWindow = await browser.windows.getCurrent();
       console.log("[Brainer][_ensureDefaultWorkspace] no primary window — setting to:", currentWindow.id);
       await WSPStorageManager.setPrimaryWindowId(currentWindow.id);
+      Brainer._primaryWindowId = currentWindow.id;
 
       const activeWsp = await WorkspaceService.getActiveWsp(currentWindow.id);
       if (!activeWsp) {
@@ -161,6 +170,7 @@ class Brainer {
         if (primaryId === windowId) {
           console.log("[Brainer][onWindowRemoved] primary window closed — clearing primary, saving lastId");
           await WSPStorageManager.removePrimaryWindowId();
+          Brainer._primaryWindowId = null;
           await WSPStorageManager.setPrimaryWindowLastId(windowId);
           Brainer._state = 'uninitialized';
           console.log("[Brainer][onWindowRemoved] state reset to uninitialized");
@@ -277,7 +287,7 @@ class Brainer {
       if (bestScore > 0) return best;
       if (attempt === 0) {
         console.log("[Brainer][_findRestoreWindow] score=0, waiting 600ms before retry...");
-        await new Promise(r => setTimeout(r, 600));
+        await new Promise(r => setTimeout(r, LIMITS.RESTORE_WINDOW_DELAY_MS));
       }
     }
 
@@ -298,6 +308,7 @@ class Brainer {
     // All tab IDs are invalidated across restart; clear stale force-reopen entries
     TabService._forceReopenIds.clear();
     await WSPStorageManager.setPrimaryWindowId(window.id);
+    Brainer._primaryWindowId = window.id;
     const newTabs = await browser.tabs.query({windowId: window.id});
     console.log("[Brainer][_restoreWorkspaces] tabs in window:", newTabs.length);
 
@@ -308,7 +319,7 @@ class Brainer {
         const wspId = await browser.sessions.getTabValue(tab.id, "wspId");
         if (wspId) sessionMap.set(tab.id, wspId);
       } catch (e) {
-        // Tab may not have session value
+        console.debug("[Brainer] session lookup failed for tab", tab.id, ":", e.message);
       }
     }));
 
@@ -329,10 +340,10 @@ class Brainer {
       icon: wsp.icon || "",
       active: wsp.active,
       groups: wsp.groups,
-      containerId: wsp.containerId || null,
-      lastActiveTabId: wsp.lastActiveTabId || null,
-      color: wsp.color || null,
-      tabSnapshot: wsp.tabSnapshot || []
+      containerId: wsp.containerId ?? null,
+      lastActiveTabId: wsp.lastActiveTabId ?? null,
+      color: wsp.color ?? null,
+      tabSnapshot: wsp.tabSnapshot ?? []
     }));
 
     // If storage was wiped (e.g. extension reinstall cleared data) but session values
@@ -563,7 +574,8 @@ class Brainer {
 
     for (const tab of untracked) {
       let wspId;
-      try { wspId = await browser.sessions.getTabValue(tab.id, "wspId"); } catch {}
+      try { wspId = await browser.sessions.getTabValue(tab.id, "wspId"); }
+      catch (e) { console.debug("[Brainer][_reconcileLateTabs] session lookup failed for tab", tab.id, ":", e.message); }
       const target = wspId ? workspaces.find(w => w.id === wspId) : null;
       if (target) {
         if (!byWsp.has(wspId)) byWsp.set(wspId, []);
@@ -603,8 +615,10 @@ class Brainer {
     }
 
     if (toHide.length > 0) {
-      try { await browser.tabs.hide(toHide); } catch {}
-      try { await browser.tabs.ungroup(toHide); } catch {}
+      try { await browser.tabs.hide(toHide); }
+      catch (e) { console.debug("[Brainer][_reconcileLateTabs] tabs.hide failed:", e.message); }
+      try { await browser.tabs.ungroup(toHide); }
+      catch (e) { console.debug("[Brainer][_reconcileLateTabs] tabs.ungroup failed:", e.message); }
       console.log("[Brainer][_reconcileLateTabs] hidden", toHide.length, "inactive-workspace tabs");
     }
   }
@@ -625,7 +639,7 @@ class Brainer {
           console.log("[Brainer][onTabCreated] skipped — workspace activating");
           return;
         }
-        const primaryId = await WSPStorageManager.getPrimaryWindowId();
+        const primaryId = await Brainer.getCachedPrimaryWindowId();
         if (primaryId !== tab.windowId) {
           console.log("[Brainer][onTabCreated] skipped — not primary window (primary:", primaryId, ")");
           return;
@@ -646,7 +660,7 @@ class Brainer {
           console.log("[Brainer][onTabRemoved] skipped — state not ready");
           return;
         }
-        const primaryId = await WSPStorageManager.getPrimaryWindowId();
+        const primaryId = await Brainer.getCachedPrimaryWindowId();
         if (primaryId !== removeInfo.windowId) {
           console.log("[Brainer][onTabRemoved] skipped — not primary window (primary:", primaryId, ")");
           return;
@@ -723,7 +737,7 @@ class Brainer {
           console.log("[Brainer][onTabUpdated/pinned] skipped — state not ready");
           return;
         }
-        const primaryId = await WSPStorageManager.getPrimaryWindowId();
+        const primaryId = await Brainer.getCachedPrimaryWindowId();
         if (primaryId !== tab.windowId) {
           console.log("[Brainer][onTabUpdated/pinned] skipped — not primary window");
           return;
@@ -741,7 +755,7 @@ class Brainer {
     browser.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
       try {
         if (Brainer._state !== 'ready') return;
-        const primaryId = await WSPStorageManager.getPrimaryWindowId();
+        const primaryId = await Brainer.getCachedPrimaryWindowId();
         if (primaryId !== tab.windowId) return;
         if (!tab.hidden) {
           console.log("[Brainer][onTabUpdated/groupId] tabId:", tabId, "groupId changed — updating tab groups");
@@ -753,7 +767,7 @@ class Brainer {
 
     browser.tabGroups.onUpdated.addListener(async (group) => {
       try {
-        const primaryId = await WSPStorageManager.getPrimaryWindowId();
+        const primaryId = await Brainer.getCachedPrimaryWindowId();
         if (primaryId !== group.windowId) return;
         console.log("[Brainer][onTabGroupsUpdated] groupId:", group.id,
           "windowId:", group.windowId, "title:", group.title);

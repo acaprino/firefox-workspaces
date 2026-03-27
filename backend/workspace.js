@@ -7,14 +7,14 @@ class Workspace {
     this.tabs = Array.isArray(state.tabs) ? state.tabs : [];
     this.windowId = state.windowId;
     this.groups = Array.isArray(state.groups) ? state.groups : [];
-    this.lastActiveTabId = state.lastActiveTabId || null;
-    this.containerId = state.containerId || null;
-    this.color = state.color || null;
+    this.lastActiveTabId = state.lastActiveTabId ?? null;
+    this.containerId = state.containerId ?? null;
+    this.color = state.color ?? null;
     this.tabSnapshot = Array.isArray(state.tabSnapshot) ? state.tabSnapshot : [];
   }
 
   static async create(id, state) {
-    const wspId = id || crypto.randomUUID();
+    const wspId = id ?? crypto.randomUUID();
     console.log("[Workspace][create] wspId:", wspId, "name:", state.name,
       "windowId:", state.windowId, "tabs:", state.tabs?.length ?? 0,
       "active:", state.active, "containerId:", state.containerId || null);
@@ -110,14 +110,14 @@ class Workspace {
     } else {
       console.log("[Workspace][activate] no tabs at all -- creating fallback tab");
       // Guard against onCreated racing with the manual tabs.push below:
-      // _isReopening tells addTabToWorkspace to skip this tab.
-      TabService._isReopening = true;
+      // _reopeningCount > 0 tells addTabToWorkspace to skip this tab.
+      TabService._reopeningCount++;
       try {
         const fallbackTab = await this._createTabFallback();
         this.tabs.push(fallbackTab.id);
         await TabService.setTabSessionValue(fallbackTab.id, this.id);
       } finally {
-        TabService._isReopening = false;
+        TabService._reopeningCount--;
       }
     }
 
@@ -130,29 +130,11 @@ class Workspace {
         .filter(t => t && t.url)
         .map(t => t.url);
       console.log("[Workspace][activate] snapshot saved:", this.tabSnapshot.length, "URLs");
-    } catch (e) { /* non-critical — snapshot is a resilience measure */ }
+    } catch (e) { console.debug("[Workspace][activate] snapshot save failed:", e.message); }
 
     this.active = true;
     await this._saveState();
     console.log("[Workspace][activate] done — id:", this.id);
-  }
-
-  async hideTabs() {
-    console.log("[Workspace][hideTabs] id:", this.id, "name:", this.name,
-      "tabs:", this.tabs.length, "windowId:", this.windowId);
-    this.active = false;
-
-    this.tabs = await Workspace._filterValidTabs(this.tabs, this.windowId);
-    console.log("[Workspace][hideTabs] valid tabs to hide:", this.tabs.length);
-
-    // hide
-    if (this.tabs.length > 0) {
-      await browser.tabs.hide(this.tabs);
-      await browser.tabs.ungroup(this.tabs);
-      console.log("[Workspace][hideTabs] hidden and ungrouped", this.tabs.length, "tabs");
-    }
-    await this._saveState();
-    console.log("[Workspace][hideTabs] done — id:", this.id);
   }
 
   async updateTabGroups() {

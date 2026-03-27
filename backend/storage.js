@@ -44,6 +44,14 @@ const STORAGE_KEYS = {
   schemaVersion: 'ld-wsp-schema-version',
 };
 
+const LIMITS = {
+  MAX_CLOSED_TABS: 25,
+  MENU_DEBOUNCE_MS: 50,
+  RESTORE_DELAY_MS: 500,
+  RESTORE_WINDOW_DELAY_MS: 600,
+  FORCE_REOPEN_SAFETY_VALVE: 50,
+};
+
 class WSPStorageManager {
   static SCHEMA_VERSION = 2;
 
@@ -183,8 +191,7 @@ class WSPStorageManager {
       const results = await browser.storage.local.get(key);
       const closedTabs = results[key] || [];
       closedTabs.unshift(tabInfo);
-      // Keep max 25 closed tabs per workspace
-      if (closedTabs.length > 25) closedTabs.length = 25;
+      if (closedTabs.length > LIMITS.MAX_CLOSED_TABS) closedTabs.length = LIMITS.MAX_CLOSED_TABS;
       await browser.storage.local.set({[key]: closedTabs});
     });
   }
@@ -222,7 +229,7 @@ class WSPStorageManager {
   static async getWorkspaceOrder(windowId) {
     const key = STORAGE_KEYS.wspOrder(windowId);
     const results = await browser.storage.local.get(key);
-    return results[key] || null;
+    return results[key] ?? null;
   }
 
   static async saveWorkspaceOrder(windowId, orderedIds) {

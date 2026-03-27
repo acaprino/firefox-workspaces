@@ -101,7 +101,7 @@ class MenuService {
         console.log("[MenuService][refreshTabMenu] onClicked listener registered");
       }
       await MenuService.initializeTabMenu();
-    }, 50);
+    }, LIMITS.MENU_DEBOUNCE_MS);
   }
 
   static registerOmniboxListeners() {

@@ -18,7 +18,7 @@ class TabService {
   // Coarse phase guard: set by moveTabToWsp for the entire reopen window so that
   // even if onCreated fires before tabs.create() resolves (before the new tab ID
   // is in _forceReopenIds), it is still blocked from auto-assigning the tab.
-  static _isReopening = false;
+  static _reopeningCount = 0;
 
   // Close a tab and reopen it in the specified container.
   // Returns the new tab, or null if the reopen failed (original tab kept).
@@ -28,18 +28,18 @@ class TabService {
   //   assignment manually (moveTabToWsp). Use false when onCreated SHOULD fire to
   //   assign the new tab to the workspace (addTabToWorkspace's force-container path).
   //
-  // CONTRACT: callers passing suppressOnCreated=true MUST set _isReopening=true
+  // CONTRACT: callers passing suppressOnCreated=true MUST increment _reopeningCount
   //   before calling. Firefox can fire onCreated before tabs.create() resolves (before
-  //   the new tab ID is in _forceReopenIds), so _isReopening is the only guard
-  //   during that window. Not setting it re-introduces the race.
+  //   the new tab ID is in _forceReopenIds), so _reopeningCount > 0 is the only guard
+  //   during that window. Not incrementing it re-introduces the race.
   // Verify a container ID is usable. Returns the container object if valid, null if stale/deleted.
   static async _verifyContainer(containerId) {
     try {
       const container = await browser.contextualIdentities.get(containerId);
       console.log("[TabService][_verifyContainer] containerId:", containerId, "-> valid:", container.name);
       return container;
-    } catch {
-      console.debug("[TabService][_verifyContainer] containerId:", containerId, "-> not found (stale/deleted)");
+    } catch (e) {
+      console.debug("[TabService][_verifyContainer] containerId:", containerId, "-> not found (stale/deleted):", e.message);
       return null;
     }
   }
@@ -88,7 +88,7 @@ class TabService {
     console.log("[TabService][addTabToWorkspace] tabId:", tab.id,
       "windowId:", tab.windowId, "cookieStoreId:", tab.cookieStoreId,
       "skipForceContainer:", skipForceContainer,
-      "_isReopening:", TabService._isReopening,
+      "_reopeningCount:", TabService._reopeningCount,
       "inForceReopenIds:", TabService._forceReopenIds.has(tab.id));
 
     // Skip Firefox View and other special system tabs — never assign to workspaces
@@ -98,15 +98,15 @@ class TabService {
     }
 
     // Skip tabs created by force-container reopen (_reopenInContainer).
-    // Check _isReopening first: Firefox can fire onCreated before tabs.create()
+    // Check _reopeningCount first: Firefox can fire onCreated before tabs.create()
     // resolves, so the ID may not be in _forceReopenIds yet.
-    if (TabService._isReopening || TabService._forceReopenIds.has(tab.id)) {
+    if (TabService._reopeningCount > 0 || TabService._forceReopenIds.has(tab.id)) {
       TabService._forceReopenIds.delete(tab.id);
-      console.log("[TabService][addTabToWorkspace] skipped — force-reopen guard (isReopening or forceReopenIds)");
+      console.log("[TabService][addTabToWorkspace] skipped -- force-reopen guard (reopeningCount:", TabService._reopeningCount, "or forceReopenIds)");
       return false;
     }
     // Safety valve: clear stale entries that were never consumed (e.g. dropped onCreated events)
-    if (TabService._forceReopenIds.size > 50) {
+    if (TabService._forceReopenIds.size > LIMITS.FORCE_REOPEN_SAFETY_VALVE) {
       console.warn("[Workspaces] _forceReopenIds unexpectedly large, clearing");
       TabService._forceReopenIds.clear();
     }
@@ -141,7 +141,8 @@ class TabService {
             if (freshTarget.active) {
               WorkspaceService._activeCache?.tabIds.add(tab.id);
             } else {
-              try { await browser.tabs.hide(tab.id); } catch (e) { /* tab may have closed */ }
+              try { await browser.tabs.hide(tab.id); }
+              catch (e) { console.debug("[TabService][addTabToWorkspace] tabs.hide failed for tab", tab.id, ":", e.message); }
             }
             await TabService.setTabSessionValue(tab.id, sessionWspId);
             await MenuService.refreshTabMenu();
@@ -266,9 +267,9 @@ class TabService {
       toWsp.containerId, tab.cookieStoreId);
     if (toWsp.containerId && tab.cookieStoreId !== toWsp.containerId
         && TabService._canReopenInContainer(tab.url)) {
-      console.log("[TabService][moveTabToWsp] container mismatch — reopening tab in:", toWsp.containerId);
+      console.log("[TabService][moveTabToWsp] container mismatch -- reopening tab in:", toWsp.containerId);
+      TabService._reopeningCount++;
       try {
-        TabService._isReopening = true;
         const newTab = await TabService._reopenInContainer(tab, toWsp.containerId); // suppressOnCreated=true (default)
         if (newTab) {
           effectiveTabId = newTab.id;
@@ -278,7 +279,7 @@ class TabService {
           console.warn("[Workspaces] moveTabToWsp: reopen failed, keeping original tab");
         }
       } finally {
-        TabService._isReopening = false;
+        TabService._reopeningCount--;
       }
     }
 
@@ -318,7 +319,8 @@ class TabService {
         }
       }
 
-      try { await browser.tabs.ungroup(effectiveTabId); } catch (e) { /* tab may not support groups */ }
+      try { await browser.tabs.ungroup(effectiveTabId); }
+      catch (e) { console.debug("[TabService][moveTabToWsp] tabs.ungroup failed for tab", effectiveTabId, ":", e.message); }
     }
 
     await MenuService.refreshTabMenu();
@@ -398,7 +400,8 @@ class TabService {
         return url.startsWith(browser.runtime.getURL(""));
       }
       return parsed.protocol === "http:" || parsed.protocol === "https:";
-    } catch {
+    } catch (e) {
+      console.debug("[TabService][_isUrlAllowed] URL parse failed:", url, ":", e.message);
       return false;
     }
   }

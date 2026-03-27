@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "Workspaces",
-  "version": "2.6.29",
+  "version": "2.6.30",
   "description": "A workspace manager for Firefox",
   "icons": {
     "64": "icons/layered-light.svg",

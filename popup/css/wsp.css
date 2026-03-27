@@ -140,10 +140,6 @@ body {
   mask-repeat: no-repeat;
   mask-position: center;
   mask-size: contain;
-  -webkit-mask-image: url("../img/workspace-icon.svg");
-  -webkit-mask-repeat: no-repeat;
-  -webkit-mask-position: center;
-  -webkit-mask-size: contain;
   flex-shrink: 0;
 }
 
@@ -175,10 +171,6 @@ body {
   mask-repeat: no-repeat;
   mask-position: center;
   mask-size: contain;
-  -webkit-mask-image: url("../img/palette.svg");
-  -webkit-mask-repeat: no-repeat;
-  -webkit-mask-position: center;
-  -webkit-mask-size: contain;
 }
 
 #wsp-color-toggle:hover { opacity: 0.85; background: var(--wsp-hover); }
@@ -404,10 +396,6 @@ li.wsp-list-item .rename-btn::after {
   mask-repeat: no-repeat;
   mask-position: center;
   mask-size: contain;
-  -webkit-mask-image: url("../img/edit.svg");
-  -webkit-mask-repeat: no-repeat;
-  -webkit-mask-position: center;
-  -webkit-mask-size: contain;
 }
 
 li.wsp-list-item .delete-btn {
@@ -424,10 +412,6 @@ li.wsp-list-item .delete-btn::after {
   mask-repeat: no-repeat;
   mask-position: center;
   mask-size: contain;
-  -webkit-mask-image: url("../img/delete.svg");
-  -webkit-mask-repeat: no-repeat;
-  -webkit-mask-position: center;
-  -webkit-mask-size: contain;
 }
 
 li.wsp-list-item .rename-btn:hover::after {
@@ -660,10 +644,6 @@ li.no-wsp {
   mask-repeat: no-repeat;
   mask-position: center;
   mask-size: contain;
-  -webkit-mask-image: url("../img/plus.svg");
-  -webkit-mask-repeat: no-repeat;
-  -webkit-mask-position: center;
-  -webkit-mask-size: contain;
 }
 
 .wsp-closed-tab-item:hover .wsp-closed-tab-restore {
@@ -716,10 +696,6 @@ li.no-wsp {
   mask-repeat: no-repeat;
   mask-position: center;
   mask-size: contain;
-  -webkit-mask-image: url("../img/plus.svg");
-  -webkit-mask-repeat: no-repeat;
-  -webkit-mask-position: center;
-  -webkit-mask-size: contain;
   flex-shrink: 0;
   vertical-align: -2px;
   margin-inline-end: 6px;
@@ -930,30 +906,6 @@ li.no-wsp {
   outline: 2px solid var(--wsp-focus);
   outline-offset: -2px;
   border-color: transparent;
-}
-
-/* Force container checkbox row */
-.custom-dialog-force-container-row {
-  display: flex;
-  align-items: center;
-  margin-bottom: 16px;
-  font-size: 12px;
-}
-
-.custom-dialog-force-container-row label {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  color: var(--wsp-text-secondary);
-  cursor: pointer;
-  user-select: none;
-}
-
-.custom-dialog-force-container-row input[type="checkbox"] {
-  width: 14px;
-  height: 14px;
-  cursor: pointer;
-  accent-color: var(--wsp-primary);
 }
 
 /* Color picker row - vertical layout */
