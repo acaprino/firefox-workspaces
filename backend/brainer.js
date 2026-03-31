@@ -168,7 +168,8 @@ class Brainer {
         console.log("[Brainer][onWindowRemoved] windowId:", windowId);
         const primaryId = await WSPStorageManager.getPrimaryWindowId();
         if (primaryId === windowId) {
-          console.log("[Brainer][onWindowRemoved] primary window closed — clearing primary, saving lastId");
+          console.log("[Brainer][onWindowRemoved] primary window closed — flushing last active tab, clearing primary, saving lastId");
+          await WorkspaceService.flushLastActiveTab();
           await WSPStorageManager.removePrimaryWindowId();
           Brainer._primaryWindowId = null;
           await WSPStorageManager.setPrimaryWindowLastId(windowId);
@@ -342,6 +343,7 @@ class Brainer {
       groups: wsp.groups,
       containerId: wsp.containerId ?? null,
       lastActiveTabId: wsp.lastActiveTabId ?? null,
+      lastActiveTabUrl: wsp.lastActiveTabUrl ?? null,
       color: wsp.color ?? null,
       tabSnapshot: wsp.tabSnapshot ?? []
     }));
@@ -487,15 +489,26 @@ class Brainer {
       await Promise.all(
         wspObj.tabs.map(tabId => TabService.setTabSessionValue(tabId, wsp.id))
       );
-      if (wsp.active && wspObj.tabs.length > 0) {
-        // Preserve lastActiveTabId from before restart; only fall back to
-        // first tab if the saved tab is no longer in this workspace.
+      if (wspObj.tabs.length > 0) {
+        // After restart, tab IDs change. Remap lastActiveTabId via URL matching.
         if (!wspObj.lastActiveTabId || !wspObj.tabs.includes(wspObj.lastActiveTabId)) {
-          console.log("[Brainer][_restoreWorkspaces] lastActiveTabId stale for", wsp.name,
-            "— falling back to first tab:", wspObj.tabs[0]);
-          wspObj.lastActiveTabId = wspObj.tabs[0];
+          let remapped = null;
+          if (wsp.lastActiveTabUrl) {
+            const wspTabSet = new Set(wspObj.tabs);
+            const match = newTabs.find(t => wspTabSet.has(t.id) && t.url === wsp.lastActiveTabUrl);
+            if (match) {
+              remapped = match.id;
+              console.log("[Brainer][_restoreWorkspaces] remapped lastActiveTabId via URL for", wsp.name,
+                "url:", wsp.lastActiveTabUrl, "-> tabId:", remapped);
+            }
+          }
+          if (!remapped) {
+            console.log("[Brainer][_restoreWorkspaces] lastActiveTabId stale for", wsp.name,
+              "- falling back to first tab:", wspObj.tabs[0]);
+          }
+          wspObj.lastActiveTabId = remapped || wspObj.tabs[0];
+          await wspObj._saveState();
         }
-        await wspObj._saveState();
       }
     }
 
@@ -693,7 +706,10 @@ class Brainer {
         const cacheResult = WorkspaceService.isTabInActiveWsp(activeInfo.windowId, activeInfo.tabId);
         console.log("[Brainer][onTabActivated] cache result:", cacheResult);
         if (cacheResult === true) {
-          console.log("[Brainer][onTabActivated] fast-path hit — tab in active workspace, no action");
+          // Persist lastActiveTabId/Url so shutdown captures the correct tab.
+          // Fire-and-forget to avoid slowing down tab switches.
+          WorkspaceService.updateLastActiveTab(activeInfo.windowId, activeInfo.tabId);
+          console.log("[Brainer][onTabActivated] fast-path hit - tab in active workspace, no action");
           return;
         }
 
@@ -703,7 +719,10 @@ class Brainer {
           "tabs:", activeWsp?.tabs.length);
 
         if (!activeWsp || activeWsp.tabs.includes(activeInfo.tabId)) {
-          console.log("[Brainer][onTabActivated] tab already in active workspace or no active wsp — no action");
+          if (activeWsp) {
+            WorkspaceService.updateLastActiveTab(activeInfo.windowId, activeInfo.tabId);
+          }
+          console.log("[Brainer][onTabActivated] tab already in active workspace or no active wsp - no action");
           return;
         }
 

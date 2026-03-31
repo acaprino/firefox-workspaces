@@ -8,6 +8,7 @@ class Workspace {
     this.windowId = state.windowId;
     this.groups = Array.isArray(state.groups) ? state.groups : [];
     this.lastActiveTabId = state.lastActiveTabId ?? null;
+    this.lastActiveTabUrl = state.lastActiveTabUrl ?? null;
     this.containerId = state.containerId ?? null;
     this.color = state.color ?? null;
     this.tabSnapshot = Array.isArray(state.tabSnapshot) ? state.tabSnapshot : [];
@@ -213,6 +214,7 @@ class Workspace {
       groups: this.groups,
       windowId: this.windowId,
       lastActiveTabId: this.lastActiveTabId,
+      lastActiveTabUrl: this.lastActiveTabUrl,
       containerId: this.containerId,
       color: this.color,
       tabSnapshot: this.tabSnapshot

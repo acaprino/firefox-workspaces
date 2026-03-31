@@ -23,6 +23,49 @@ class WorkspaceService {
     return c.tabIds.has(tabId);
   }
 
+  // Debounced persist of last active tab so shutdown/restart restores it.
+  // Stores pending args so flushLastActiveTab() can execute on shutdown.
+  static _lastActiveTimer = null;
+  static _lastActivePending = null; // { windowId, tabId, url }
+
+  static updateLastActiveTab(windowId, tabId) {
+    clearTimeout(WorkspaceService._lastActiveTimer);
+    WorkspaceService._lastActivePending = { windowId, tabId, url: null };
+    // Eagerly read tab URL so flush doesn't need a live tab (tabs are
+    // already destroyed when onWindowRemoved fires).
+    browser.tabs.get(tabId).then(tab => {
+      const p = WorkspaceService._lastActivePending;
+      if (p && p.windowId === windowId && p.tabId === tabId) {
+        p.url = tab.url || null;
+      }
+    }).catch(() => {});
+    WorkspaceService._lastActiveTimer = setTimeout(() => {
+      WorkspaceService._flushLastActiveTabImpl();
+    }, 500);
+  }
+
+  static async _flushLastActiveTabImpl() {
+    const pending = WorkspaceService._lastActivePending;
+    WorkspaceService._lastActivePending = null;
+    clearTimeout(WorkspaceService._lastActiveTimer);
+    WorkspaceService._lastActiveTimer = null;
+    if (!pending) return;
+    try {
+      const activeWsp = await WorkspaceService.getActiveWsp(pending.windowId);
+      if (!activeWsp || !activeWsp.tabs.includes(pending.tabId)) return;
+      activeWsp.lastActiveTabId = pending.tabId;
+      activeWsp.lastActiveTabUrl = pending.url;
+      await activeWsp._saveState();
+    } catch (e) {
+      console.debug("[WorkspaceService][updateLastActiveTab] failed:", e.message);
+    }
+  }
+
+  // Flush any pending debounced save immediately (called on shutdown).
+  static async flushLastActiveTab() {
+    await WorkspaceService._flushLastActiveTabImpl();
+  }
+
   static _updateActiveCache(windowId, tabIds) {
     WorkspaceService._activeCache = { windowId, tabIds: new Set(tabIds) };
     console.log("[WorkspaceService][_updateActiveCache] windowId:", windowId, "tabIds:", tabIds.length);
@@ -245,9 +288,18 @@ class WorkspaceService {
       const browserActiveTabId = (await browser.tabs.query({active: true, windowId}))[0]?.id || null;
       const fallback = freshWsp.tabs.includes(freshWsp.lastActiveTabId) ? freshWsp.lastActiveTabId : null;
       freshWsp.lastActiveTabId = freshWsp.tabs.includes(browserActiveTabId) ? browserActiveTabId : fallback;
+      // Save the URL of the last active tab so we can remap after restart
+      // (Firefox assigns new tab IDs on restart, making the numeric ID stale).
+      if (freshWsp.lastActiveTabId) {
+        const lastActiveTab = currentTabs.find(t => t.id === freshWsp.lastActiveTabId);
+        freshWsp.lastActiveTabUrl = lastActiveTab ? lastActiveTab.url : null;
+      } else {
+        freshWsp.lastActiveTabUrl = null;
+      }
       console.log("[WorkspaceService][_deactivateCurrentWspFromList] deactivating",
         freshWsp.id, "| tabs:", freshWsp.tabs.length,
         "| lastActiveTabId:", freshWsp.lastActiveTabId,
+        "| lastActiveTabUrl:", freshWsp.lastActiveTabUrl,
         "| snapshot URLs:", freshWsp.tabSnapshot.length);
       await freshWsp._saveState();
     }
@@ -267,6 +319,12 @@ class WorkspaceService {
   }
 
   static async _doActivateWsp(wspId, windowId, activeTabId) {
+    // Cancel any pending debounced lastActiveTab save to prevent it from
+    // running during activation and clobbering _deactivateCurrentWspFromList's
+    // state (read-modify-write race on the same workspace).
+    clearTimeout(WorkspaceService._lastActiveTimer);
+    WorkspaceService._lastActiveTimer = null;
+    WorkspaceService._lastActivePending = null;
     WorkspaceService._activationInProgress = true;
     try {
       const workspaces = await WSPStorageManager.getWorkspaces(windowId);
