@@ -1,8 +1,15 @@
 // Bookmark export/restore for workspaces
 // Exports workspace tabs as a bookmarks folder under "Other Bookmarks > Workspaces".
 // Restores a workspace from a bookmarks folder.
+
+// Control characters, bidi overrides, and zero-width chars -- same pattern as
+// handler.js CONTROL_AND_BIDI_RE. Duplicated here so BookmarkService sanitizes
+// names defensively regardless of call site (defense-in-depth).
+const _BOOKMARK_CONTROL_RE = /[\x00-\x1F\x7F\u202A-\u202E\u2066-\u2069]/g;
+
 class BookmarkService {
   static PARENT_FOLDER_TITLE = "Workspaces";
+  static MAX_RESTORE_TABS = 200;
 
   // Find or create the "Workspaces" parent folder under Other Bookmarks (unfiled).
   static async _getOrCreateParentFolder() {
@@ -17,11 +24,18 @@ class BookmarkService {
     }
     const folder = await browser.bookmarks.create({
       parentId: "unfiled_____",
-      title: BookmarkService.PARENT_FOLDER_TITLE,
-      type: "folder"
+      title: BookmarkService.PARENT_FOLDER_TITLE
     });
     console.log("[BookmarkService][_getOrCreateParentFolder] created new folder:", folder.id);
     return folder;
+  }
+
+  // Sanitize a bookmark folder title for use as a workspace name.
+  static _sanitizeFolderTitle(title) {
+    return (title || "Restored Workspace")
+      .replace(_BOOKMARK_CONTROL_RE, '')
+      .trim()
+      .slice(0, 200) || "Restored Workspace";
   }
 
   // Export a workspace's tabs as bookmarks under Workspaces/{workspace name}.
@@ -34,36 +48,44 @@ class BookmarkService {
 
     const parent = await BookmarkService._getOrCreateParentFolder();
 
-    // Check if a subfolder with the same name already exists
-    let folderTitle = wsp.name;
+    // Resolve a unique folder name under the Workspaces parent
     const children = await browser.bookmarks.getChildren(parent.id);
-    const nameExists = children.some(
-      c => c.type === "folder" && c.title === folderTitle
+    const existingNames = new Set(
+      children.filter(c => c.type === "folder").map(c => c.title)
     );
-    if (nameExists) {
-      const now = new Date();
-      const dateSuffix = now.toISOString().slice(0, 10);
-      folderTitle = `${wsp.name} (${dateSuffix})`;
+    let folderTitle = wsp.name;
+    if (existingNames.has(folderTitle)) {
+      const dateSuffix = new Date().toISOString().slice(0, 10);
+      let candidate = `${wsp.name} (${dateSuffix})`;
+      let counter = 2;
+      while (existingNames.has(candidate)) {
+        candidate = `${wsp.name} (${dateSuffix} #${counter})`;
+        counter++;
+      }
+      folderTitle = candidate;
       console.log("[BookmarkService][exportWorkspace] name collision, using:", folderTitle);
     }
 
     const folder = await browser.bookmarks.create({
       parentId: parent.id,
-      title: folderTitle,
-      type: "folder"
+      title: folderTitle
     });
     console.log("[BookmarkService][exportWorkspace] created folder:", folder.id, "title:", folderTitle);
 
-    // Get live tab info for URLs and titles
+    // Batch-fetch all tab info in one call, then filter by workspace tabs
+    const allTabs = await browser.tabs.query({ windowId: wsp.windowId });
+    const tabMap = new Map(allTabs.map(t => [t.id, t]));
     let exported = 0;
+
     for (const tabId of wsp.tabs) {
+      const tab = tabMap.get(tabId);
+      if (!tab || !tab.url) continue;
+      // Skip non-bookmarkable URLs
+      if (!TabService._isUrlAllowed(tab.url)) {
+        console.debug("[BookmarkService][exportWorkspace] skipping non-bookmarkable tab:", tab.url);
+        continue;
+      }
       try {
-        const tab = await browser.tabs.get(tabId);
-        // Skip about: and other non-bookmarkable URLs
-        if (!tab.url || tab.url.startsWith("about:") || tab.url.startsWith("moz-extension:")) {
-          console.debug("[BookmarkService][exportWorkspace] skipping non-bookmarkable tab:", tab.url);
-          continue;
-        }
         await browser.bookmarks.create({
           parentId: folder.id,
           title: tab.title || tab.url,
@@ -109,40 +131,62 @@ class BookmarkService {
   // Restore a workspace from a bookmarks folder.
   // Creates a new workspace and opens all bookmarked URLs as tabs.
   static async restoreWorkspace(folderId, windowId) {
-    const [folder] = await browser.bookmarks.get(folderId);
+    // Validate folder exists and provide a friendly error
+    let folder;
+    try {
+      [folder] = await browser.bookmarks.get(folderId);
+    } catch {
+      throw new Error("Bookmark folder not found");
+    }
     if (!folder || folder.type !== "folder") {
       throw new Error("Bookmark folder not found");
     }
+
+    // [H1] Verify the folder is a child of the Workspaces parent
+    const parent = await BookmarkService._getOrCreateParentFolder();
+    if (folder.parentId !== parent.id) {
+      throw new Error("Folder is not a Workspaces export folder");
+    }
+
     console.log("[BookmarkService][restoreWorkspace] folderId:", folderId,
       "title:", folder.title, "windowId:", windowId);
 
     const items = await browser.bookmarks.getChildren(folderId);
+    // [H2] Use the allowlist URL filter instead of denylist
     const urls = items
-      .filter(i => i.url && !i.url.startsWith("about:") && !i.url.startsWith("moz-extension:"))
+      .filter(i => i.url && TabService._isUrlAllowed(i.url))
       .map(i => ({ url: i.url, title: i.title }));
 
     if (urls.length === 0) {
       throw new Error("No bookmarks to restore");
     }
 
+    // [M2] Prevent unbounded tab creation
+    if (urls.length > BookmarkService.MAX_RESTORE_TABS) {
+      throw new Error(`Too many bookmarks to restore (${urls.length}, max ${BookmarkService.MAX_RESTORE_TABS})`);
+    }
+
     console.log("[BookmarkService][restoreWorkspace] restoring", urls.length, "bookmarks as tabs");
 
-    // Build workspace data (createWorkspace handles deactivation internally)
+    // [M1] Sanitize folder title before using as workspace name
     const wspData = WorkspaceService._buildDefaultWspData(windowId, []);
-    wspData.name = folder.title;
+    wspData.name = BookmarkService._sanitizeFolderTitle(folder.title);
     wspData.active = true;
 
-    // Create the workspace
-    await WorkspaceService.createWorkspace(wspData);
-    const wspId = wspData.id;
-
-    // Create tabs for each bookmark
-    const wsp = await WSPStorageManager.getWorkspace(wspId);
-    const containerId = wsp.containerId || null;
-    const tabIds = [];
-
+    // [M4 + Firefox reviewer] Guard _reopeningCount BEFORE createWorkspace
+    // to prevent the entire workspace creation + tab creation sequence from
+    // being intercepted by addTabToWorkspace.
     TabService._reopeningCount++;
     try {
+      // Create the workspace (internally calls deactivateCurrentWsp)
+      await WorkspaceService.createWorkspace(wspData);
+      const wspId = wspData.id;
+
+      // Create tabs for each bookmark
+      const wsp = await WSPStorageManager.getWorkspace(wspId);
+      const containerId = wsp.containerId || null;
+      const tabIds = [];
+
       for (const item of urls) {
         const createOpts = { url: item.url, windowId, active: false };
         if (containerId) createOpts.cookieStoreId = containerId;
@@ -154,28 +198,35 @@ class BookmarkService {
           console.debug("[BookmarkService][restoreWorkspace] failed to create tab for:", item.url, e.message);
         }
       }
+
+      // [H3] Rollback if no tabs were created
+      if (tabIds.length === 0) {
+        console.warn("[BookmarkService][restoreWorkspace] all tab creations failed -- rolling back");
+        await WorkspaceService.destroyWsp(wspId, windowId).catch(e =>
+          console.warn("[BookmarkService][restoreWorkspace] rollback destroy failed:", e.message)
+        );
+        throw new Error("Failed to restore any tabs from bookmarks");
+      }
+
+      // Update workspace with created tabs
+      const freshWsp = await WSPStorageManager.getWorkspace(wspId);
+      freshWsp.tabs = tabIds;
+      await freshWsp._saveState();
+
+      // Activate the first tab
+      await browser.tabs.update(tabIds[0], { active: true });
+
+      // Hide inactive workspace tabs
+      await WorkspaceService.hideInactiveWspTabs(windowId, wspId);
+      WorkspaceService._updateActiveCache(windowId, tabIds);
+      await MenuService.refreshTabMenu();
+      await UIService.updateToolbarButton(windowId);
+
+      console.log("[BookmarkService][restoreWorkspace] done - wspId:", wspId,
+        "tabs:", tabIds.length);
+      return { wspId, name: wspData.name, tabCount: tabIds.length };
     } finally {
       TabService._reopeningCount--;
     }
-
-    // Update workspace with created tabs
-    const freshWsp = await WSPStorageManager.getWorkspace(wspId);
-    freshWsp.tabs = tabIds;
-    await freshWsp._saveState();
-
-    // Activate the first tab
-    if (tabIds.length > 0) {
-      await browser.tabs.update(tabIds[0], { active: true });
-    }
-
-    // Hide inactive workspace tabs
-    await WorkspaceService.hideInactiveWspTabs(windowId, wspId);
-    WorkspaceService._updateActiveCache(windowId, tabIds);
-    await MenuService.refreshTabMenu();
-    await UIService.updateToolbarButton(windowId);
-
-    console.log("[BookmarkService][restoreWorkspace] done - wspId:", wspId,
-      "tabs:", tabIds.length);
-    return { wspId, name: folder.title, tabCount: tabIds.length };
   }
 }

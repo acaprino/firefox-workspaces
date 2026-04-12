@@ -588,13 +588,14 @@ class WorkspaceUI {
           wspId: workspace.id,
           windowId: this.currentWindowId,
         });
-        if (destroyResult?._error) {
-          console.log("[WorkspaceUI][exportBtn] destroy failed:", destroyResult.message);
+        // _callBackgroundTask returns null for error responses
+        if (!destroyResult) {
+          console.log("[WorkspaceUI][exportBtn] destroy failed");
           return;
         }
         const liParent = li.parentElement;
         li.parentNode.removeChild(li);
-        if (wasActive && destroyResult?.activatedWspId) {
+        if (wasActive && destroyResult.activatedWspId) {
           const targetLi = liParent.querySelector(`[data-wsp-id="${destroyResult.activatedWspId}"]`);
           if (targetLi) targetLi.classList.add("active");
         }
@@ -712,8 +713,9 @@ class WorkspaceUI {
         wspId: workspace.id,
         windowId: this.currentWindowId,
       });
-      if (destroyResult?._error) {
-        console.log("[WorkspaceUI][deleteBtn] destroy failed:", destroyResult.message);
+      // _callBackgroundTask returns null for error responses
+      if (!destroyResult) {
+        console.log("[WorkspaceUI][deleteBtn] destroy failed");
         return;
       }
 
@@ -721,7 +723,7 @@ class WorkspaceUI {
       li.parentNode.removeChild(li);
 
       // Backend already activated another workspace -- just update the DOM
-      if (wasActive && destroyResult?.activatedWspId) {
+      if (wasActive && destroyResult.activatedWspId) {
         const targetLi = liParent.querySelector(`[data-wsp-id="${destroyResult.activatedWspId}"]`);
         if (targetLi) {
           console.log("[WorkspaceUI][deleteBtn] marking activated:", destroyResult.activatedWspId);
