@@ -16,7 +16,7 @@ const HEX_COLOR_RE = /^#?[0-9a-f]{6}$/i;
 // for visual spoofing in toolbar tooltips or log injection via newlines.
 // Stripping these from workspace names is defense-in-depth — popup rendering
 // uses .textContent (no XSS risk) but setTitle/console.log are not HTML-safe.
-const CONTROL_AND_BIDI_RE = /[\x00-\x1F\x7F\u202A-\u202E\u2066-\u2069]/g;
+const CONTROL_AND_BIDI_RE = /[\x00-\x1F\x7F\u200B-\u200F\u202A-\u202E\u2060-\u2069\uFEFF]/g;
 
 function _validateWspId(id) {
   if (typeof id !== "string" || !UUID_RE.test(id)) {
@@ -217,11 +217,26 @@ async function _handleMessage(message) {
       return result;
 
     // Tier 4: Bookmark export/restore
-    case "exportWorkspaceToBookmarks":
+    case "exportWorkspaceToBookmarks": {
       _validateWspId(message.wspId);
       result = await BookmarkService.exportWorkspace(message.wspId);
       console.log("[Handler] exportWorkspaceToBookmarks -> exported:", result?.exported);
+      // Atomic export+destroy: if the popup requested destroy, handle it here
+      // so the operation completes even if the popup closes mid-flow.
+      if (message.destroyAfter && result) {
+        if (message.windowId != null) _validateWindowId(message.windowId);
+        try {
+          const destroyResult = await WorkspaceService.destroyWsp(message.wspId, message.windowId ?? null);
+          result.destroyed = true;
+          result.activatedWspId = destroyResult?.activatedWspId;
+        } catch (e) {
+          const msg = e?.message ?? String(e);
+          console.warn("[Handler] exportWorkspaceToBookmarks destroy failed:", msg);
+          result.destroyed = false;
+        }
+      }
       return result;
+    }
     case "getBookmarkWorkspaces":
       result = await BookmarkService.getExportedWorkspaces();
       console.log("[Handler] getBookmarkWorkspaces -> count:", result?.length);
@@ -231,7 +246,18 @@ async function _handleMessage(message) {
       if (typeof message.folderId !== "string" || !message.folderId) {
         throw new Error("Invalid folderId");
       }
-      result = await BookmarkService.restoreWorkspace(message.folderId, message.windowId);
+      try {
+        result = await BookmarkService.restoreWorkspace(message.folderId, message.windowId);
+      } catch (e) {
+        const msg = e?.message ?? String(e);
+        if (msg.startsWith("No bookmarks") || msg.startsWith("Too many") ||
+            msg.startsWith("Bookmark folder") || msg.startsWith("Folder is not") ||
+            msg.startsWith("Failed to restore")) {
+          console.log("[Handler] restoreWorkspaceFromBookmarks -> refused:", msg);
+          return { _error: true, message: msg };
+        }
+        throw e;
+      }
       console.log("[Handler] restoreWorkspaceFromBookmarks -> wspId:", result?.wspId, "tabs:", result?.tabCount);
       return result;
 

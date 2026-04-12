@@ -5,7 +5,7 @@
 // Control characters, bidi overrides, and zero-width chars -- same pattern as
 // handler.js CONTROL_AND_BIDI_RE. Duplicated here so BookmarkService sanitizes
 // names defensively regardless of call site (defense-in-depth).
-const _BOOKMARK_CONTROL_RE = /[\x00-\x1F\x7F\u202A-\u202E\u2066-\u2069]/g;
+const _BOOKMARK_CONTROL_RE = /[\x00-\x1F\x7F\u200B-\u200F\u202A-\u202E\u2060-\u2069\uFEFF]/g;
 
 class BookmarkService {
   static PARENT_FOLDER_TITLE = "Workspaces";
@@ -46,6 +46,17 @@ class BookmarkService {
     console.log("[BookmarkService][exportWorkspace] wspId:", wspId,
       "name:", wsp.name, "tabs:", wsp.tabs.length);
 
+    // Batch-fetch all tab info and pre-check for bookmarkable tabs
+    const allTabs = await browser.tabs.query({ windowId: wsp.windowId });
+    const tabMap = new Map(allTabs.map(t => [t.id, t]));
+    const bookmarkableTabs = wsp.tabs.filter(tabId => {
+      const tab = tabMap.get(tabId);
+      return tab && tab.url && TabService._isUrlAllowed(tab.url);
+    });
+    if (bookmarkableTabs.length === 0) {
+      throw new Error("No bookmarkable tabs to export");
+    }
+
     const parent = await BookmarkService._getOrCreateParentFolder();
 
     // Resolve a unique folder name under the Workspaces parent
@@ -58,7 +69,7 @@ class BookmarkService {
       const dateSuffix = new Date().toISOString().slice(0, 10);
       let candidate = `${wsp.name} (${dateSuffix})`;
       let counter = 2;
-      while (existingNames.has(candidate)) {
+      while (existingNames.has(candidate) && counter < 1000) {
         candidate = `${wsp.name} (${dateSuffix} #${counter})`;
         counter++;
       }
@@ -72,19 +83,9 @@ class BookmarkService {
     });
     console.log("[BookmarkService][exportWorkspace] created folder:", folder.id, "title:", folderTitle);
 
-    // Batch-fetch all tab info in one call, then filter by workspace tabs
-    const allTabs = await browser.tabs.query({ windowId: wsp.windowId });
-    const tabMap = new Map(allTabs.map(t => [t.id, t]));
     let exported = 0;
-
-    for (const tabId of wsp.tabs) {
+    for (const tabId of bookmarkableTabs) {
       const tab = tabMap.get(tabId);
-      if (!tab || !tab.url) continue;
-      // Skip non-bookmarkable URLs
-      if (!TabService._isUrlAllowed(tab.url)) {
-        console.debug("[BookmarkService][exportWorkspace] skipping non-bookmarkable tab:", tab.url);
-        continue;
-      }
       try {
         await browser.bookmarks.create({
           parentId: folder.id,
@@ -114,18 +115,11 @@ class BookmarkService {
     const folders = children.filter(c => c.type === "folder");
     console.log("[BookmarkService][getExportedWorkspaces] found", folders.length, "folders");
 
-    // For each folder, count bookmarks
-    const result = [];
-    for (const f of folders) {
+    // Fetch bookmark counts in parallel
+    return Promise.all(folders.map(async (f) => {
       const items = await browser.bookmarks.getChildren(f.id);
-      const bookmarkCount = items.filter(i => i.url).length;
-      result.push({
-        id: f.id,
-        title: f.title,
-        bookmarkCount
-      });
-    }
-    return result;
+      return { id: f.id, title: f.title, bookmarkCount: items.filter(i => i.url).length };
+    }));
   }
 
   // Restore a workspace from a bookmarks folder.

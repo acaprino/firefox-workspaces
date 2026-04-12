@@ -267,41 +267,47 @@ class WorkspaceUI {
   }
 
   _setupRestoreButton() {
-    document.getElementById("restoreFromBookmarks").addEventListener("click", async (e) => {
+    const restoreLink = document.getElementById("restoreFromBookmarks");
+    restoreLink.addEventListener("click", async (e) => {
       e.preventDefault();
-      console.log("[WorkspaceUI][restoreFromBookmarks] clicked");
+      if (restoreLink.dataset.busy) return;
+      restoreLink.dataset.busy = "1";
+      try {
+        console.log("[WorkspaceUI][restoreFromBookmarks] clicked");
 
-      const folders = await this._callBackgroundTask("getBookmarkWorkspaces");
-      if (!folders || folders.length === 0) {
-        await showCustomDialog({ message: "No saved workspaces found in bookmarks." });
-        return;
+        const folders = await this._callBackgroundTask("getBookmarkWorkspaces");
+        if (!folders || folders.length === 0) {
+          await showCustomDialog({ message: "No saved workspaces found in bookmarks." });
+          return;
+        }
+
+        const result = await showCustomDialog({
+          message: "Restore workspace from bookmarks:",
+          showFolderPicker: true,
+          folders
+        });
+
+        if (!result) {
+          console.log("[WorkspaceUI][restoreFromBookmarks] cancelled");
+          return;
+        }
+
+        console.log("[WorkspaceUI][restoreFromBookmarks] restoring folder:", result.folderId);
+        const restored = await this._callBackgroundTask("restoreWorkspaceFromBookmarks", {
+          folderId: result.folderId,
+          windowId: this.currentWindowId
+        });
+
+        if (!restored) {
+          console.log("[WorkspaceUI][restoreFromBookmarks] restore failed");
+          return;
+        }
+
+        console.log("[WorkspaceUI][restoreFromBookmarks] restored:", restored.name, "tabs:", restored.tabCount);
+        window.close();
+      } finally {
+        delete restoreLink.dataset.busy;
       }
-
-      const result = await showCustomDialog({
-        message: "Restore workspace from bookmarks:",
-        showFolderPicker: true,
-        folders
-      });
-
-      if (!result) {
-        console.log("[WorkspaceUI][restoreFromBookmarks] cancelled");
-        return;
-      }
-
-      console.log("[WorkspaceUI][restoreFromBookmarks] restoring folder:", result.folderId);
-      const restored = await this._callBackgroundTask("restoreWorkspaceFromBookmarks", {
-        folderId: result.folderId,
-        windowId: this.currentWindowId
-      });
-
-      if (!restored) {
-        console.log("[WorkspaceUI][restoreFromBookmarks] restore failed");
-        return;
-      }
-
-      console.log("[WorkspaceUI][restoreFromBookmarks] restored:", restored.name, "tabs:", restored.tabCount);
-      // Reload popup to show the new workspace
-      window.close();
     });
   }
 
@@ -429,8 +435,11 @@ class WorkspaceUI {
 
       const idx = i;
       li.addEventListener("click", async () => {
+        // Disable all closed-tab items to prevent stale-index clicks
+        const allItems = list.querySelectorAll(".wsp-closed-tab-item");
+        for (const item of allItems) item.style.pointerEvents = "none";
+
         console.log("[WorkspaceUI][restoreClosedTab] restoring index:", idx, "url:", tab.url);
-        // Tab creation happens in the background handler (respects container)
         await this._callBackgroundTask("restoreClosedTab", {
           wspId: activeWsp.id,
           index: idx,
@@ -558,47 +567,48 @@ class WorkspaceUI {
     // Export to bookmarks
     exportBtn.addEventListener("click", async (e) => {
       e.stopPropagation();
-      console.log("[WorkspaceUI][exportBtn] clicked for workspace:", workspace.id, workspace.name);
+      if (exportBtn.disabled) return;
+      exportBtn.disabled = true;
+      try {
+        console.log("[WorkspaceUI][exportBtn] clicked for workspace:", workspace.id, workspace.name);
 
-      const result = await showCustomDialog({
-        message: `Export "${li.dataset.originalText}" to bookmarks?`,
-        showCheckbox: true,
-        checkboxLabel: "Close workspace after export",
-        checkboxDefault: false
-      });
-
-      if (!result) {
-        console.log("[WorkspaceUI][exportBtn] export cancelled");
-        return;
-      }
-
-      const exportResult = await this._callBackgroundTask("exportWorkspaceToBookmarks", {
-        wspId: workspace.id
-      });
-      if (!exportResult) {
-        console.log("[WorkspaceUI][exportBtn] export failed");
-        return;
-      }
-      console.log("[WorkspaceUI][exportBtn] exported", exportResult.exported, "tabs to:", exportResult.folderTitle);
-
-      if (result.checked) {
-        console.log("[WorkspaceUI][exportBtn] closing workspace after export");
-        const wasActive = li.classList.contains("active");
-        const destroyResult = await this._callBackgroundTask("destroyWsp", {
-          wspId: workspace.id,
-          windowId: this.currentWindowId,
+        const result = await showCustomDialog({
+          message: `Export "${li.dataset.originalText}" to bookmarks?`,
+          showCheckbox: true,
+          checkboxLabel: "Close workspace after export",
+          checkboxDefault: false
         });
-        // _callBackgroundTask returns null for error responses
-        if (!destroyResult) {
-          console.log("[WorkspaceUI][exportBtn] destroy failed");
+
+        if (!result) {
+          console.log("[WorkspaceUI][exportBtn] export cancelled");
           return;
         }
-        const liParent = li.parentElement;
-        li.parentNode.removeChild(li);
-        if (wasActive && destroyResult.activatedWspId) {
-          const targetLi = liParent.querySelector(`[data-wsp-id="${destroyResult.activatedWspId}"]`);
-          if (targetLi) targetLi.classList.add("active");
+
+        // Single background call handles both export and optional destroy
+        const exportResult = await this._callBackgroundTask("exportWorkspaceToBookmarks", {
+          wspId: workspace.id,
+          windowId: this.currentWindowId,
+          destroyAfter: !!result.checked
+        });
+        if (!exportResult) {
+          console.log("[WorkspaceUI][exportBtn] export failed");
+          return;
         }
+        console.log("[WorkspaceUI][exportBtn] exported", exportResult.exported, "tabs to:", exportResult.folderTitle);
+
+        if (exportResult.destroyed) {
+          const wasActive = li.classList.contains("active");
+          if (li.parentNode) {
+            const liParent = li.parentElement;
+            li.parentNode.removeChild(li);
+            if (wasActive && exportResult.activatedWspId) {
+              const targetLi = liParent.querySelector(`[data-wsp-id="${exportResult.activatedWspId}"]`);
+              if (targetLi) targetLi.classList.add("active");
+            }
+          }
+        }
+      } finally {
+        exportBtn.disabled = false;
       }
     });
 
@@ -696,41 +706,47 @@ class WorkspaceUI {
     // Delete
     deleteBtn.addEventListener("click", async (e) => {
       e.stopPropagation();
-      console.log("[WorkspaceUI][deleteBtn] clicked for workspace:", workspace.id, workspace.name);
+      if (deleteBtn.disabled) return;
+      deleteBtn.disabled = true;
+      try {
+        console.log("[WorkspaceUI][deleteBtn] clicked for workspace:", workspace.id, workspace.name);
 
-      const deleteConfirmed = await showCustomDialog({
-        message: `Delete "${li.dataset.originalText}"?`
-      });
-      if (!deleteConfirmed) {
-        console.log("[WorkspaceUI][deleteBtn] delete cancelled");
-        return;
-      }
-
-      const wasActive = li.classList.contains("active");
-      console.log("[WorkspaceUI][deleteBtn] confirmed — wasActive:", wasActive, "wspId:", workspace.id);
-
-      const destroyResult = await this._callBackgroundTask("destroyWsp", {
-        wspId: workspace.id,
-        windowId: this.currentWindowId,
-      });
-      // _callBackgroundTask returns null for error responses
-      if (!destroyResult) {
-        console.log("[WorkspaceUI][deleteBtn] destroy failed");
-        return;
-      }
-
-      const liParent = li.parentElement;
-      li.parentNode.removeChild(li);
-
-      // Backend already activated another workspace -- just update the DOM
-      if (wasActive && destroyResult.activatedWspId) {
-        const targetLi = liParent.querySelector(`[data-wsp-id="${destroyResult.activatedWspId}"]`);
-        if (targetLi) {
-          console.log("[WorkspaceUI][deleteBtn] marking activated:", destroyResult.activatedWspId);
-          targetLi.classList.add("active");
+        const deleteConfirmed = await showCustomDialog({
+          message: `Delete "${li.dataset.originalText}"?`
+        });
+        if (!deleteConfirmed) {
+          console.log("[WorkspaceUI][deleteBtn] delete cancelled");
+          return;
         }
+
+        const wasActive = li.classList.contains("active");
+        console.log("[WorkspaceUI][deleteBtn] confirmed -- wasActive:", wasActive, "wspId:", workspace.id);
+
+        const destroyResult = await this._callBackgroundTask("destroyWsp", {
+          wspId: workspace.id,
+          windowId: this.currentWindowId,
+        });
+        if (!destroyResult) {
+          console.log("[WorkspaceUI][deleteBtn] destroy failed");
+          return;
+        }
+
+        if (li.parentNode) {
+          const liParent = li.parentElement;
+          li.parentNode.removeChild(li);
+
+          if (wasActive && destroyResult.activatedWspId) {
+            const targetLi = liParent.querySelector(`[data-wsp-id="${destroyResult.activatedWspId}"]`);
+            if (targetLi) {
+              console.log("[WorkspaceUI][deleteBtn] marking activated:", destroyResult.activatedWspId);
+              targetLi.classList.add("active");
+            }
+          }
+        }
+        console.log("[WorkspaceUI][deleteBtn] done");
+      } finally {
+        deleteBtn.disabled = false;
       }
-      console.log("[WorkspaceUI][deleteBtn] done");
     });
 
     return li;
