@@ -54,7 +54,7 @@ function _createIconElement(iconName, className) {
    Custom Dialog (with Container picker support)
    ============================================================ */
 
-function showCustomDialog({ message, withInput = false, defaultValue = "", defaultIcon = "", showContainerPicker = false, defaultContainerId = null, containers = [], showColorPicker = false, defaultColor = null }) {
+function showCustomDialog({ message, withInput = false, defaultValue = "", defaultIcon = "", showContainerPicker = false, defaultContainerId = null, containers = [], showColorPicker = false, defaultColor = null, showCheckbox = false, checkboxLabel = "", checkboxDefault = false, showFolderPicker = false, folders = [] }) {
   return new Promise((resolve) => {
     const backdrop = document.getElementById("custom-dialog-backdrop");
     const msgEl = document.getElementById("custom-dialog-message");
@@ -68,6 +68,11 @@ function showCustomDialog({ message, withInput = false, defaultValue = "", defau
     const containerSelect = document.getElementById("custom-dialog-container-select");
     const colorRow = document.getElementById("custom-dialog-color-row");
     const colorSwatches = document.getElementById("color-swatches");
+    const checkboxRow = document.getElementById("custom-dialog-checkbox-row");
+    const checkboxEl = document.getElementById("custom-dialog-checkbox");
+    const checkboxLabelEl = document.getElementById("custom-dialog-checkbox-label");
+    const folderRow = document.getElementById("custom-dialog-folder-row");
+    const folderSelect = document.getElementById("custom-dialog-folder-select");
     const okBtn = document.getElementById("custom-dialog-ok");
     const cancelBtn = document.getElementById("custom-dialog-cancel");
 
@@ -127,6 +132,25 @@ function showCustomDialog({ message, withInput = false, defaultValue = "", defau
       colorSwatches.appendChild(removeBtn);
     }
 
+    // Checkbox setup
+    checkboxRow.hidden = !showCheckbox;
+    if (showCheckbox) {
+      checkboxEl.checked = checkboxDefault;
+      checkboxLabelEl.textContent = checkboxLabel;
+    }
+
+    // Folder picker setup
+    folderRow.hidden = !showFolderPicker;
+    if (showFolderPicker) {
+      folderSelect.innerHTML = "";
+      for (const f of folders) {
+        const opt = document.createElement("option");
+        opt.value = f.id;
+        opt.textContent = `${f.title} (${f.bookmarkCount} tabs)`;
+        folderSelect.appendChild(opt);
+      }
+    }
+
     // Initialize icon state (scoped to this dialog invocation)
     let selectedIcon = defaultIcon || "";
     _updateIconBtn(iconBtn, selectedIcon);
@@ -142,6 +166,10 @@ function showCustomDialog({ message, withInput = false, defaultValue = "", defau
 
     // Expand popup viewport so Firefox doesn't clip the dialog
     function syncPopupHeight() {
+      if (showFolderPicker || showCheckbox) {
+        document.body.style.minHeight = "180px";
+        return;
+      }
       if (!withInput) {
         document.body.style.minHeight = "140px";
         return;
@@ -150,9 +178,10 @@ function showCustomDialog({ message, withInput = false, defaultValue = "", defau
       document.body.style.minHeight = pickerOpen ? "520px" : "280px";
     }
 
-    // Toggle confirm mode class for delete dialogs
+    // Toggle confirm mode class for delete dialogs (no body content)
     const dialog = backdrop.querySelector(".custom-dialog");
-    if (withInput) {
+    const hasBody = withInput || showCheckbox || showFolderPicker;
+    if (hasBody) {
       dialog.classList.remove("dialog-confirm");
     } else {
       dialog.classList.add("dialog-confirm");
@@ -276,6 +305,10 @@ function showCustomDialog({ message, withInput = false, defaultValue = "", defau
           result.containerId = containerSelect.value || null;
         }
         cleanup(result);
+      } else if (showFolderPicker) {
+        cleanup({ folderId: folderSelect.value });
+      } else if (showCheckbox) {
+        cleanup({ confirmed: true, checked: checkboxEl.checked });
       } else {
         cleanup(true);
       }
@@ -286,7 +319,13 @@ function showCustomDialog({ message, withInput = false, defaultValue = "", defau
     }
 
     function updateOkButtonState() {
-      okBtn.disabled = withInput && inputEl.value.trim().length === 0;
+      if (withInput) {
+        okBtn.disabled = inputEl.value.trim().length === 0;
+      } else if (showFolderPicker) {
+        okBtn.disabled = folders.length === 0;
+      } else {
+        okBtn.disabled = false;
+      }
     }
 
     function onKeyDown(e) {

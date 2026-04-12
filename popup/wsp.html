@@ -19,6 +19,18 @@
                 <label id="color-picker-label">Color</label>
                 <div class="color-swatches" id="color-swatches" role="radiogroup" aria-labelledby="color-picker-label"></div>
             </div>
+            <!-- Checkbox row (shown in export dialog) -->
+            <div class="custom-dialog-checkbox-row" id="custom-dialog-checkbox-row" hidden>
+                <label>
+                    <input type="checkbox" id="custom-dialog-checkbox">
+                    <span id="custom-dialog-checkbox-label"></span>
+                </label>
+            </div>
+            <!-- Folder picker row (shown in restore dialog) -->
+            <div class="custom-dialog-folder-row" id="custom-dialog-folder-row" hidden>
+                <label for="custom-dialog-folder-select">Bookmark folder</label>
+                <select id="custom-dialog-folder-select" class="custom-dialog-select"></select>
+            </div>
             <!-- Container picker row (shown in create/rename dialog) -->
             <div class="custom-dialog-container-row" id="custom-dialog-container-row" hidden>
                 <label for="custom-dialog-container-select">Container</label>
@@ -40,7 +52,6 @@
 <div class="container" id="wsp-container">
     <div class="title">
       Workspaces
-      <button type="button" id="wsp-color-toggle" title="Use system colors"></button>
     </div>
     <!-- Tab search (Tier 3) -->
     <div class="wsp-search" id="wsp-search">
@@ -58,8 +69,10 @@
     </div>
     <div class="footer-container">
         <a href="#" class="footer" id="createNewWsp">New workspace</a>
+        <a href="#" class="footer" id="restoreFromBookmarks">Restore from bookmarks</a>
     </div>
 </div>
+<script src="../backend/theme-utils.js"></script>
 <script src="js/dialog.js"></script>
 <script src="js/tooltip.js"></script>
 <script src="js/drag-drop.js"></script>

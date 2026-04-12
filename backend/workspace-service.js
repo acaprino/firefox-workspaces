@@ -180,29 +180,94 @@ class WorkspaceService {
     console.log("[WorkspaceService][renameWorkspace] done — wspId:", wspId);
   }
 
-  static async destroyWsp(wspId) {
-    console.log("[WorkspaceService][destroyWsp] wspId:", wspId);
-    const wsp = await WSPStorageManager.getWorkspace(wspId);
-    console.log("[WorkspaceService][destroyWsp] workspace:", wsp.name,
-      "tabs:", wsp.tabs.length, "active:", wsp.active);
+  // `windowId` is optional: if the caller (popup) already knows it, passing
+  // it lets us skip the getWorkspace(wspId) lookup and read only the batch
+  // getWorkspaces(windowId), saving one storage round-trip per destroy.
+  static async destroyWsp(wspId, windowId = null) {
+    console.log("[WorkspaceService][destroyWsp] wspId:", wspId, "windowId:", windowId);
 
-    // Remove from workspace order
-    const order = await WSPStorageManager.getWorkspaceOrder(wsp.windowId);
-    if (order) {
-      const idx = order.indexOf(wspId);
-      if (idx >= 0) {
-        order.splice(idx, 1);
-        await WSPStorageManager.saveWorkspaceOrder(wsp.windowId, order);
-        console.log("[WorkspaceService][destroyWsp] removed from order at idx:", idx,
-          "new order length:", order.length);
-      } else {
-        console.log("[WorkspaceService][destroyWsp] wspId not found in order array");
+    // Resolve windowId if the caller didn't provide it. This falls back to a
+    // per-wsp state read — same as the old two-read path.
+    if (windowId == null) {
+      const stub = await WSPStorageManager.getWorkspace(wspId);
+      if (!stub || stub.windowId == null) {
+        console.log("[WorkspaceService][destroyWsp] wspId not found or has no windowId");
+        throw new Error("Workspace not found");
       }
+      windowId = stub.windowId;
     }
 
-    await wsp.destroy();
-    await MenuService.refreshTabMenu();
-    console.log("[WorkspaceService][destroyWsp] done — wspId:", wspId);
+    // Single batch read: get every workspace in the target window and find
+    // the doomed one inside the returned array. No second getWorkspace call.
+    const windowWorkspaces = await WSPStorageManager.getWorkspaces(windowId);
+    const target = windowWorkspaces.find(w => w.id === wspId);
+    if (!target) {
+      console.log("[WorkspaceService][destroyWsp] wspId not in window", windowId);
+      throw new Error("Workspace not found in window");
+    }
+    console.log("[WorkspaceService][destroyWsp] workspace:", target.name,
+      "tabs:", target.tabs.length, "active:", target.active,
+      "totalWorkspacesInWindow:", windowWorkspaces.length);
+
+    // Prevent destroying the last workspace in the window
+    if (windowWorkspaces.length <= 1) {
+      throw new Error("Cannot destroy the last workspace");
+    }
+
+    // Hold the doomed workspace's lock for the entire mutation block so that
+    // concurrent addTabToWorkspace/removeTabFromWorkspace events for the
+    // same wspId queue behind us. Without this lock, the old pre-deactivation
+    // save + subsequent activateWsp + destroy sequence had a race window in
+    // which new tabs could be added to a workspace we were about to destroy,
+    // leaving orphaned session tags that reference a nonexistent wspId.
+    return await WSPStorageManager.withWorkspaceLock(wspId, async () => {
+      // Re-read the workspace under the lock to get the freshest tab list
+      // (any addTab/removeTab that landed before we acquired the lock).
+      const wsp = await WSPStorageManager.getWorkspace(wspId);
+      if (!wsp) {
+        console.log("[WorkspaceService][destroyWsp] wspId vanished before lock acquired");
+        return { activatedWspId: null };
+      }
+
+      // If destroying the active workspace, activate another one first.
+      // Without this, browser.tabs.remove inside destroy() can trigger Firefox
+      // to auto-create a tab, and addTabToWorkspace finds no active workspace,
+      // creating a phantom "Unnamed Workspace".
+      let activatedWspId = null;
+      if (wsp.active) {
+        const other = windowWorkspaces.find(w => w.id !== wspId);
+        if (other) {
+          // Mark inactive before activateWsp so the subsequent activation
+          // flow doesn't waste work running _deactivateCurrentWspFromList on
+          // a workspace that's about to be deleted anyway.
+          wsp.active = false;
+          await wsp._saveState();
+          console.log("[WorkspaceService][destroyWsp] pre-deactivated, activating:", other.id, other.name);
+          await WorkspaceService.activateWsp(other.id, windowId);
+          activatedWspId = other.id;
+        }
+      }
+
+      // Remove from workspace order
+      const order = await WSPStorageManager.getWorkspaceOrder(windowId);
+      if (order) {
+        const idx = order.indexOf(wspId);
+        if (idx >= 0) {
+          order.splice(idx, 1);
+          await WSPStorageManager.saveWorkspaceOrder(windowId, order);
+          console.log("[WorkspaceService][destroyWsp] removed from order at idx:", idx,
+            "new order length:", order.length);
+        } else {
+          console.log("[WorkspaceService][destroyWsp] wspId not found in order array");
+        }
+      }
+
+      await wsp.destroy();
+      await MenuService.refreshTabMenu();
+      console.log("[WorkspaceService][destroyWsp] done — wspId:", wspId,
+        "activatedWspId:", activatedWspId);
+      return { activatedWspId };
+    });
   }
 
   static async deactivateCurrentWsp(windowId) {

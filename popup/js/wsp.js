@@ -5,72 +5,56 @@
 
 // ── Theme detection ──────────────────────────────────────────
 
+// Strict CSS color validator. Mirror of backend/ui-service.js's _isSafeCssColor
+// so both sites accept exactly the same shape. Rejects anything containing
+// ;, }, {, <, >, url(, or backslash to prevent a malicious/malformed LWT
+// theme from feeding arbitrary CSS tokens into style.setProperty.
+const _WSP_NAMED_COLOR_RE = /^(transparent|currentcolor|black|white|red|green|blue|yellow|cyan|magenta|gray|grey|orange|purple|pink|brown)$/i;
+const _WSP_HEX_COLOR_RE   = /^#([0-9a-f]{3}|[0-9a-f]{4}|[0-9a-f]{6}|[0-9a-f]{8})$/i;
+const _WSP_FUNC_COLOR_RE  = /^(rgba?|hsla?|hwb|lab|lch|oklab|oklch|color)\([^;{}<>\\]*\)$/i;
+function _isSafeCssColor(value) {
+  if (typeof value !== 'string') return false;
+  const s = value.trim();
+  if (s.length === 0 || s.length > 128) return false;
+  if (/[;{}<>\\]/.test(s)) return false;
+  return _WSP_HEX_COLOR_RE.test(s) || _WSP_FUNC_COLOR_RE.test(s) || _WSP_NAMED_COLOR_RE.test(s);
+}
+
 // Normalize a theme API color value (string or [R,G,B] / [R,G,B,A] array)
-// to a CSS color string, or null if absent.
+// to a CSS color string, or null if absent/untrusted. String values pass
+// through _isSafeCssColor to reject injection-shaped tokens that a hostile
+// LWT theme could supply (themes on AMO are low-trust; any installed theme
+// could provide arbitrary strings).
 function _toCSSColor(v) {
   if (!v) return null;
   if (Array.isArray(v)) {
-    const a = +(Math.min(1, Math.max(0, v[3] / 255))).toFixed(3);
-    return v.length >= 4
-      ? `rgba(${v[0]},${v[1]},${v[2]},${a})`
-      : `rgb(${v[0]},${v[1]},${v[2]})`;
+    if (v.length < 3) return null;
+    const [r, g, b] = v;
+    if (!Number.isFinite(r) || !Number.isFinite(g) || !Number.isFinite(b)) return null;
+    if (v.length >= 4) {
+      const a = +(Math.min(1, Math.max(0, v[3] / 255))).toFixed(3);
+      return `rgba(${r | 0},${g | 0},${b | 0},${a})`;
+    }
+    return `rgb(${r | 0},${g | 0},${b | 0})`;
   }
-  if (typeof v === 'string') return v;
+  if (typeof v === 'string' && _isSafeCssColor(v)) return v.trim();
   return null;
 }
 
-function _getLuminance(colorVal) {
-  if (!colorVal) return null;
-  if (Array.isArray(colorVal)) {
-    const [r, g, b] = colorVal;
-    return 0.299 * r + 0.587 * g + 0.114 * b;
-  }
-  const s = String(colorVal).trim();
-  // Handle hex colors: #RGB, #RRGGBB, #RRGGBBAA
-  const hex = s.match(/^#([0-9a-f]{3,8})$/i);
-  if (hex) {
-    const h = hex[1];
-    let r, g, b;
-    if (h.length <= 4) {
-      r = parseInt(h[0] + h[0], 16);
-      g = parseInt(h[1] + h[1], 16);
-      b = parseInt(h[2] + h[2], 16);
-    } else {
-      r = parseInt(h.slice(0, 2), 16);
-      g = parseInt(h.slice(2, 4), 16);
-      b = parseInt(h.slice(4, 6), 16);
-    }
-    return 0.299 * r + 0.587 * g + 0.114 * b;
-  }
-  // Handle rgb()/rgba() strings
-  const m = s.match(/\d+/g);
-  if (!m || m.length < 3) return null;
-  const [r, g, b] = m.map(Number);
-  return 0.299 * r + 0.587 * g + 0.114 * b;
-}
-
+// Detect dark theme. Tries the shared pure detector first (same candidate
+// chain as the backend, avoids drift). If the theme doesn't expose any
+// useful color (Firefox built-in themes return theme.colors = {}), fall
+// back to a -moz-Dialog DOM probe which reflects the actual OS dark mode
+// even when privacy.resistFingerprinting spoofs prefers-color-scheme.
 function _isFirefoxThemeDark(theme) {
-  console.log("[WSP][_isFirefoxThemeDark] full theme.colors:", JSON.stringify(theme?.colors ?? null));
-  // Prefer toolbar_text (light text = dark theme)
-  const toolbar_text = theme?.colors?.toolbar_text ?? theme?.colors?.bookmark_text;
-  const textLum = _getLuminance(toolbar_text);
-  console.log("[WSP][_isFirefoxThemeDark] toolbar_text:", toolbar_text, "lum:", textLum);
-  if (textLum !== null) {
-    const result = textLum > 128;
-    console.log("[WSP][_isFirefoxThemeDark] branch=toolbar_text lum:", textLum.toFixed(1), "-> isDark:", result);
-    return result;
+  const colors = theme?.colors ?? null;
+  console.log("[WSP][_isFirefoxThemeDark] colors:", JSON.stringify(colors));
+
+  const fromColors = detectDarkFromThemeColors(colors);
+  if (fromColors !== null) {
+    console.log("[WSP][_isFirefoxThemeDark] branch=themeColors -> isDark:", fromColors);
+    return fromColors;
   }
-  // Fallback: dark frame/toolbar background = dark theme
-  const bgSource = theme?.colors?.frame ?? theme?.colors?.toolbar;
-  const bgLum = _getLuminance(bgSource);
-  console.log("[WSP][_isFirefoxThemeDark] frame/toolbar:", bgSource, "lum:", bgLum);
-  if (bgLum !== null) {
-    const result = bgLum < 128;
-    console.log("[WSP][_isFirefoxThemeDark] branch=bg lum:", bgLum.toFixed(1), "-> isDark:", result);
-    return result;
-  }
-  // Probe -moz-Dialog system color: reflects real OS dark/light mode even when
-  // privacy.resistFingerprinting spoofs prefers-color-scheme to 'light'.
   try {
     const probe = document.createElement("div");
     document.documentElement.appendChild(probe);
@@ -91,44 +75,59 @@ function _isFirefoxThemeDark(theme) {
   } catch (e) {
     console.warn("[WSP][_isFirefoxThemeDark] mozDialog probe failed:", e);
   }
-  // Last resort: OS preference (may be spoofed by resistFingerprinting)
   const result = window.matchMedia('(prefers-color-scheme: dark)').matches;
   console.log("[WSP][_isFirefoxThemeDark] branch=matchMedia -> isDark:", result);
   return result;
 }
 
+// Each entry: [cssVar, [theme.colors keys in priority order]]
+// The first non-null resolved color from the priority chain is injected as
+// a --ff-popup-* CSS var. When a custom LWT theme is active, the popup can
+// match its palette exactly. When the user is on a Firefox built-in theme
+// (Default / Dark / System), theme.colors is empty and these vars stay
+// unset — the CSS falls through to CSS system colors (Canvas, CanvasText,
+// AccentColor, ...) which the browser resolves to the active theme/OS
+// palette on its own.
+// NOTE: --ff-popup-accent MUST stay in sync with THEME_ACCENT_KEYS in
+// backend/theme-utils.js so the toolbar badge color matches the popup accent.
 const _FF_POPUP_PROPS = [
-  '--ff-popup-bg', '--ff-popup-text', '--ff-popup-border',
-  '--ff-popup-highlight', '--ff-popup-highlight-text',
+  ['--ff-popup-bg',             ['popup', 'frame', 'toolbar']],
+  ['--ff-popup-text',           ['popup_text', 'toolbar_text', 'bookmark_text']],
+  ['--ff-popup-border',         ['popup_border', 'toolbar_field_border']],
+  ['--ff-popup-highlight',      ['popup_highlight', 'toolbar_field_focus', 'tab_selected']],
+  ['--ff-popup-highlight-text', ['popup_highlight_text', 'toolbar_field_highlight_text']],
+  ['--ff-popup-accent',         ['accentcolor', 'toolbar_field_focus_border', 'icons_attention', 'tab_loading', 'popup_highlight']],
+  ['--ff-popup-input-bg',       ['toolbar_field', 'popup', 'frame']],
+  ['--ff-popup-input-text',     ['toolbar_field_text', 'popup_text', 'toolbar_text']],
+  ['--ff-popup-input-border',   ['toolbar_field_border', 'popup_border']],
 ];
 
-// mode: 'auto' (inject LWT colors) | 'system' (skip LWT, use CSS system colors)
+// Apply theme colors from the Firefox LWT theme API.
+// If the theme provides colors (only custom LWT themes do; built-ins return
+// an empty object), inject them as --ff-popup-* CSS vars. Otherwise the CSS
+// falls through to CSS system colors (Canvas, CanvasText, AccentColor, ...)
+// which Firefox resolves to the active theme/OS palette automatically.
 // Returns isDark boolean so callers can forward it to the background.
-function applyColorMode(theme, mode) {
+function applyTheme(theme) {
   const dark = _isFirefoxThemeDark(theme);
-  console.log("[WSP][applyColorMode] mode:", mode, "isDark:", dark);
+  console.log("[WSP][applyTheme] isDark:", dark);
   document.documentElement.dataset.theme = dark ? 'dark' : 'light';
 
   const s = document.documentElement.style;
-  if (mode === 'system') {
-    // Remove all LWT overrides → -moz-Dialog / system colors take control
-    _FF_POPUP_PROPS.forEach(p => s.removeProperty(p));
-    return dark;
-  }
+  // Always clear previously injected vars so stale values can't linger.
+  for (const [cssVar] of _FF_POPUP_PROPS) s.removeProperty(cssVar);
 
-  // 'auto': inject popup colors from the Firefox LWT theme API.
-  // Cascade: popup_* keys (explicit) → toolbar_* keys (derived) → remove var
-  // so the stylesheet's -moz-Dialog/-moz-DialogText fallbacks kick in.
+  // Walk each cssVar's priority chain and inject the first resolved color.
   const c = theme?.colors ?? {};
-  const map = {
-    '--ff-popup-bg':             _toCSSColor(c.popup)             ?? _toCSSColor(c.toolbar),
-    '--ff-popup-text':           _toCSSColor(c.popup_text)        ?? _toCSSColor(c.toolbar_text) ?? _toCSSColor(c.bookmark_text),
-    '--ff-popup-border':         _toCSSColor(c.popup_border),
-    '--ff-popup-highlight':      _toCSSColor(c.popup_highlight),
-    '--ff-popup-highlight-text': _toCSSColor(c.popup_highlight_text),
-  };
-  for (const [k, v] of Object.entries(map)) {
-    if (v) s.setProperty(k, v); else s.removeProperty(k);
+  for (const [cssVar, keys] of _FF_POPUP_PROPS) {
+    for (const k of keys) {
+      const v = _toCSSColor(c[k]);
+      if (v) {
+        s.setProperty(cssVar, v);
+        console.log(`[WSP][applyTheme] ${cssVar} <- theme.colors.${k} = ${v}`);
+        break;
+      }
+    }
   }
   return dark;
 }
@@ -145,40 +144,32 @@ class WorkspaceUI {
 
   async initialize() {
     console.log("[WorkspaceUI][initialize] starting");
-    // Parallelize the three independent startup API calls
-    const [currentWindow, currentTheme, stored] = await Promise.all([
+    // Parallelize the two independent startup API calls
+    const [currentWindow, currentTheme] = await Promise.all([
       browser.windows.getCurrent(),
       browser.theme.getCurrent(),
-      browser.storage.local.get('colorMode'),
     ]);
     this.currentWindowId = currentWindow.id;
     console.log("[WorkspaceUI][initialize] windowId:", this.currentWindowId);
 
-    // Apply color mode before rendering anything
-    let colorMode = stored.colorMode ?? 'auto';
-    console.log("[WorkspaceUI][initialize] colorMode:", colorMode);
-    const isDark = applyColorMode(currentTheme, colorMode);
+    // Apply theme colors before rendering anything
+    const isDark = applyTheme(currentTheme);
     // Forward dark-mode result to background so menu icons use correct variant.
     // The popup has a real rendered document where -moz-Dialog probe works,
-    // unlike the hidden background page. Ignore errors (background may not be ready).
-    browser.runtime.sendMessage({ action: "setDarkModeHint", isDark }).catch(() => {});
+    // unlike the hidden background page. Soft-log failures (background may not
+    // be ready on cold start — this is expected, logged at debug level only).
+    browser.runtime.sendMessage({ action: "setDarkModeHint", isDark })
+      .catch(e => console.debug("[WSP] setDarkModeHint failed:", e?.message));
 
-    // Color mode toggle button
-    const toggleBtn = document.getElementById('wsp-color-toggle');
-    toggleBtn.classList.toggle('active', colorMode === 'system');
-    toggleBtn.title = colorMode === 'system' ? 'Using system colors' : 'Use system colors';
-    toggleBtn.addEventListener('click', async () => {
-      const prev = colorMode;
-      colorMode = colorMode === 'system' ? 'auto' : 'system';
-      console.log("[WorkspaceUI][colorToggle] colorMode:", prev, "->", colorMode);
-      await browser.storage.local.set({ colorMode });
-      const newDark = applyColorMode(currentTheme, colorMode);
-      browser.runtime.sendMessage({ action: "setDarkModeHint", isDark: newDark }).catch(() => {});
-      toggleBtn.classList.toggle('active', colorMode === 'system');
-      toggleBtn.title = colorMode === 'system' ? 'Using system colors' : 'Use system colors';
+    // Debounce theme.onUpdated: dynamic themes can re-fire many events per
+    // second, and each applyTheme() call writes ~9 CSS custom properties and
+    // may trigger a -moz-Dialog DOM probe (forced reflow). 80ms coalescing
+    // is below the perception threshold but absorbs bursts.
+    let _themeUpdateTimer = null;
+    browser.theme.onUpdated.addListener(({ theme }) => {
+      clearTimeout(_themeUpdateTimer);
+      _themeUpdateTimer = setTimeout(() => applyTheme(theme), 80);
     });
-
-    browser.theme.onUpdated.addListener(({ theme }) => applyColorMode(theme, colorMode));
 
     const primaryWindowId = await this._callBackgroundTask("getPrimaryWindowId");
     console.log("[WorkspaceUI][initialize] primaryWindowId:", primaryWindowId,
@@ -187,6 +178,7 @@ class WorkspaceUI {
     if (primaryWindowId !== this.currentWindowId) {
       console.log("[WorkspaceUI][initialize] not primary window — showing restricted UI");
       document.getElementById("createNewWsp").style.display = "none";
+      document.getElementById("restoreFromBookmarks").style.display = "none";
       document.getElementById("wsp-search").hidden = true;
       const noWspLi = document.createElement("li");
       noWspLi.className = "no-wsp";
@@ -213,6 +205,7 @@ class WorkspaceUI {
       this.workspaces.map(w => `"${w.name}"(${w.tabs.length}t,active:${w.active})`));
     this.displayWorkspaces();
     this._setupCreateButton();
+    this._setupRestoreButton();
     this.setupSearch();
     this.showClosedTabs();
     console.log("[WorkspaceUI][initialize] done");
@@ -270,6 +263,45 @@ class WorkspaceUI {
 
       this._removePreviouslyActiveLi();
       this._addWorkspace(wsp);
+    });
+  }
+
+  _setupRestoreButton() {
+    document.getElementById("restoreFromBookmarks").addEventListener("click", async (e) => {
+      e.preventDefault();
+      console.log("[WorkspaceUI][restoreFromBookmarks] clicked");
+
+      const folders = await this._callBackgroundTask("getBookmarkWorkspaces");
+      if (!folders || folders.length === 0) {
+        await showCustomDialog({ message: "No saved workspaces found in bookmarks." });
+        return;
+      }
+
+      const result = await showCustomDialog({
+        message: "Restore workspace from bookmarks:",
+        showFolderPicker: true,
+        folders
+      });
+
+      if (!result) {
+        console.log("[WorkspaceUI][restoreFromBookmarks] cancelled");
+        return;
+      }
+
+      console.log("[WorkspaceUI][restoreFromBookmarks] restoring folder:", result.folderId);
+      const restored = await this._callBackgroundTask("restoreWorkspaceFromBookmarks", {
+        folderId: result.folderId,
+        windowId: this.currentWindowId
+      });
+
+      if (!restored) {
+        console.log("[WorkspaceUI][restoreFromBookmarks] restore failed");
+        return;
+      }
+
+      console.log("[WorkspaceUI][restoreFromBookmarks] restored:", restored.name, "tabs:", restored.tabCount);
+      // Reload popup to show the new workspace
+      window.close();
     });
   }
 
@@ -473,6 +505,12 @@ class WorkspaceUI {
     span2.textContent = workspace.tabs.length + " tabs";
     li.appendChild(span2);
 
+    const exportBtn = document.createElement("button");
+    exportBtn.type = "button";
+    exportBtn.classList.add("edit-btn", "export-btn");
+    exportBtn.title = "Export to bookmarks";
+    li.appendChild(exportBtn);
+
     const deleteBtn = document.createElement("button");
     deleteBtn.type = "button";
     deleteBtn.classList.add("edit-btn", "delete-btn");
@@ -515,6 +553,52 @@ class WorkspaceUI {
       });
       console.log("[WorkspaceUI][switchWorkspace] done — closing popup");
       window.close();
+    });
+
+    // Export to bookmarks
+    exportBtn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      console.log("[WorkspaceUI][exportBtn] clicked for workspace:", workspace.id, workspace.name);
+
+      const result = await showCustomDialog({
+        message: `Export "${li.dataset.originalText}" to bookmarks?`,
+        showCheckbox: true,
+        checkboxLabel: "Close workspace after export",
+        checkboxDefault: false
+      });
+
+      if (!result) {
+        console.log("[WorkspaceUI][exportBtn] export cancelled");
+        return;
+      }
+
+      const exportResult = await this._callBackgroundTask("exportWorkspaceToBookmarks", {
+        wspId: workspace.id
+      });
+      if (!exportResult) {
+        console.log("[WorkspaceUI][exportBtn] export failed");
+        return;
+      }
+      console.log("[WorkspaceUI][exportBtn] exported", exportResult.exported, "tabs to:", exportResult.folderTitle);
+
+      if (result.checked) {
+        console.log("[WorkspaceUI][exportBtn] closing workspace after export");
+        const wasActive = li.classList.contains("active");
+        const destroyResult = await this._callBackgroundTask("destroyWsp", {
+          wspId: workspace.id,
+          windowId: this.currentWindowId,
+        });
+        if (destroyResult?._error) {
+          console.log("[WorkspaceUI][exportBtn] destroy failed:", destroyResult.message);
+          return;
+        }
+        const liParent = li.parentElement;
+        li.parentNode.removeChild(li);
+        if (wasActive && destroyResult?.activatedWspId) {
+          const targetLi = liParent.querySelector(`[data-wsp-id="${destroyResult.activatedWspId}"]`);
+          if (targetLi) targetLi.classList.add("active");
+        }
+      }
     });
 
     // Rename
@@ -623,23 +707,25 @@ class WorkspaceUI {
 
       const wasActive = li.classList.contains("active");
       console.log("[WorkspaceUI][deleteBtn] confirmed — wasActive:", wasActive, "wspId:", workspace.id);
+
+      const destroyResult = await this._callBackgroundTask("destroyWsp", {
+        wspId: workspace.id,
+        windowId: this.currentWindowId,
+      });
+      if (destroyResult?._error) {
+        console.log("[WorkspaceUI][deleteBtn] destroy failed:", destroyResult.message);
+        return;
+      }
+
       const liParent = li.parentElement;
       li.parentNode.removeChild(li);
 
-      // Destroy first to avoid deactivateCurrentWsp saving state for a doomed workspace
-      await this._callBackgroundTask("destroyWsp", { wspId: workspace.id });
-
-      if (wasActive) {
-        const firstChild = liParent.children[0];
-        if (firstChild) {
-          console.log("[WorkspaceUI][deleteBtn] activating next workspace:", firstChild.dataset.wspId);
-          firstChild.classList.add("active");
-          await this._callBackgroundTask("activateWorkspace", {
-            wspId: firstChild.dataset.wspId,
-            windowId: workspace.windowId
-          });
-        } else {
-          console.log("[WorkspaceUI][deleteBtn] no remaining workspaces to activate");
+      // Backend already activated another workspace -- just update the DOM
+      if (wasActive && destroyResult?.activatedWspId) {
+        const targetLi = liParent.querySelector(`[data-wsp-id="${destroyResult.activatedWspId}"]`);
+        if (targetLi) {
+          console.log("[WorkspaceUI][deleteBtn] marking activated:", destroyResult.activatedWspId);
+          targetLi.classList.add("active");
         }
       }
       console.log("[WorkspaceUI][deleteBtn] done");

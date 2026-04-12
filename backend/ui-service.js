@@ -1,3 +1,24 @@
+// Default badge background when no theme accent is available.
+// Note: the shared THEME_ACCENT_KEYS list and pickAccentFromThemeColors()
+// live in backend/theme-utils.js (loaded first via manifest background.scripts).
+const BADGE_FALLBACK_COLOR = "#0078D4";
+
+// Strict CSS color validator. Accepts hex (#abc / #aabbcc / #aabbccdd),
+// rgb()/rgba()/hsl()/hsla() with numeric args, and a small named-color
+// whitelist. Rejects anything containing ;, }, {, <, >, url(, or backslash
+// to prevent a malicious/malformed LWT theme from feeding arbitrary CSS
+// tokens into setBadgeBackgroundColor or style.setProperty.
+const _NAMED_COLOR_RE = /^(transparent|currentcolor|black|white|red|green|blue|yellow|cyan|magenta|gray|grey|orange|purple|pink|brown)$/i;
+const _HEX_COLOR_RE   = /^#([0-9a-f]{3}|[0-9a-f]{4}|[0-9a-f]{6}|[0-9a-f]{8})$/i;
+const _FUNC_COLOR_RE  = /^(rgba?|hsla?|hwb|lab|lch|oklab|oklch|color)\([^;{}<>\\]*\)$/i;
+function _isSafeCssColor(value) {
+  if (typeof value !== "string") return false;
+  const s = value.trim();
+  if (s.length === 0 || s.length > 128) return false;
+  if (/[;{}<>\\]/.test(s)) return false;
+  return _HEX_COLOR_RE.test(s) || _FUNC_COLOR_RE.test(s) || _NAMED_COLOR_RE.test(s);
+}
+
 // Toolbar button icon, badge, and SVG handling
 class UIService {
   // Cache SVG data URLs keyed by "iconName:fillColor" to avoid repeated fetch+encode
@@ -5,6 +26,11 @@ class UIService {
   static _SVG_CACHE_MAX = 100;
   // Cached isDark result — invalidated by theme.onUpdated via clearThemeCache()
   static _isDarkCache = null;
+  // Cached badge color string — invalidated alongside _isDarkCache. Without
+  // this, updateToolbarButton would issue a browser.theme.getCurrent() IPC
+  // round-trip on every focus change, tab create, and tab remove, adding
+  // sustained background traffic for users with high tab churn.
+  static _cachedBadgeColor = null;
   // Dark-mode hint forwarded from the popup (popup has a real rendering context
   // where -moz-Dialog resolves correctly, unlike the hidden background page).
   // Set via "setDarkModeHint" message. null = no hint yet.
@@ -18,54 +44,33 @@ class UIService {
     "star", "target", "video", "wrench"
   ]);
 
-  static _parseRgb(color) {
-    if (Array.isArray(color)) return color.slice(0, 3);
-    const hex = /^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})/i.exec(color);
-    if (hex) return [parseInt(hex[1], 16), parseInt(hex[2], 16), parseInt(hex[3], 16)];
-    const rgb = /rgb\((\d+),\s*(\d+),\s*(\d+)\)/i.exec(color);
-    if (rgb) return [+rgb[1], +rgb[2], +rgb[3]];
-    console.warn("[UIService][_parseRgb] unrecognized color format:", color, "-> fallback [128,128,128]");
-    return [128, 128, 128];
+  // Pick the theme's accent color. Thin wrapper around the shared
+  // pickAccentFromThemeColors (backend/theme-utils.js): re-runs the same
+  // canonical chain, then validates string values via _isSafeCssColor
+  // before they reach the setBadgeBackgroundColor API.
+  static _pickAccentColor(colors) {
+    const raw = pickAccentFromThemeColors(colors);
+    if (raw === null) return null;
+    // Arrays are already serialized into `rgb(...)` form by the shared
+    // helper — trust that output. Strings must still pass the validator.
+    if (raw.startsWith("rgb(")) return raw;
+    return _isSafeCssColor(raw) ? raw.trim() : null;
   }
 
-  // Extract dark/light from a theme.colors object without any DOM or async calls.
-  // Returns true (dark), false (light), or null (indeterminate).
+  // Detect dark theme from theme.colors. Thin wrapper around the shared
+  // detectDarkFromThemeColors so the backend and popup stay in sync on
+  // the threshold + candidate chain.
   static _detectDarkFromColors(colors) {
-    if (!colors) return null;
-    const iconColor    = colors.icons;
-    const toolbarText  = colors.toolbar_text ?? colors.bookmark_text;
-    const tabBgText    = colors.tab_background_text;
-    const fieldText    = colors.toolbar_field_text;
-    const popupText    = colors.popup_text;
-    const textColor    = iconColor ?? toolbarText ?? tabBgText ?? fieldText ?? popupText;
-    if (textColor !== undefined && textColor !== null) {
-      const [r, g, b] = UIService._parseRgb(textColor);
-      const lum = 0.299 * r + 0.587 * g + 0.114 * b;
-      console.log("[UIService][_detectDarkFromColors] text rgb:", r, g, b, "lum:", lum.toFixed(1));
-      return lum > 128;
-    }
-    const toolbarColor = colors.toolbar;
-    if (toolbarColor !== undefined && toolbarColor !== null) {
-      const [r, g, b] = UIService._parseRgb(toolbarColor);
-      const lum = 0.299 * r + 0.587 * g + 0.114 * b;
-      console.log("[UIService][_detectDarkFromColors] toolbar rgb:", r, g, b, "lum:", lum.toFixed(1));
-      return lum < 128;
-    }
-    const frameColor = colors.frame;
-    if (frameColor !== undefined && frameColor !== null) {
-      const [r, g, b] = UIService._parseRgb(frameColor);
-      const lum = 0.299 * r + 0.587 * g + 0.114 * b;
-      console.log("[UIService][_detectDarkFromColors] frame rgb:", r, g, b, "lum:", lum.toFixed(1));
-      return lum < 128;
-    }
-    return null;
+    return detectDarkFromThemeColors(colors);
   }
 
   static clearThemeCache() {
     console.log("[UIService][clearThemeCache] invalidating _isDarkCache (was:", UIService._isDarkCache,
-      ") _darkModeHint (was:", UIService._darkModeHint, ")");
+      ") _darkModeHint (was:", UIService._darkModeHint,
+      ") _cachedBadgeColor (was:", UIService._cachedBadgeColor, ")");
     UIService._isDarkCache = null;
     UIService._darkModeHint = null;
+    UIService._cachedBadgeColor = null;
     // Also clear persisted hint so stale value doesn't override fresh theme detection.
     browser.storage.local.remove("ld-wsp-dark-hint").catch(() => {});
   }
@@ -179,9 +184,30 @@ class UIService {
     console.log("[UIService][_setDefaultIcon] done");
   }
 
+  // Resolve the badge color for the current theme. Memoized via
+  // _cachedBadgeColor (invalidated in clearThemeCache on theme.onUpdated),
+  // so the hot-path callers (onFocusChanged, onTabCreated/Removed, etc.) do
+  // NOT make a browser.theme.getCurrent() IPC round-trip every invocation.
+  static async _resolveBadgeColor(themeColors) {
+    if (UIService._cachedBadgeColor !== null) return UIService._cachedBadgeColor;
+    let colorsForBadge = themeColors;
+    if (!colorsForBadge) {
+      try {
+        const theme = await browser.theme.getCurrent();
+        colorsForBadge = theme?.colors ?? null;
+      } catch (e) {
+        console.warn("[UIService][_resolveBadgeColor] theme.getCurrent() failed:", e);
+      }
+    }
+    UIService._cachedBadgeColor = UIService._pickAccentColor(colorsForBadge) ?? BADGE_FALLBACK_COLOR;
+    console.log("[UIService][_resolveBadgeColor] resolved:", UIService._cachedBadgeColor);
+    return UIService._cachedBadgeColor;
+  }
+
   static async updateToolbarButton(windowId, themeColors) {
     console.log("[UIService][updateToolbarButton] called for windowId:", windowId);
     const activeWsp = await WorkspaceService.getActiveWsp(windowId);
+    const badgeColor = await UIService._resolveBadgeColor(themeColors);
 
     if (activeWsp) {
       console.log("[UIService][updateToolbarButton] activeWsp:", activeWsp.id,
@@ -191,7 +217,17 @@ class UIService {
 
       const tabCount = activeWsp.tabs.length;
       await browser.browserAction.setBadgeText({ text: tabCount > 0 ? tabCount.toString() : "", windowId });
-      await browser.browserAction.setBadgeBackgroundColor({ color: "#0078D4", windowId });
+      // setBadgeBackgroundColor throws on invalid color strings. Even though
+      // _pickAccentColor/_isSafeCssColor validate, wrap defensively so a
+      // malformed theme or future Firefox API change cannot break the whole
+      // toolbar update cascade (which is called from many hot paths).
+      try {
+        await browser.browserAction.setBadgeBackgroundColor({ color: badgeColor, windowId });
+      } catch (e) {
+        console.warn("[UIService][updateToolbarButton] setBadgeBackgroundColor rejected", badgeColor, "-- falling back:", e);
+        UIService._cachedBadgeColor = BADGE_FALLBACK_COLOR;
+        await browser.browserAction.setBadgeBackgroundColor({ color: BADGE_FALLBACK_COLOR, windowId }).catch(() => {});
+      }
 
       const validIcon = activeWsp.icon && UIService._VALID_ICONS.has(activeWsp.icon) ? activeWsp.icon : null;
       console.log("[UIService][updateToolbarButton] validIcon:", validIcon,

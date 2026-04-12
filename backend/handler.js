@@ -8,6 +8,16 @@ browser.runtime.onMessage.addListener(async (message, sender) => {
   }
 });
 
+const CONTAINER_RE = /^firefox-container-\d+$/;
+// Matches 6-digit hex color codes (with/without leading #). Used to validate
+// user-supplied workspace colors before they are persisted.
+const HEX_COLOR_RE = /^#?[0-9a-f]{6}$/i;
+// Control characters, bidi overrides, and zero-width chars that can be used
+// for visual spoofing in toolbar tooltips or log injection via newlines.
+// Stripping these from workspace names is defense-in-depth — popup rendering
+// uses .textContent (no XSS risk) but setTitle/console.log are not HTML-safe.
+const CONTROL_AND_BIDI_RE = /[\x00-\x1F\x7F\u202A-\u202E\u2066-\u2069]/g;
+
 function _validateWspId(id) {
   if (typeof id !== "string" || !UUID_RE.test(id)) {
     throw new Error("Invalid wspId: " + String(id));
@@ -17,6 +27,42 @@ function _validateWindowId(id) {
   if (typeof id !== "number" || id <= 0 || !Number.isInteger(id)) {
     throw new Error("Invalid windowId: " + String(id));
   }
+}
+function _validateContainerId(id) {
+  // Null is a valid "no container" value. Any non-null must match the exact
+  // Firefox container-id grammar. Empty string is NOT accepted — the caller
+  // must normalize `""` to `null` before calling this validator.
+  if (id === null) return;
+  if (typeof id !== "string" || !CONTAINER_RE.test(id)) {
+    throw new Error("Invalid containerId: " + String(id));
+  }
+}
+function _sanitizeName(name) {
+  if (typeof name !== "string") return name;
+  return name.replace(CONTROL_AND_BIDI_RE, '').trim().slice(0, 200);
+}
+// Validate user-supplied workspace metadata that is persisted to storage:
+// icon must be a known value from the UIService whitelist (or falsy), color
+// must be a 6-digit hex (or falsy), containerId must match the Firefox grammar
+// (or null). Caller-supplied `id` is stripped so crypto.randomUUID() always
+// assigns a fresh id — the popup never needs to pick its own wspId.
+function _sanitizeCreatePayload(message) {
+  if ("id" in message) delete message.id;
+  if (message.icon != null && message.icon !== "") {
+    if (!UIService._VALID_ICONS.has(message.icon)) {
+      console.warn("[Handler] rejecting unknown icon:", message.icon);
+      message.icon = "";
+    }
+  }
+  if (message.color != null && message.color !== "") {
+    if (typeof message.color !== "string" || !HEX_COLOR_RE.test(message.color)) {
+      console.warn("[Handler] rejecting malformed color:", message.color);
+      message.color = null;
+    }
+  }
+  // Normalize empty-string container to null, then validate.
+  if (!message.containerId) message.containerId = null;
+  _validateContainerId(message.containerId);
 }
 
 async function _handleMessage(message) {
@@ -40,16 +86,31 @@ async function _handleMessage(message) {
       return result;
     case "createWorkspace":
       _validateWindowId(message.windowId);
+      message.name = _sanitizeName(message.name);
+      _sanitizeCreatePayload(message);
       await WorkspaceService.createWorkspace(message);
       console.log("[Handler] createWorkspace -> success");
       return { success: true };
     case "createWorkspaceWithTab":
       _validateWindowId(message.windowId);
+      message.name = _sanitizeName(message.name);
+      _sanitizeCreatePayload(message);
       result = await WorkspaceService.createWorkspaceWithTab(message);
       console.log("[Handler] createWorkspaceWithTab -> wspId:", result?.wspId, "tabId:", result?.tabId);
       return result;
     case "renameWorkspace":
       _validateWspId(message.wspId);
+      message.wspName = _sanitizeName(message.wspName);
+      // Normalize icon/color on rename as well — same validation rules apply.
+      if (message.wspIcon != null && message.wspIcon !== "" && !UIService._VALID_ICONS.has(message.wspIcon)) {
+        console.warn("[Handler] renameWorkspace rejecting icon:", message.wspIcon);
+        message.wspIcon = "";
+      }
+      if (message.wspColor != null && message.wspColor !== "" &&
+          (typeof message.wspColor !== "string" || !HEX_COLOR_RE.test(message.wspColor))) {
+        console.warn("[Handler] renameWorkspace rejecting color:", message.wspColor);
+        message.wspColor = null;
+      }
       await WorkspaceService.renameWorkspace(message.wspId, { name: message.wspName, icon: message.wspIcon, color: message.wspColor });
       console.log("[Handler] renameWorkspace -> success");
       return { success: true };
@@ -65,9 +126,25 @@ async function _handleMessage(message) {
       return { success: true };
     case "destroyWsp":
       _validateWspId(message.wspId);
-      await WorkspaceService.destroyWsp(message.wspId);
-      console.log("[Handler] destroyWsp -> success");
-      return { success: true };
+      // windowId is optional here (popup normally passes it), so we don't
+      // hard-validate. WorkspaceService.destroyWsp falls back to a per-wsp
+      // state lookup if windowId is null.
+      if (message.windowId != null) _validateWindowId(message.windowId);
+      try {
+        result = await WorkspaceService.destroyWsp(message.wspId, message.windowId ?? null);
+      } catch (e) {
+        // Surface user-actionable errors ("Cannot destroy the last workspace",
+        // "Workspace not found") with a distinct _error shape so the popup
+        // can show a targeted message instead of a generic "internal error".
+        const msg = e?.message ?? String(e);
+        if (msg.startsWith("Cannot destroy") || msg.startsWith("Workspace not found")) {
+          console.log("[Handler] destroyWsp -> refused:", msg);
+          return { _error: true, message: msg };
+        }
+        throw e;
+      }
+      console.log("[Handler] destroyWsp -> success, activatedWspId:", result?.activatedWspId);
+      return { success: true, activatedWspId: result?.activatedWspId };
     case "activateWorkspace":
       _validateWspId(message.wspId);
       _validateWindowId(message.windowId);
@@ -90,7 +167,8 @@ async function _handleMessage(message) {
       return result;
     case "setWorkspaceContainer":
       _validateWspId(message.wspId);
-      await WorkspaceService.setWorkspaceContainer(message.wspId, message.containerId);
+      _validateContainerId(message.containerId);
+      await WorkspaceService.setWorkspaceContainer(message.wspId, message.containerId || null);
       console.log("[Handler] setWorkspaceContainer -> success");
       return { success: true };
     // Tier 2: Closed tabs
@@ -115,9 +193,9 @@ async function _handleMessage(message) {
     case "saveWorkspaceOrder": {
       _validateWindowId(message.windowId);
       const ids = message.orderedIds;
-      if (!Array.isArray(ids) || !ids.every(id => typeof id === "string")) {
+      if (!Array.isArray(ids) || !ids.every(id => typeof id === "string" && UUID_RE.test(id))) {
         console.warn("[Handler] saveWorkspaceOrder -> invalid orderedIds:", ids);
-        return { _error: true, message: "orderedIds must be an array of strings" };
+        return { _error: true, message: "orderedIds must be an array of valid UUIDs" };
       }
       await WorkspaceService.saveWorkspaceOrder(message.windowId, ids);
       console.log("[Handler] saveWorkspaceOrder -> success, length:", ids.length);
@@ -136,6 +214,25 @@ async function _handleMessage(message) {
       _validateWspId(message.wspId);
       result = await TabService.getTabPreviews(message.wspId, message.limit);
       console.log("[Handler] getTabPreviews -> previews:", result?.previews?.length, "total:", result?.total);
+      return result;
+
+    // Tier 4: Bookmark export/restore
+    case "exportWorkspaceToBookmarks":
+      _validateWspId(message.wspId);
+      result = await BookmarkService.exportWorkspace(message.wspId);
+      console.log("[Handler] exportWorkspaceToBookmarks -> exported:", result?.exported);
+      return result;
+    case "getBookmarkWorkspaces":
+      result = await BookmarkService.getExportedWorkspaces();
+      console.log("[Handler] getBookmarkWorkspaces -> count:", result?.length);
+      return result;
+    case "restoreWorkspaceFromBookmarks":
+      _validateWindowId(message.windowId);
+      if (typeof message.folderId !== "string" || !message.folderId) {
+        throw new Error("Invalid folderId");
+      }
+      result = await BookmarkService.restoreWorkspace(message.folderId, message.windowId);
+      console.log("[Handler] restoreWorkspaceFromBookmarks -> wspId:", result?.wspId, "tabs:", result?.tabCount);
       return result;
 
     // Dark-mode hint from popup (popup has real DOM, bypasses resistFingerprinting)

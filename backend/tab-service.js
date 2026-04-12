@@ -201,10 +201,45 @@ class TabService {
           "already assigned to workspace:", alreadyAssigned.id, alreadyAssigned.name, "— no-op");
       }
     } else {
-      console.log("[TabService][addTabToWorkspace] no active workspace — creating default");
-      const wsp = WorkspaceService._buildDefaultWspData(tab.windowId, [tab.id]);
-      await WorkspaceService.createWorkspace(wsp);
-      await TabService.setTabSessionValue(tab.id, wsp.id);
+      // If workspaces exist but none is active (e.g. after destroying the active
+      // workspace), activate the first one instead of creating a phantom workspace.
+      if (workspaces.length > 0) {
+        const targetWsp = workspaces[0];
+        console.log("[TabService][addTabToWorkspace] no active workspace but", workspaces.length,
+          "exist - activating first:", targetWsp.id, targetWsp.name);
+        // Container mismatch: reopen first (the reopen onCreated re-enters
+        // addTabToWorkspace with a fresh tab ID and will hit the active-wsp
+        // path on the second pass — there is no double-assign risk here).
+        if (targetWsp.containerId
+            && tab.cookieStoreId !== targetWsp.containerId
+            && TabService._canReopenInContainer(tab.url)) {
+          console.log("[TabService][addTabToWorkspace] container mismatch in fallback path — reopening");
+          await TabService._reopenInContainer(tab, targetWsp.containerId, { suppressOnCreated: false });
+          return false;
+        }
+        // IMPORTANT: push the new tab into targetWsp's tab list BEFORE calling
+        // activateWsp. Otherwise activateWsp's _updateActiveCache runs with a
+        // stale tab list (missing our tab), and a concurrent onTabActivated
+        // sees a cache miss until the post-activation patch below can run —
+        // the old flow did this patch via _activeCache?.tabIds.add which was
+        // a band-aid duplicating what activateWsp had already done internally.
+        await WSPStorageManager.withWorkspaceLock(targetWsp.id, async () => {
+          const freshActive = await WSPStorageManager.getWorkspace(targetWsp.id);
+          if (!freshActive.tabs.includes(tab.id)) {
+            freshActive.tabs.push(tab.id);
+            await freshActive._saveState();
+          }
+        });
+        await TabService.setTabSessionValue(tab.id, targetWsp.id);
+        // Now activate: _updateActiveCache will pick up the fresh tab list
+        // including our just-added tab in a single pass.
+        await WorkspaceService.activateWsp(targetWsp.id, tab.windowId);
+      } else {
+        console.log("[TabService][addTabToWorkspace] no workspaces at all - creating default");
+        const wsp = WorkspaceService._buildDefaultWspData(tab.windowId, [tab.id]);
+        await WorkspaceService.createWorkspace(wsp);
+        await TabService.setTabSessionValue(tab.id, wsp.id);
+      }
     }
     return false;
   }

@@ -48,20 +48,36 @@ class Workspace {
     this.tabs = await Workspace._filterValidTabs(this.tabs, this.windowId);
     console.log("[Workspace][destroy] valid tabs to remove:", this.tabs.length);
 
+    // Critical ordering: removeWsp (window list) BEFORE tabs.remove.
+    // tabs.remove triggers onTabRemoved -> removeTabFromWorkspace which
+    // iterates workspaces from the window list via getWorkspaces(windowId).
+    // Removing from the window list first ensures that iteration no longer
+    // sees this wspId, so removeTabFromWorkspace becomes a no-op and cannot
+    // re-create zombie state for the workspace we are about to delete.
+    // deleteWspState and clearClosedTabs can come in any order after.
+    await WSPStorageManager.removeWsp(this.id, this.windowId);
+    await WSPStorageManager.deleteWspState(this.id);
+    await WSPStorageManager.clearClosedTabs(this.id);
+
     if (this.tabs.length > 0) {
       try {
         await browser.tabs.remove(this.tabs);
         console.log("[Workspace][destroy] removed", this.tabs.length, "tabs");
       } catch (e) {
-        // Tabs may have closed between _filterValidTabs and remove (TOCTOU).
-        // Continue cleanup so the workspace doesn't become a ghost in storage.
-        console.warn("[Workspace][destroy] tabs.remove failed (tabs may have closed):", e.message);
+        // Tabs may have closed between _filterValidTabs and remove (TOCTOU),
+        // OR tabs.remove genuinely failed. In the latter case, we have an
+        // orphan situation: state is already deleted but the tabs are still
+        // open with session values pointing to a nonexistent wspId. Best-
+        // effort recovery: clear each tab's session value so future restart
+        // logic doesn't try to route it to the deleted workspace.
+        console.warn("[Workspace][destroy] tabs.remove failed:", e.message);
+        for (const tabId of this.tabs) {
+          try {
+            await browser.sessions.removeTabValue(tabId, "wspId");
+          } catch { /* tab already gone — fine */ }
+        }
       }
     }
-    await WSPStorageManager.deleteWspState(this.id);
-    await WSPStorageManager.removeWsp(this.id, this.windowId);
-    // Clean up closed tabs for this workspace
-    await WSPStorageManager.clearClosedTabs(this.id);
     console.log("[Workspace][destroy] done — id:", this.id);
   }
 

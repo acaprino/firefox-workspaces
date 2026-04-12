@@ -8,23 +8,62 @@
    1. CSS Custom Properties (mapped to CSS system colors)
    ---------------------------------------------------------- */
 :root {
-  /* Panel colors — injected by applyFirefoxTheme() from the browser.theme API
-     as --ff-popup-* custom properties; fall back to CSS system colors for
-     themes that omit specific popup color keys. */
-  --wsp-bg:             var(--ff-popup-bg,    -moz-Dialog);
-  --wsp-color:          var(--ff-popup-text,  -moz-DialogText);
-  --wsp-border:         var(--ff-popup-border, ThreeDShadow);
-  --wsp-text-secondary: GrayText;
+  /* Panel colors — zero hardcoded hex. The strategy is:
+
+     1. If the user's Firefox theme defines LWT keys (popup, accentcolor, ...),
+        applyTheme() in wsp.js injects them as --ff-popup-* custom
+        properties. Those override everything below.
+     2. Otherwise, --wsp-bg falls through to the standard CSS `Canvas`
+        system color, which Firefox resolves based on the active
+        color-scheme (set on :root[data-theme]). On Firefox dark this is
+        #1c1b22; on light it's white. Not a hex we chose — it's the page
+        canvas color the browser exposes automatically.
+     3. Text / accent colors use `CanvasText`, `AccentColor`, and
+        `AccentColorText` — all CSS system colors that the browser resolves
+        to the active theme/OS palette.
+
+     No hex values anywhere. Everything is theme/chrome/system-driven. */
+  --wsp-bg:             var(--ff-popup-bg,    Canvas);
+  --wsp-color:          var(--ff-popup-text,  CanvasText);
+  /* Border defaults to transparent so the popup stays seamless (like the
+     native Firefox "Extensions" panel). Only themes that explicitly define
+     popup_border will show divider lines. */
+  --wsp-border:         var(--ff-popup-border, transparent);
+  --wsp-text-secondary: color-mix(in srgb, var(--wsp-color) 55%, transparent);
   --wsp-hover:          var(--ff-popup-highlight, color-mix(in srgb, var(--wsp-color) 8%, transparent));
   --wsp-active:         color-mix(in srgb, var(--ff-popup-highlight, var(--wsp-color)) 20%, transparent);
-  --wsp-primary:        AccentColor;
-  --wsp-primary-hover:  color-mix(in srgb, AccentColor 85%, CanvasText);
-  --wsp-primary-active: color-mix(in srgb, AccentColor 72%, CanvasText);
-  --wsp-btn-bg:         ButtonFace;
-  --wsp-btn-hover:      color-mix(in srgb, ButtonFace 80%, ButtonText);
-  --wsp-input-bg:       var(--ff-popup-bg, Field);
-  --wsp-input-border:   var(--ff-popup-border, ThreeDShadow);
-  --wsp-focus:          AccentColor;
+
+  /* Accent derives from the theme's accentcolor via --ff-popup-accent.
+     Falls back to the CSS AccentColor system color when no theme chain
+     matches — that tracks the OS / user-chrome accent automatically. */
+  --wsp-primary:        var(--ff-popup-accent, AccentColor);
+  --wsp-primary-hover:  color-mix(in srgb, var(--wsp-primary) 85%, var(--wsp-color));
+  --wsp-primary-active: color-mix(in srgb, var(--wsp-primary) 72%, var(--wsp-color));
+  /* Text on a primary-colored background (e.g. dialog OK button). Prefer the
+     theme's popup_highlight_text when defined; else fall back to the CSS
+     AccentColorText system color which pairs with AccentColor automatically. */
+  --wsp-on-primary:     var(--ff-popup-highlight-text, AccentColorText);
+
+  /* Button surfaces derived from the text color. With --wsp-bg transparent
+     by default, these become subtle tints layered over the panel chrome,
+     giving a native "ghost button" look without a solid fill. */
+  --wsp-btn-bg:         color-mix(in srgb, var(--wsp-color) 8%, transparent);
+  --wsp-btn-hover:      color-mix(in srgb, var(--wsp-color) 14%, transparent);
+
+  /* Input/search field. Without an explicit theme value, use a subtle tint
+     derived from the text color — layered over the transparent popup bg,
+     this produces a field with just enough contrast to be visible against
+     the panel chrome without hardcoding a color. */
+  --wsp-input-bg:       var(--ff-popup-input-bg, color-mix(in srgb, var(--wsp-color) 6%, transparent));
+  --wsp-input-text:     var(--ff-popup-input-text, var(--wsp-color));
+  --wsp-input-border:   var(--ff-popup-input-border, transparent);
+  --wsp-focus:          var(--wsp-primary);
+
+  /* Danger color for destructive hover states. Derived from the current text
+     color mixed with a warning red hue, so it reads correctly on light and
+     dark themes. The red seed is the only literal color in this file — it
+     defines "danger" semantically, not a theme surface. */
+  --wsp-danger:         color-mix(in srgb, #e34242 70%, var(--wsp-color));
 
   /* Geometry — Firefox Proton uses a 4px grid */
   --wsp-radius-sm: 4px;
@@ -46,21 +85,10 @@
   color-scheme: light dark;
 }
 
-/* Fallback for browsers that do not support -moz-Dialog:
-   Use standard CSS system colors (Canvas/CanvasText).
-   Firefox supports -moz-Dialog, so this is a safety net only. */
-@supports not (background: -moz-Dialog) {
-  :root {
-    --wsp-bg:           var(--ff-popup-bg,    Canvas);
-    --wsp-color:        var(--ff-popup-text,  CanvasText);
-    --wsp-border:       var(--ff-popup-border, color-mix(in srgb, CanvasText 20%, transparent));
-    --wsp-input-bg:     var(--ff-popup-bg, Field);
-    --wsp-input-border: var(--ff-popup-border, color-mix(in srgb, CanvasText 25%, transparent));
-  }
-}
-
-/* color-scheme tells the browser which system color palette to use,
-   so -moz-Dialog and other system colors resolve to the correct theme. */
+/* color-scheme tells the browser which system color palette to use, so
+   CanvasText, AccentColor, AccentColorText, GrayText, and other CSS system
+   colors resolve to the dark or light variant as the theme requires.
+   JS sets data-theme via _isFirefoxThemeDark() -> applyTheme(). */
 :root[data-theme="light"] { color-scheme: light; }
 :root[data-theme="dark"]  { color-scheme: dark;  }
 
@@ -127,7 +155,7 @@ body {
   padding: 10px 14px;
   background: var(--wsp-bg);
   color: var(--wsp-color);
-  border-bottom: 1px solid var(--wsp-border);
+  /* No divider: native Firefox popups have a seamless header. */
 }
 
 .title::before {
@@ -143,47 +171,13 @@ body {
   flex-shrink: 0;
 }
 
-/* Color mode toggle button in the title bar */
-#wsp-color-toggle {
-  margin-inline-start: auto;
-  width: 20px;
-  height: 20px;
-  border: none;
-  background: transparent;
-  cursor: pointer;
-  border-radius: var(--wsp-radius-sm);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  opacity: 0.45;
-  transition: opacity 0.1s, background-color 0.1s;
-  padding: 0;
-  flex-shrink: 0;
-}
-
-#wsp-color-toggle::after {
-  content: "";
-  display: block;
-  width: 14px;
-  height: 14px;
-  background: var(--wsp-text-secondary);
-  mask-image: url("../img/palette.svg");
-  mask-repeat: no-repeat;
-  mask-position: center;
-  mask-size: contain;
-}
-
-#wsp-color-toggle:hover { opacity: 0.85; background: var(--wsp-hover); }
-#wsp-color-toggle.active { opacity: 1; }
-#wsp-color-toggle.active::after { background: var(--wsp-primary); }
-
 /* ----------------------------------------------------------
    4. Tab Search (Tier 3)
    ---------------------------------------------------------- */
 .wsp-search {
   padding: 6px 8px;
   background: var(--wsp-bg);
-  border-bottom: 1px solid var(--wsp-border);
+  /* No divider: seamless with the list below, matching native popups. */
 }
 
 #wsp-search-input {
@@ -192,7 +186,7 @@ body {
   border: 1px solid var(--wsp-input-border);
   border-radius: var(--wsp-radius-sm);
   background: var(--wsp-input-bg);
-  color: var(--wsp-color);
+  color: var(--wsp-input-text);
   font-family: inherit;
   font-size: 12px;
   outline: none;
@@ -266,7 +260,7 @@ li.wsp-list-item {
   align-items: center;
   gap: 8px;
   padding: 6px 10px;
-  padding-inline-end: 56px;
+  padding-inline-end: 80px;
   margin: 2px 4px;
   border-radius: var(--wsp-radius-sm);
   background: transparent;
@@ -293,11 +287,15 @@ li.wsp-list-item.has-color {
   padding-left: 8px;
 }
 
-/* Active workspace highlight bar */
+/* Active workspace highlight bar.
+   Monochromatic by default (mirrors native Firefox popups which do not
+   show a colored accent for selected rows). When a user picks a workspace
+   color via the color picker, .has-color overrides border-left-color via
+   inline style from JS (_applyColorBar). */
 li.wsp-list-item.active {
   background: var(--wsp-hover);
   font-weight: 600;
-  border-left: 3px solid var(--wsp-primary);
+  border-left: 3px solid color-mix(in srgb, var(--wsp-color) 35%, transparent);
   padding-left: 7px;
 }
 
@@ -349,7 +347,8 @@ li.wsp-list-item.dragging {
 }
 
 li.wsp-list-item.drag-over {
-  box-shadow: inset 0 2px 0 var(--wsp-primary);
+  /* Monochromatic drop indicator derived from text color. */
+  box-shadow: inset 0 2px 0 color-mix(in srgb, var(--wsp-color) 55%, transparent);
 }
 
 /* ----------------------------------------------------------
@@ -380,6 +379,26 @@ li.wsp-list-item:hover .edit-btn {
 li.wsp-list-item .edit-btn:hover {
   opacity: 1;
   background: var(--wsp-active);
+}
+
+li.wsp-list-item .export-btn {
+  inset-inline-end: 54px;
+}
+
+li.wsp-list-item .export-btn::after {
+  content: "";
+  display: block;
+  width: 14px;
+  height: 14px;
+  background: var(--wsp-text-secondary);
+  mask-image: url("../img/bookmark.svg");
+  mask-repeat: no-repeat;
+  mask-position: center;
+  mask-size: contain;
+}
+
+li.wsp-list-item .export-btn:hover::after {
+  background: var(--wsp-color);
 }
 
 li.wsp-list-item .rename-btn {
@@ -415,11 +434,11 @@ li.wsp-list-item .delete-btn::after {
 }
 
 li.wsp-list-item .rename-btn:hover::after {
-  background: var(--wsp-primary);
+  background: var(--wsp-color);
 }
 
 li.wsp-list-item .delete-btn:hover::after {
-  background: color-mix(in srgb, red 80%, var(--wsp-color));
+  background: var(--wsp-danger);
 }
 
 /* Empty state */
@@ -450,10 +469,11 @@ li.no-wsp {
   border: none;
   border-radius: var(--wsp-radius-md);
   padding: 6px 4px 6px 10px;
+  /* Theme-aware shadow: dark on light themes, subtle glow on dark themes */
   box-shadow:
-    0 0.5px 1px rgba(0, 0, 0, 0.06),
-    0 2px 6px rgba(0, 0, 0, 0.08),
-    0 8px 24px rgba(0, 0, 0, 0.14);
+    0 0.5px 1px color-mix(in srgb, var(--wsp-color) 8%, transparent),
+    0 2px 6px  color-mix(in srgb, var(--wsp-color) 10%, transparent),
+    0 8px 24px color-mix(in srgb, var(--wsp-color) 16%, transparent);
   z-index: 100;
   pointer-events: none;
   line-height: 1.3;
@@ -555,7 +575,7 @@ li.no-wsp {
    8. Closed Tabs (Tier 2)
    ---------------------------------------------------------- */
 .wsp-closed-tabs {
-  border-top: 1px solid var(--wsp-border);
+  /* No divider: seamless continuation of the workspace list. */
   padding: 4px;
 }
 
@@ -662,7 +682,7 @@ li.no-wsp {
   bottom: 0;
   padding: 4px;
   background: var(--wsp-bg);
-  border-top: 1px solid var(--wsp-border);
+  /* No divider: seamless footer like the native Firefox "Extensions" popup. */
 }
 
 .footer {
@@ -706,6 +726,46 @@ li.no-wsp {
 }
 
 .footer#createNewWsp:active {
+  background: var(--wsp-active);
+}
+
+.footer#restoreFromBookmarks {
+  display: block;
+  width: auto;
+  padding: 6px 10px;
+  background: transparent;
+  color: var(--wsp-color);
+  font-size: 13px;
+  font-weight: 400;
+  text-decoration: none;
+  text-align: start;
+  border: none;
+  border-radius: var(--wsp-radius-sm);
+  cursor: default;
+  transition: background-color 0.08s ease-out;
+  appearance: none;
+}
+
+.footer#restoreFromBookmarks::before {
+  content: "";
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  background: var(--wsp-text-secondary);
+  mask-image: url("../img/restore.svg");
+  mask-repeat: no-repeat;
+  mask-position: center;
+  mask-size: contain;
+  flex-shrink: 0;
+  vertical-align: -2px;
+  margin-inline-end: 6px;
+}
+
+.footer#restoreFromBookmarks:hover {
+  background: var(--wsp-hover);
+}
+
+.footer#restoreFromBookmarks:active {
   background: var(--wsp-active);
 }
 
@@ -856,7 +916,7 @@ li.no-wsp {
   border: 1px solid var(--wsp-input-border);
   border-radius: var(--wsp-radius-sm);
   background: var(--wsp-input-bg);
-  color: var(--wsp-color);
+  color: var(--wsp-input-text);
   font-family: inherit;
   font-size: 13px;
   outline: none;
@@ -867,6 +927,50 @@ li.no-wsp {
   outline: 2px solid var(--wsp-focus);
   outline-offset: -2px;
   border-color: transparent;
+}
+
+/* Checkbox row (export dialog) */
+.custom-dialog-checkbox-row {
+  display: flex;
+  align-items: center;
+  margin-bottom: 16px;
+}
+
+.custom-dialog-checkbox-row label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--wsp-color);
+  cursor: pointer;
+  user-select: none;
+}
+
+.custom-dialog-checkbox-row input[type="checkbox"] {
+  width: 14px;
+  height: 14px;
+  accent-color: var(--wsp-primary);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+/* Folder picker row (restore dialog) */
+.custom-dialog-folder-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 16px;
+  font-size: 12px;
+}
+
+.custom-dialog-folder-row label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  font-weight: 500;
+  color: var(--wsp-text-secondary);
+  white-space: nowrap;
+  line-height: 1;
 }
 
 /* Container picker row - vertical layout */
@@ -895,7 +999,7 @@ li.no-wsp {
   border: 1px solid var(--wsp-input-border);
   border-radius: var(--wsp-radius-sm);
   background: var(--wsp-input-bg);
-  color: var(--wsp-color);
+  color: var(--wsp-input-text);
   font-family: inherit;
   font-size: 12px;
   outline: none;
@@ -1067,8 +1171,8 @@ li.no-wsp {
 }
 
 .icon-grid button.selected {
-  background: color-mix(in srgb, var(--wsp-primary) 14%, transparent);
-  border-color: var(--wsp-primary);
+  background: color-mix(in srgb, var(--wsp-color) 12%, transparent);
+  border-color: color-mix(in srgb, var(--wsp-color) 45%, transparent);
 }
 
 .icon-grid button.selected img {
@@ -1121,7 +1225,7 @@ li.no-wsp {
 
 .custom-dialog-buttons button#custom-dialog-ok {
   background: var(--wsp-primary);
-  color: AccentColorText;
+  color: var(--wsp-on-primary);
 }
 
 .custom-dialog-buttons button#custom-dialog-ok:hover {
@@ -1155,7 +1259,8 @@ li.no-wsp {
 }
 
 ::selection {
-  background: color-mix(in srgb, var(--wsp-primary) 30%, transparent);
+  /* Monochromatic selection — matches native arrowpanel behavior. */
+  background: color-mix(in srgb, var(--wsp-color) 22%, transparent);
 }
 
 /* ----------------------------------------------------------
