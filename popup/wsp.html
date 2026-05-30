@@ -53,6 +53,15 @@
     <div class="title">
       Workspaces
     </div>
+    <!-- Refuse-to-wipe error banner -->
+    <div id="wsp-error-banner" class="wsp-error-banner" role="alert" hidden>
+        <div class="wsp-error-banner-text" id="wsp-error-banner-text"></div>
+        <div class="wsp-error-banner-actions">
+            <button type="button" id="wsp-error-copy">Copy diagnostic dump</button>
+            <button type="button" id="wsp-error-acknowledge" title="Dismiss this banner. The next Firefox restart will retry the restore.">Dismiss</button>
+            <button type="button" id="wsp-error-give-up" title="Permanently abandon the restore retry. Only do this if you do not need the workspaces from before the failed restart." class="wsp-error-give-up">Give up</button>
+        </div>
+    </div>
     <!-- Tab search (Tier 3) -->
     <div class="wsp-search" id="wsp-search">
         <input type="text" id="wsp-search-input" placeholder="Search tabs..." autocomplete="off" aria-label="Search tabs">
@@ -70,6 +79,7 @@
     <div class="footer-container">
         <a href="#" class="footer" id="createNewWsp">New workspace</a>
         <a href="#" class="footer" id="restoreFromBookmarks">Restore from bookmarks</a>
+        <a href="#" class="footer footer-diagnostic" id="wsp-copy-diagnostics" title="Copy a JSON dump of all extension storage for diagnostics">Copy diagnostics</a>
     </div>
 </div>
 <script src="../backend/theme-utils.js"></script>

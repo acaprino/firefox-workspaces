@@ -206,9 +206,115 @@ class WorkspaceUI {
     this.displayWorkspaces();
     this._setupCreateButton();
     this._setupRestoreButton();
+    this._setupDiagnosticsLink();
+    this._setupRestoreErrorBanner();
     this.setupSearch();
     this.showClosedTabs();
     console.log("[WorkspaceUI][initialize] done");
+  }
+
+  // Render an inline banner if the previous restart aborted via the
+  // refuse-to-wipe guard (see backend/brainer.js _restoreWorkspaces).
+  //
+  // Two user actions are exposed:
+  //   - Dismiss (acknowledgeLastRestoreError): clears the banner only. The
+  //     restart-retry signal stays armed; the next Firefox restart will try
+  //     again.
+  //   - Give up (giveUpRestoreRetry): clears the banner AND the retry signal
+  //     (destructive; old workspaces become orphaned). Confirms first.
+  async _setupRestoreErrorBanner() {
+    const banner = document.getElementById("wsp-error-banner");
+    if (!banner) return;
+    let info;
+    try {
+      info = await this._callBackgroundTask("getLastRestoreError");
+    } catch (e) {
+      console.debug("[WSP][_setupRestoreErrorBanner] getLastRestoreError failed:", e?.message);
+      return;
+    }
+    if (!info) return;
+    // Popup may have been torn down while we awaited the background reply.
+    // Re-fetch DOM nodes after the await and bail if any are missing.
+    const text = document.getElementById("wsp-error-banner-text");
+    const copyBtn = document.getElementById("wsp-error-copy");
+    const ackBtn = document.getElementById("wsp-error-acknowledge");
+    const giveUpBtn = document.getElementById("wsp-error-give-up");
+    if (!text || !copyBtn || !ackBtn || !giveUpBtn) return;
+
+    // Storage values can be edited via about:debugging; validate before
+    // formatting them into user-visible text.
+    const isFiniteNum = (v) => typeof v === "number" && Number.isFinite(v);
+    const when = isFiniteNum(info.when) ? new Date(info.when).toLocaleString() : "earlier";
+    const wspCount = isFiniteNum(info.wspCount) ? info.wspCount : "?";
+    const urlCount = isFiniteNum(info.snapshotUrlCount) ? info.snapshotUrlCount : "?";
+    const reason = info.reason === "phase4-failure"
+      ? `A previous restore attempt failed mid-way at ${when}.`
+      : `Workspace restore was paused at ${when} to prevent data loss.`;
+    text.textContent =
+      `${reason} ${wspCount} workspace(s) had ${urlCount} previously open URL(s) recorded. ` +
+      `User data was left untouched. ` +
+      `Try restarting Firefox to retry the restore. ` +
+      `Use "Give up" only if you no longer need the workspaces from before the failed restart.`;
+    banner.hidden = false;
+
+    copyBtn.addEventListener("click", () => {
+      this._copyDiagnostics();
+    });
+    ackBtn.addEventListener("click", async () => {
+      // Optimistic UI: hide the banner immediately so the user sees feedback
+      // even if the background storage write is slow. acknowledge is best-
+      // effort and idempotent.
+      banner.hidden = true;
+      try { await this._callBackgroundTask("acknowledgeLastRestoreError"); }
+      catch (e) { console.debug("[WSP][acknowledge] failed:", e?.message); }
+    });
+    giveUpBtn.addEventListener("click", async () => {
+      // showCustomDialog returns true on OK, false on Cancel for no-input dialogs.
+      const ok = await showCustomDialog({
+        message:
+          "Give up the automatic restore retry?\n\n" +
+          "Workspaces from before the failed restart will become unrecoverable from " +
+          "this UI (they remain in storage but unattached). The next Firefox start " +
+          "will create a fresh default workspace.\n\n" +
+          "If you have not copied the diagnostic dump yet, do that first."
+      });
+      if (!ok) return;
+      banner.hidden = true;
+      try { await this._callBackgroundTask("giveUpRestoreRetry"); }
+      catch (e) { console.debug("[WSP][giveUpRestoreRetry] failed:", e?.message); }
+    });
+  }
+
+  _setupDiagnosticsLink() {
+    const link = document.getElementById("wsp-copy-diagnostics");
+    if (!link) return;
+    link.addEventListener("click", (e) => {
+      e.preventDefault();
+      this._copyDiagnostics();
+    });
+  }
+
+  async _copyDiagnostics() {
+    let dump;
+    try {
+      dump = await this._callBackgroundTask("getDiagnostics");
+    } catch (e) {
+      console.warn("[WSP][_copyDiagnostics] failed:", e?.message);
+      await showCustomDialog({ message: "Failed to read diagnostics: " + (e?.message || e) });
+      return;
+    }
+    const json = JSON.stringify(dump, null, 2);
+    try {
+      await navigator.clipboard.writeText(json);
+      console.log("[WSP][_copyDiagnostics] copied", json.length, "chars");
+      await showCustomDialog({
+        message: `Diagnostics copied to clipboard (${json.length} chars). ` +
+          `Includes workspace metadata + URL snapshots -- review before sharing.`
+      });
+    } catch (e) {
+      console.warn("[WSP][_copyDiagnostics] clipboard write failed:", e?.message);
+      await showCustomDialog({ message: "Clipboard write blocked. JSON length: " + json.length });
+    }
   }
 
   async getWorkspaces(currentWindowId) {

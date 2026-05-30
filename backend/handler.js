@@ -261,6 +261,44 @@ async function _handleMessage(message) {
       console.log("[Handler] restoreWorkspaceFromBookmarks -> wspId:", result?.wspId, "tabs:", result?.tabCount);
       return result;
 
+    // Refuse-to-wipe error surface. Popup queries on open to render a banner
+    // when the previous restart aborted because the restore would have wiped
+    // workspace tab arrays.
+    //
+    // Two distinct user actions:
+    //   - acknowledgeLastRestoreError: dismisses the banner only. Leaves
+    //     primaryWindowLastId intact so the next restart can still retry the
+    //     restore. Also clears the in-memory _refuseToWipeActive flag so a
+    //     re-attempt can run during the same Firefox session.
+    //   - giveUpRestoreRetry: destructive. Also clears primaryWindowLastId
+    //     so the next start enters the first-startup path and creates a
+    //     fresh default workspace. Old `ld-wsp-{wspId}` records become
+    //     orphaned (recoverable only via the diagnostic dump).
+    case "getLastRestoreError":
+      result = await WSPStorageManager.getLastRestoreError();
+      console.log("[Handler] getLastRestoreError ->", result ? "present" : "none");
+      return result;
+    case "acknowledgeLastRestoreError":
+      await WSPStorageManager.clearLastRestoreError();
+      Brainer._refuseToWipeActive = false;
+      console.log("[Handler] acknowledgeLastRestoreError -> banner cleared, retry signal kept");
+      return { success: true };
+    case "giveUpRestoreRetry":
+      await WSPStorageManager.clearLastRestoreError();
+      await WSPStorageManager.removePrimaryWindowLastId();
+      Brainer._refuseToWipeActive = false;
+      console.log("[Handler] giveUpRestoreRetry -> banner + retry signal cleared (destructive)");
+      return { success: true };
+
+    // Diagnostic dump for incident response. Returns every ld-wsp-* key plus
+    // primary IDs and schema version. URL contents are returned as-is so the
+    // user can decide what to share -- the popup can warn before copying to
+    // clipboard.
+    case "getDiagnostics":
+      result = await WSPStorageManager.getDiagnostics();
+      console.log("[Handler] getDiagnostics -> keys:", Object.keys(result || {}).length);
+      return result;
+
     // Dark-mode hint from popup (popup has real DOM, bypasses resistFingerprinting)
     case "setDarkModeHint":
       UIService._darkModeHint = message.isDark === true;

@@ -1294,3 +1294,64 @@ li.no-wsp {
     transition: none;
   }
 }
+
+/* ----------------------------------------------------------
+   13. Refuse-to-wipe error banner + diagnostic footer link
+   ---------------------------------------------------------- */
+.wsp-error-banner {
+  margin: 8px 12px;
+  padding: 10px 12px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--wsp-primary) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--wsp-primary) 35%, transparent);
+  color: var(--wsp-color);
+  font-size: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.wsp-error-banner-text {
+  line-height: 1.4;
+  white-space: pre-wrap;
+}
+
+.wsp-error-banner-actions {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+}
+
+.wsp-error-banner-actions button {
+  padding: 4px 10px;
+  font-size: 12px;
+  background: var(--wsp-btn-bg);
+  color: var(--wsp-color);
+  border: 1px solid var(--wsp-input-border);
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.wsp-error-banner-actions button:hover {
+  background: var(--wsp-btn-hover);
+}
+
+.footer-diagnostic {
+  margin-left: auto;
+  opacity: 0.7;
+  font-size: 11px;
+}
+
+.footer-diagnostic:hover {
+  opacity: 1;
+}
+
+/* "Give up" is destructive -- soft accent to set it apart from Dismiss. */
+.wsp-error-banner-actions button.wsp-error-give-up {
+  opacity: 0.65;
+  margin-left: auto;
+}
+
+.wsp-error-banner-actions button.wsp-error-give-up:hover {
+  opacity: 1;
+}

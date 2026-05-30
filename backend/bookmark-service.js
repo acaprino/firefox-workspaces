@@ -206,13 +206,16 @@ class BookmarkService {
       const freshWsp = await WSPStorageManager.getWorkspace(wspId);
       freshWsp.tabs = tabIds;
       await freshWsp._saveState();
+      // Keep tabSnapshot fresh for restart resilience (IC3) -- restore opens
+      // the bookmarked URLs as brand-new tabs.
+      TabService._scheduleSnapshotRefresh(windowId, wspId);
 
       // Activate the first tab
       await browser.tabs.update(tabIds[0], { active: true });
 
       // Hide inactive workspace tabs
       await WorkspaceService.hideInactiveWspTabs(windowId, wspId);
-      WorkspaceService._updateActiveCache(windowId, tabIds);
+      WorkspaceService._updateActiveCache(windowId, tabIds, wspId);
       await MenuService.refreshTabMenu();
       await UIService.updateToolbarButton(windowId);
 

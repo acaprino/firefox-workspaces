@@ -17,3 +17,16 @@ desktop.ini
 # Environment
 .env
 .env.local
+
+# Review / forensic / scaffold artifacts -- mirror .webextignore so a stray
+# `git add .` cannot leak them. Forensic scripts in scripts/ may reference
+# raw profile paths and should never end up in public history.
+.deep-dive/
+.team-review/
+.full-review-pipeline/
+scripts/
+docs/
+.claude/
+amo-metadata.json
+claude_.bat
+.env.example

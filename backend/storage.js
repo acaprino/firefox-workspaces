@@ -42,6 +42,10 @@ const STORAGE_KEYS = {
   primaryWindow: 'primary-window-id',
   primaryWindowLast: 'primary-window-last-id',
   schemaVersion: 'ld-wsp-schema-version',
+  // Surface-only error state. Set by _restoreWorkspaces when the refuse-to-wipe
+  // guard trips so the popup can show an explanatory banner. Cleared on
+  // successful activate/restore.
+  lastRestoreError: 'ld-wsp-last-restore-error',
 };
 
 const LIMITS = {
@@ -134,23 +138,19 @@ class WSPStorageManager {
     });
   }
 
-  // delete data (window id and associated tabs) associated to window
-  static async destroyWindow(windowId) {
-    const key = STORAGE_KEYS.windowWsps(windowId);
-    const results = await browser.storage.local.get(key);
-    const wspIds = results[key] || [];
-
-    // 1. delete window-id: [array of associated workspaces ids] from local storage
-    await browser.storage.local.remove(key);
-
-    // 2. delete all workspace-ids: [array of tabs] associated with that window from local storage
-    await Promise.all(wspIds.map(WSPStorageManager.deleteWspState));
-
-    // 3. clean up closed-tab entries for each workspace
-    await Promise.all(wspIds.map(id => WSPStorageManager.clearClosedTabs(id)));
-
-    // 4. clean up workspace order for this window
-    await browser.storage.local.remove(STORAGE_KEYS.wspOrder(windowId));
+  // Detach metadata for a window WITHOUT deleting the per-workspace state or
+  // closed-tab entries. Used by the restart-restore path: workspace IDs are
+  // reused under a new windowId, so the shared `ld-wsp-{wspId}` and
+  // `ld-wsp-closed-{wspId}` keys must survive. Only the window-keyed indexes
+  // (window list + order) are window-specific and can be safely removed.
+  // (A `destroyWindow` variant that DID wipe `ld-wsp-{wspId}` used to live
+  // here. It was the root cause of the original tab-loss incident and was
+  // removed once the restore path no longer needed it.)
+  static async detachWindow(windowId) {
+    await browser.storage.local.remove([
+      STORAGE_KEYS.windowWsps(windowId),
+      STORAGE_KEYS.wspOrder(windowId),
+    ]);
   }
 
   static async getPrimaryWindowId() {
@@ -181,6 +181,23 @@ class WSPStorageManager {
 
   static async removePrimaryWindowLastId() {
     await browser.storage.local.remove(STORAGE_KEYS.primaryWindowLast);
+  }
+
+  // ── Last restore error (surfaced to the popup as a banner) ──
+
+  static async getLastRestoreError() {
+    const key = STORAGE_KEYS.lastRestoreError;
+    const result = await browser.storage.local.get(key);
+    return result[key] || null;
+  }
+
+  static async setLastRestoreError(payload) {
+    const key = STORAGE_KEYS.lastRestoreError;
+    await browser.storage.local.set({ [key]: payload });
+  }
+
+  static async clearLastRestoreError() {
+    await browser.storage.local.remove(STORAGE_KEYS.lastRestoreError);
   }
 
   // ── Closed Tabs (Tier 2) ──
@@ -222,6 +239,22 @@ class WSPStorageManager {
   // each other's changes when they interleave at await points.
   static async withWorkspaceLock(wspId, fn) {
     return _storageMutex.run(`wsp-${wspId}`, fn);
+  }
+
+  // ── Diagnostic dump (Tier 4 -- incident response) ──
+
+  // Return every ld-wsp-* key plus primary window IDs and schema version.
+  // Used by the popup's "Copy diagnostic dump" action when investigating loss.
+  static async getDiagnostics() {
+    const all = await browser.storage.local.get(null);
+    const out = { _generatedAt: new Date().toISOString(), _schemaVersion: WSPStorageManager.SCHEMA_VERSION };
+    for (const [k, v] of Object.entries(all)) {
+      if (k.startsWith("ld-wsp-") || k === STORAGE_KEYS.primaryWindow ||
+          k === STORAGE_KEYS.primaryWindowLast || k === STORAGE_KEYS.schemaVersion) {
+        out[k] = v;
+      }
+    }
+    return out;
   }
 
   // ── Workspace Order (Tier 3) ──

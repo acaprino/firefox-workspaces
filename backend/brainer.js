@@ -1,10 +1,32 @@
 // Orchestrator: init + listener registration only. All logic delegated to services.
 class Brainer {
-  // Lifecycle states: 'uninitialized' -> 'restoring' -> 'ready'
+  // Lifecycle states: 'uninitialized' -> 'initializing' -> 'restoring' -> 'ready'
+  // ('restoring' is skipped on the first-start / already-running path; the
+  // state goes 'initializing' -> 'ready' directly there.)
   static _state = 'uninitialized';
   static _initStarted = false;
   static _lastFocusedWindowId = null;
   static _primaryWindowId = null;
+  // Set when refuse-to-wipe trips; blocks _onWindowCreated and initialize from
+  // re-entering the restore path on every new window the user opens during the
+  // recovery banner. Cleared on successful restore or via acknowledge/giveUp.
+  // In-memory only -- a fresh Firefox start naturally clears it.
+  static _refuseToWipeActive = false;
+
+  // Tabs that look like Firefox session-restore placeholders rather than real
+  // user content. When refuse-to-wipe evaluates, these don't count as "live
+  // tabs" -- otherwise a profile-corrupted restart that comes up with a single
+  // about:newtab placeholder would bypass the guard (FMA2).
+  static _PLACEHOLDER_URL_RE = /^about:(blank|newtab|home|sessionrestore)/i;
+
+  // Set true the moment browser.runtime.onStartup fires. onStartup fires ONLY on
+  // a real browser start (never on an extension reload), so it is the one
+  // reliable "the browser just restarted" signal. The already-running init path
+  // uses it to enable the URL-snapshot fallback, and onStartup itself uses it to
+  // run a post-init repair if it fires after initialize() already settled.
+  static _browserStarted = false;
+  // Guards the onStartup-fired-after-ready repair so it runs at most once.
+  static _postStartupRepairDone = false;
 
   static async getCachedPrimaryWindowId() {
     if (Brainer._primaryWindowId != null) return Brainer._primaryWindowId;
@@ -14,13 +36,25 @@ class Brainer {
 
   static async initialize() {
     Brainer._initStarted = true;
+    // Fresh Firefox start: a previous session's refuse-to-wipe flag is in
+    // memory only, but be explicit. Cleared again on successful restore.
+    Brainer._refuseToWipeActive = false;
+    // 'initializing' is a sub-state of 'uninitialized' that signals to event
+    // handlers (notably onInstalled) that initialize() is in flight but has
+    // not yet reached the restart-detect logic. Without this, an onInstalled
+    // event that arrives during the ensureSchemaVersion await could race
+    // _ensureDefaultWorkspace and create duplicate default workspaces.
+    Brainer._state = 'initializing';
     try {
       console.log("[Brainer][initialize] starting — current state:", Brainer._state);
-      await WSPStorageManager.ensureSchemaVersion();
+      // Register listeners BEFORE the schema-version await so any buffered
+      // events fire against handlers that guard on _state. The handlers
+      // themselves no-op while _state is 'initializing' or 'restoring'.
       this._registerWindowListeners();
       this._registerTabListeners();
       this._registerCommandListeners();
       MenuService.registerOmniboxListeners();
+      await WSPStorageManager.ensureSchemaVersion();
 
       // Detect restart vs first-ever startup BEFORE _ensureDefaultWorkspace
       // to eliminate the race with onStartup event.
@@ -67,15 +101,16 @@ class Brainer {
       } else {
         console.log("[Brainer][initialize] first-start or already-running path");
         await this._ensureDefaultWorkspace();
-        // Remove stale tab IDs from all workspaces. After a non-clean shutdown
-        // (crash, kill, power loss) the restart is not detected because
-        // onWindowRemoved never fired, so stale IDs from the previous session
-        // linger. Firefox reuses tab IDs across sessions, so a newly created
-        // tab can match a stale ID and trigger an unwanted workspace switch.
+        // Repair tab->workspace assignments. After a non-clean shutdown (crash,
+        // kill, power loss) the restart is not detected because onWindowRemoved
+        // never fired, so we are on this path even though the browser actually
+        // restarted. Firefox reuses tab IDs from low numbers across sessions, so
+        // stored arrays now point to DIFFERENT restored tabs. _repairTabAssignments
+        // re-files every open tab by its session value (and, when a restart is
+        // confirmed, by URL snapshot). No-op on a genuine already-running reload.
         const pid = await WSPStorageManager.getPrimaryWindowId();
         if (pid) {
-          await Brainer._cleanStaleTabIds(pid);
-          await Brainer._reconcileLateTabs(pid);
+          await Brainer._repairTabAssignments(pid, Brainer._browserStarted);
         }
         // Ensure state is 'ready' even if onInstalled fired before its listener
         // was registered (during the ensureSchemaVersion() await above).
@@ -103,7 +138,10 @@ class Brainer {
     }
   }
 
-  // Shared initialization: ensure primary window and default workspace exist
+  // Shared initialization: ensure primary window and default workspace exist.
+  // Callable from initialize() (legit, runs while _state === 'initializing')
+  // and from event handlers (onInstalled, onStartup); the event-handler entry
+  // points guard themselves on _initStarted / _state before calling.
   static async _ensureDefaultWorkspace() {
     console.log("[Brainer][_ensureDefaultWorkspace] state:", Brainer._state);
     if (Brainer._state === 'restoring') {
@@ -153,8 +191,11 @@ class Brainer {
     browser.runtime.onInstalled.addListener(async () => {
       try {
         console.log("[Brainer][onInstalled] fired — state:", Brainer._state);
-        if (Brainer._state === 'restoring') {
-          console.log("[Brainer][onInstalled] skipped — state is 'restoring'");
+        // Skip while initialize() is still in flight (either the schema-check
+        // await or the restart-detect window). initialize() will run
+        // _ensureDefaultWorkspace itself once it reaches the right path.
+        if (Brainer._state === 'restoring' || Brainer._state === 'initializing' || Brainer._initStarted) {
+          console.log("[Brainer][onInstalled] skipped -- state:", Brainer._state, "initStarted:", Brainer._initStarted);
           return;
         }
         await Brainer._ensureDefaultWorkspace();
@@ -172,13 +213,45 @@ class Brainer {
 
     browser.runtime.onStartup.addListener(async () => {
       try {
-        console.log("[Brainer][onStartup] fired — state:", Brainer._state);
-        // initialize() already handles restart restore directly;
-        // this is kept as a fallback for edge cases only.
-        if (Brainer._state === 'ready' || Brainer._state === 'restoring' || Brainer._initStarted) {
-          console.log("[Brainer][onStartup] skipped — state:", Brainer._state, "initStarted:", Brainer._initStarted);
+        // Record the restart signal FIRST so initialize()'s already-running path
+        // can read it (it gates the URL-snapshot fallback). onStartup fires only
+        // on a real browser start, never on an extension reload.
+        Brainer._browserStarted = true;
+        console.log("[Brainer][onStartup] fired -- state:", Brainer._state);
+
+        // initialize() is still in flight (or restoring): it will see
+        // _browserStarted and handle the repair itself. Nothing to do here.
+        if (Brainer._initStarted || Brainer._state === 'initializing' || Brainer._state === 'restoring') {
+          console.log("[Brainer][onStartup] deferring to in-flight initialize()");
           return;
         }
+
+        // initialize() already settled into 'ready'. If it took the
+        // already-running path it may have trusted reused tab IDs before this
+        // restart signal was available. Run the repair once, now that onStartup
+        // confirms a genuine browser restart. Wrap in 'restoring' so live tab
+        // events no-op during the show/hide. The repair is idempotent and a
+        // no-op when assignments already match session values.
+        if (Brainer._state === 'ready') {
+          if (Brainer._postStartupRepairDone) {
+            console.log("[Brainer][onStartup] post-startup repair already done -- skipping");
+            return;
+          }
+          Brainer._postStartupRepairDone = true;
+          const pid = await WSPStorageManager.getPrimaryWindowId();
+          if (pid) {
+            console.log("[Brainer][onStartup] running post-init repair for windowId:", pid);
+            Brainer._state = 'restoring';
+            try {
+              await Brainer._repairTabAssignments(pid, true);
+            } finally {
+              Brainer._state = 'ready';
+            }
+          }
+          return;
+        }
+
+        // state is 'uninitialized': original fallback for the restore path.
         const windowsOnLoad = await browser.windows.getAll();
         console.log("[Brainer][onStartup] windows on load:", windowsOnLoad.length);
         if (windowsOnLoad.length === 1) {
@@ -235,8 +308,8 @@ class Brainer {
     // Fast-exit guards BEFORE the expensive stringified log (minor perf win
     // on non-primary window creation, more importantly avoids misleading
     // "looks like we processed it" log entries for skipped paths).
-    if (Brainer._state === 'restoring') {
-      console.log("[Brainer][_onWindowCreated] windowId:", window.id, "skipped — state is 'restoring'");
+    if (Brainer._state === 'restoring' || Brainer._state === 'initializing') {
+      console.log("[Brainer][_onWindowCreated] windowId:", window.id, "skipped -- state is", Brainer._state);
       return;
     }
     // If initialize() is running but hasn't reached the restart detection yet,
@@ -244,6 +317,14 @@ class Brainer {
     // can race to restore workspaces, potentially creating duplicate entries.
     if (Brainer._initStarted && Brainer._state !== 'ready') {
       console.log("[Brainer][_onWindowCreated] windowId:", window.id, "skipped — initialize() still running");
+      return;
+    }
+    // Refuse-to-wipe is active: don't retry the restore against a brand-new
+    // (likely empty) window. The user must dismiss the banner or restart
+    // Firefox. Without this guard, every new window would re-trigger the
+    // failed restore against a target with no real content.
+    if (Brainer._refuseToWipeActive) {
+      console.log("[Brainer][_onWindowCreated] windowId:", window.id, "skipped -- refuse-to-wipe active");
       return;
     }
     console.log("[Brainer][_onWindowCreated] windowId:", window.id, "state:", Brainer._state,
@@ -343,12 +424,11 @@ class Brainer {
     console.log("[Brainer][_restoreWorkspaces] windowId:", window.id);
     // All tab IDs are invalidated across restart; clear stale force-reopen entries
     TabService._forceReopenIds.clear();
-    await WSPStorageManager.setPrimaryWindowId(window.id);
-    Brainer._primaryWindowId = window.id;
+
+    // ── Phase 1: read everything we need into memory. NO writes yet. ──
     const newTabs = await browser.tabs.query({windowId: window.id});
     console.log("[Brainer][_restoreWorkspaces] tabs in window:", newTabs.length);
 
-    // Build tab mapping using sessions API
     const sessionMap = new Map();
     await Promise.all(newTabs.map(async (tab) => {
       try {
@@ -369,7 +449,6 @@ class Brainer {
     console.log(`[Workspaces] Restore: found ${oldWorkspaces.length} workspaces for window ${oldWindowId}`);
     console.log("[Brainer][_restoreWorkspaces] old workspace names:", oldWorkspaces.map(w => w.name));
 
-    // Capture workspace data before destroy
     let wspData = oldWorkspaces.map(wsp => ({
       id: wsp.id,
       name: wsp.name,
@@ -383,9 +462,8 @@ class Brainer {
       tabSnapshot: wsp.tabSnapshot ?? []
     }));
 
-    // If storage was wiped (e.g. extension reinstall cleared data) but session values
-    // still reference workspace IDs, reconstruct minimal stub workspaces so tabs
-    // don't all collapse into a single default workspace.
+    // If storage was wiped (extension reinstall) but session values still reference
+    // workspace IDs, reconstruct stubs so tabs don't collapse into a single default.
     if (wspData.length === 0 && sessionMap.size > 0) {
       console.warn("[Workspaces] Restore: no workspaces in storage but session values exist — reconstructing from session");
       const seenIds = new Set();
@@ -410,161 +488,193 @@ class Brainer {
       console.log("[Brainer][_restoreWorkspaces] reconstructed", wspData.length, "stub workspaces");
     }
 
-    // Destroy old window data FIRST — destroyWindow deletes ld-wsp-{wspId}
-    // entries for the old window's workspace IDs. Since IDs are reused, doing
-    // this after Workspace.create would wipe the freshly saved states.
-    console.log("[Brainer][_restoreWorkspaces] destroying old window data for windowId:", oldWindowId);
-    await WSPStorageManager.destroyWindow(oldWindowId);
-
-    // Now create new workspace objects (states won't be clobbered)
-    console.log("[Brainer][_restoreWorkspaces] recreating", wspData.length, "workspaces for new windowId:", window.id);
-    for (const wsp of wspData) {
-      await Workspace.create(wsp.id, {
-        ...wsp,
-        tabs: [],
-        windowId: window.id
-      });
-    }
-
-    // Migrate order to new window
-    if (oldOrder) {
-      console.log("[Brainer][_restoreWorkspaces] migrating workspace order:", oldOrder);
-      await WSPStorageManager.saveWorkspaceOrder(window.id, oldOrder);
-    }
-
-    // Assign tabs using session values — batch by workspace to reduce storage reads
-    const tabsByWsp = new Map();
+    // ── Phase 2: compute tab → workspace assignments in-memory. NO writes yet. ──
+    const wspIdSet = new Set(wspData.map(w => w.id));
+    const assigned = new Map();          // wspId -> tabId[]
     const untaggedTabs = [];
 
     for (const tab of newTabs) {
       if (tab.pinned) continue;
-
       const wspId = sessionMap.get(tab.id);
-      if (wspId && wspData.find(w => w.id === wspId)) {
-        if (!tabsByWsp.has(wspId)) tabsByWsp.set(wspId, []);
-        tabsByWsp.get(wspId).push(tab);
+      if (wspId && wspIdSet.has(wspId)) {
+        if (!assigned.has(wspId)) assigned.set(wspId, []);
+        assigned.get(wspId).push(tab.id);
       } else {
-        if (wspId) console.warn(`[Workspaces] Restore: session value ${wspId} not found in wspData (${wspData.length} workspaces)`);
+        if (wspId) console.warn(`[Workspaces] Restore: session value ${wspId} not in wspData (${wspData.length} workspaces)`);
         untaggedTabs.push(tab);
       }
     }
 
-    console.log("[Brainer][_restoreWorkspaces] session-tagged tabs by workspace:",
-      [...tabsByWsp.entries()].map(([id, tabs]) => `${id.slice(0,8)}: ${tabs.length} tabs`));
-    console.log("[Brainer][_restoreWorkspaces] untagged tabs:", untaggedTabs.length);
-
-    // One storage read per workspace instead of per tab
-    for (const [wspId, tabs] of tabsByWsp) {
-      const wspObj = await WSPStorageManager.getWorkspace(wspId);
-      for (const tab of tabs) {
-        if (!wspObj.tabs.includes(tab.id)) {
-          wspObj.tabs.push(tab.id);
-        }
-      }
-      await wspObj._saveState();
-    }
-
-    // URL-based fallback for untagged tabs (session values may be lost across restart)
+    // URL-based fallback for untagged tabs (session API can drop values across restart).
+    const unmatchedTabs = [];
     if (untaggedTabs.length > 0) {
       console.warn(`[Workspaces] Restore: ${untaggedTabs.length} untagged tab(s) — trying URL snapshot fallback`);
-
-      // Build mutable snapshot maps; consume entries to handle duplicate URLs correctly
       const snapshotByWsp = new Map();
       for (const wsp of wspData) {
-        if (wsp.tabSnapshot.length > 0) {
-          snapshotByWsp.set(wsp.id, [...wsp.tabSnapshot]);
-        }
+        if (wsp.tabSnapshot.length > 0) snapshotByWsp.set(wsp.id, [...wsp.tabSnapshot]);
       }
-
-      // Phase 1: URL matching (pure in-memory, no I/O) — group matched tabs by workspace
-      const urlMatchMap = new Map(); // wspId -> tab[]
-      const unmatchedTabs = [];
       for (const tab of untaggedTabs) {
         let matchedWspId = null;
         for (const [wspId, urls] of snapshotByWsp) {
           const idx = urls.indexOf(tab.url);
-          if (idx !== -1) {
-            matchedWspId = wspId;
-            urls.splice(idx, 1);
-            break;
-          }
+          if (idx !== -1) { matchedWspId = wspId; urls.splice(idx, 1); break; }
         }
         if (matchedWspId) {
-          if (!urlMatchMap.has(matchedWspId)) urlMatchMap.set(matchedWspId, []);
-          urlMatchMap.get(matchedWspId).push(tab);
+          if (!assigned.has(matchedWspId)) assigned.set(matchedWspId, []);
+          assigned.get(matchedWspId).push(tab.id);
         } else {
           unmatchedTabs.push(tab);
         }
       }
+    }
 
-      // Phase 2: One storage read-modify-write per matched workspace (was one per tab)
-      for (const [wspId, tabs] of urlMatchMap) {
-        console.log(`[Workspaces] Restore: URL-matched ${tabs.length} tab(s) to workspace`);
-        const wspObj = await WSPStorageManager.getWorkspace(wspId);
-        for (const tab of tabs) {
-          if (!wspObj.tabs.includes(tab.id)) wspObj.tabs.push(tab.id);
-        }
-        await wspObj._saveState();
+    const totalAssigned = [...assigned.values()].reduce((n, a) => n + a.length, 0);
+    const hadRecoverableData = wspData.some(w => w.tabSnapshot.length > 0);
+    console.log("[Brainer][_restoreWorkspaces] in-memory assignment:",
+      [...assigned.entries()].map(([id, tabs]) => `${id.slice(0,8)}:${tabs.length}`).join(" "),
+      `unmatched=${unmatchedTabs.length} totalAssigned=${totalAssigned} hadRecoverable=${hadRecoverableData}`);
+
+    // ── Phase 3: refuse-to-wipe guard. ──
+    // The failure mode that lost the user's data was: tabs.query ran before
+    // Firefox finished session-restoring tabs, so Phase 1 saw 0 (or a single
+    // about:newtab) and Phase 4 recreated every workspace empty. We refuse
+    // when (a) we have workspaces with snapshot URLs to potentially restore,
+    // (b) zero session-tagged tabs got assigned, AND (c) no real content tabs
+    // are live in the window. Placeholder tabs (about:newtab etc.) do NOT
+    // count as live content -- otherwise FMA2 (placeholder-only restart)
+    // bypasses the guard.
+    const liveContentTabs = newTabs.filter(t => !t.pinned && t.url && !Brainer._PLACEHOLDER_URL_RE.test(t.url));
+    if (wspData.length > 0 && totalAssigned === 0 && liveContentTabs.length === 0 && hadRecoverableData) {
+      const errorPayload = {
+        when: Date.now(),
+        reason: "refuse-to-wipe",
+        oldWindowId,
+        newWindowId: window.id,
+        wspCount: wspData.length,
+        snapshotUrlCount: wspData.reduce((n, w) => n + w.tabSnapshot.length, 0),
+        liveTabCount: newTabs.length,
+        liveContentTabCount: liveContentTabs.length,
+        unmatchedTabCount: unmatchedTabs.length,
+        sessionTaggedCount: sessionMap.size,
+      };
+      // Log first so the diagnostic survives even if storage is full.
+      console.error("[Brainer][_restoreWorkspaces] REFUSE-TO-WIPE -- aborting restore. payload:", JSON.stringify(errorPayload));
+      // Surface as banner. Storage failure here is not fatal; we still throw.
+      try { await WSPStorageManager.setLastRestoreError(errorPayload); }
+      catch (writeErr) { console.error("[Brainer][_restoreWorkspaces] failed to surface refuse-to-wipe banner:", writeErr); }
+      Brainer._refuseToWipeActive = true;
+      throw new Error(
+        `Refuse-to-wipe: would recreate ${wspData.length} workspaces with 0 tabs ` +
+        `while ${errorPayload.snapshotUrlCount} snapshot URLs exist; user data left untouched.`
+      );
+    }
+
+    // ── Phase 4: writes. From here on we mutate storage. Wrapped in a single
+    // try/catch so a partial commit surfaces as a banner instead of silently
+    // leaving primaryWindowId / primaryWindowLastId in a desynced state.
+    // primaryWindowId is set as the LAST write of Phase 4 (paired with
+    // removePrimaryWindowLastId) so a mid-Phase-4 throw leaves the
+    // pre-restart `existingPrimary == null && lastId != null` retry signal
+    // intact for the next start.
+    try {
+      console.log("[Brainer][_restoreWorkspaces] writing", wspData.length, "workspaces for new windowId:", window.id);
+      for (const wsp of wspData) {
+        await Workspace.create(wsp.id, {
+          ...wsp,
+          tabs: assigned.get(wsp.id) || [],
+          windowId: window.id
+        });
       }
 
-      // Phase 3: Truly unmatched tabs go to the active workspace
+      if (oldOrder) {
+        console.log("[Brainer][_restoreWorkspaces] migrating workspace order:", oldOrder);
+        await WSPStorageManager.saveWorkspaceOrder(window.id, oldOrder);
+      }
+
+      // Detach old window's metadata only. Per-workspace state was already
+      // rewritten above, so we keep the shared `ld-wsp-{wspId}` and
+      // `ld-wsp-closed-{wspId}` keys intact -- detachWindow only touches the
+      // window-keyed indexes.
+      if (oldWindowId != null && oldWindowId !== window.id) {
+        console.log("[Brainer][_restoreWorkspaces] detaching old window metadata:", oldWindowId);
+        await WSPStorageManager.detachWindow(oldWindowId);
+      }
+
+      // Truly unmatched tabs go to the active workspace via the normal entry point.
       for (const tab of unmatchedTabs) {
-        console.log(`[Workspaces] Restore: no URL match, adding to active workspace`, tab.url);
+        console.log("[Brainer][_restoreWorkspaces] no URL match, adding to active workspace:", tab.url);
         if (await TabService.addTabToWorkspace(tab, { skipForceContainer: true })) {
           await browser.tabs.show(tab.id);
         }
       }
-    }
 
-    // Re-tag all tabs with fresh session values (parallelized per workspace)
-    console.log("[Brainer][_restoreWorkspaces] re-tagging tabs with fresh session values");
-    for (const wsp of wspData) {
-      const wspObj = await WSPStorageManager.getWorkspace(wsp.id);
-      console.log("[Brainer][_restoreWorkspaces] workspace:", wsp.name, "tabs:", wspObj.tabs.length, "active:", wsp.active);
-      await Promise.all(
-        wspObj.tabs.map(tabId => TabService.setTabSessionValue(tabId, wsp.id))
-      );
-      if (wspObj.tabs.length > 0) {
-        // After restart, tab IDs change. Remap lastActiveTabId via URL matching.
-        if (!wspObj.lastActiveTabId || !wspObj.tabs.includes(wspObj.lastActiveTabId)) {
-          let remapped = null;
-          if (wsp.lastActiveTabUrl) {
-            const wspTabSet = new Set(wspObj.tabs);
-            const match = newTabs.find(t => wspTabSet.has(t.id) && t.url === wsp.lastActiveTabUrl);
-            if (match) {
-              remapped = match.id;
-              console.log("[Brainer][_restoreWorkspaces] remapped lastActiveTabId via URL for", wsp.name,
-                "url:", wsp.lastActiveTabUrl, "-> tabId:", remapped);
+      // Re-tag all tabs with fresh session values + remap lastActiveTabId via URL.
+      console.log("[Brainer][_restoreWorkspaces] re-tagging tabs with fresh session values");
+      for (const wsp of wspData) {
+        const wspObj = await WSPStorageManager.getWorkspace(wsp.id);
+        console.log("[Brainer][_restoreWorkspaces] workspace:", wsp.name, "tabs:", wspObj.tabs.length, "active:", wsp.active);
+        await Promise.all(
+          wspObj.tabs.map(tabId => TabService.setTabSessionValue(tabId, wsp.id))
+        );
+        if (wspObj.tabs.length > 0) {
+          if (!wspObj.lastActiveTabId || !wspObj.tabs.includes(wspObj.lastActiveTabId)) {
+            let remapped = null;
+            if (wsp.lastActiveTabUrl) {
+              const wspTabSet = new Set(wspObj.tabs);
+              const match = newTabs.find(t => wspTabSet.has(t.id) && t.url === wsp.lastActiveTabUrl);
+              if (match) {
+                remapped = match.id;
+                console.log("[Brainer][_restoreWorkspaces] remapped lastActiveTabId via URL for", wsp.name,
+                  "url:", wsp.lastActiveTabUrl, "-> tabId:", remapped);
+              }
             }
+            if (!remapped) {
+              console.log("[Brainer][_restoreWorkspaces] lastActiveTabId stale for", wsp.name,
+                "- falling back to first tab:", wspObj.tabs[0]);
+            }
+            wspObj.lastActiveTabId = remapped || wspObj.tabs[0];
+            await wspObj._saveState();
           }
-          if (!remapped) {
-            console.log("[Brainer][_restoreWorkspaces] lastActiveTabId stale for", wsp.name,
-              "- falling back to first tab:", wspObj.tabs[0]);
-          }
-          wspObj.lastActiveTabId = remapped || wspObj.tabs[0];
-          await wspObj._saveState();
         }
       }
+
+      const activeWspData = wspData.find(w => w.active);
+      console.log("[Brainer][_restoreWorkspaces] active workspace:", activeWspData?.id, activeWspData?.name);
+      if (activeWspData) {
+        const activeWspObj = await WSPStorageManager.getWorkspace(activeWspData.id);
+        await activeWspObj.activate();
+        WorkspaceService._updateActiveCache(window.id, activeWspObj.tabs, activeWspObj.id);
+      }
+
+      await WorkspaceService.hideInactiveWspTabs(window.id, activeWspData ? activeWspData.id : null);
+
+      // Final commit: claim primary, drop the retry signal, clear any banner.
+      // If anything above threw, we never get here; the next restart will see
+      // primaryWindowId still null and primaryWindowLastId still set, and the
+      // restart-detect path retries from scratch.
+      await WSPStorageManager.setPrimaryWindowId(window.id);
+      Brainer._primaryWindowId = window.id;
+      await WSPStorageManager.removePrimaryWindowLastId();
+      await WSPStorageManager.clearLastRestoreError();
+      Brainer._refuseToWipeActive = false;
+      console.log("[Brainer][_restoreWorkspaces] done");
+    } catch (e) {
+      // Phase 4 failed mid-way. Surface as a banner so the user knows what
+      // happened, and leave primaryWindowLastId set so the next restart can
+      // retry from a clean slate.
+      const errorPayload = {
+        when: Date.now(),
+        reason: "phase4-failure",
+        oldWindowId,
+        newWindowId: window.id,
+        error: String(e?.message ?? e),
+      };
+      console.error("[Brainer][_restoreWorkspaces] Phase 4 threw -- payload:", JSON.stringify(errorPayload), "error:", e);
+      try { await WSPStorageManager.setLastRestoreError(errorPayload); }
+      catch (writeErr) { console.error("[Brainer][_restoreWorkspaces] failed to surface phase4 banner:", writeErr); }
+      Brainer._refuseToWipeActive = true;
+      throw e;
     }
-
-    // Activate the correct workspace — this shows its tabs, focuses the
-    // last-active tab, and ensures Firefox's active tab belongs to the right
-    // workspace before we hide inactive ones.
-    const activeWspData = wspData.find(w => w.active);
-    console.log("[Brainer][_restoreWorkspaces] active workspace:", activeWspData?.id, activeWspData?.name);
-    if (activeWspData) {
-      const activeWspObj = await WSPStorageManager.getWorkspace(activeWspData.id);
-      await activeWspObj.activate();
-      // Populate active cache so onTabActivated fast-path works immediately after restore
-      WorkspaceService._updateActiveCache(window.id, activeWspObj.tabs);
-    }
-
-    // Re-hide tabs in inactive workspaces immediately after restore
-    await WorkspaceService.hideInactiveWspTabs(window.id, activeWspData ? activeWspData.id : null);
-
-    // Clean up: remove stale lastId so subsequent restarts don't re-read it
-    await WSPStorageManager.removePrimaryWindowLastId();
-    console.log("[Brainer][_restoreWorkspaces] done");
   }
 
   // Remove tab IDs from workspaces that no longer correspond to open tabs.
@@ -598,6 +708,187 @@ class Brainer {
     } else {
       console.log("[Brainer][_cleanStaleTabIds] no stale tab IDs found");
     }
+  }
+
+  // Source-of-truth repair for the "already-running" init path.
+  //
+  // onWindowRemoved is unreliable at shutdown: non-clean exits (crash, kill,
+  // power loss) never fire it, and even a clean quit may not flush the async
+  // handler before the process dies. When it doesn't fire, primaryWindowId is
+  // never cleared, so the next *browser restart* is misread as "already
+  // running" and we trust the stored per-workspace tab-ID arrays. But a restart
+  // reassigns tab IDs starting from low numbers, so those stored IDs now point
+  // to DIFFERENT restored tabs -- every workspace keeps its size while its
+  // contents are scrambled (the "all tabs in the wrong workspace" bug). The
+  // per-tab session value ("wspId") is the one mapping Firefox preserves
+  // correctly across restart, so we re-file every open tab by it.
+  //
+  // On a genuine already-running reload (browser never restarted) the session
+  // values already agree with the stored arrays, so this detects no change and
+  // returns false without writing -- zero disruption to the common case.
+  // Returns true iff it rewrote any workspace's tab list.
+  // `restartLikely` enables the URL-snapshot fallback for tabs whose session
+  // value Firefox dropped across the restart. It is also implied whenever a
+  // session-tagged tab is found filed under the wrong workspace (positive proof
+  // of an undetected restart). The fallback is gated this way so a normal reload
+  // -- where a legacy untagged tab's URL might coincidentally appear in another
+  // workspace's snapshot -- never moves a correctly-placed tab.
+  static async _reconcileFromSessionValues(windowId, restartLikely = false) {
+    const tabs = await browser.tabs.query({ windowId, pinned: false });
+    const workspaces = await WSPStorageManager.getWorkspaces(windowId);
+    if (workspaces.length === 0) return false;
+    const wspIds = new Set(workspaces.map(w => w.id));
+
+    // Where each open tab is currently filed per the stored arrays (first
+    // occurrence wins; an ID in two arrays is itself corruption we collapse).
+    const filedUnder = new Map();
+    for (const w of workspaces) {
+      for (const id of w.tabs) {
+        if (!filedUnder.has(id)) filedUnder.set(id, w.id);
+      }
+    }
+
+    // Read the session value (authoritative across restart) for every open tab.
+    const sessionOf = new Map();
+    await Promise.all(tabs.map(async (t) => {
+      try {
+        const sv = await browser.sessions.getTabValue(t.id, "wspId");
+        if (sv && wspIds.has(sv)) sessionOf.set(t.id, sv);
+      } catch (e) {
+        console.debug("[Brainer][_reconcileFromSessionValues] session lookup failed for tab", t.id, ":", e.message);
+      }
+    }));
+
+    // Positive proof of an undetected restart: a session-tagged tab whose ID is
+    // filed under a different workspace than its session value names.
+    let corruptionDetected = false;
+    for (const [id, sv] of sessionOf) {
+      if (filedUnder.get(id) !== sv) { corruptionDetected = true; break; }
+    }
+    const useUrlFallback = restartLikely || corruptionDetected;
+
+    // Desired workspace per open tab.
+    //  - session-tagged  -> its session value (authoritative)
+    //  - untagged + restart -> first matching workspace URL snapshot, else its
+    //    current home
+    //  - untagged + normal  -> its current home (never moved)
+    // Tabs with neither a session value nor a stored home are left for
+    // _reconcileLateTabs to assign to the active workspace.
+    const desiredOf = new Map();
+    const needsTag = []; // [tabId, wspId] for tabs we assign that had no session value
+    for (const [id, sv] of sessionOf) desiredOf.set(id, sv);
+
+    const snapshotByWsp = new Map();
+    if (useUrlFallback) {
+      for (const w of workspaces) {
+        if (w.tabSnapshot && w.tabSnapshot.length > 0) snapshotByWsp.set(w.id, [...w.tabSnapshot]);
+      }
+    }
+    for (const t of tabs) {
+      if (sessionOf.has(t.id)) continue;
+      let target = null;
+      if (useUrlFallback && t.url) {
+        for (const [wspId, urls] of snapshotByWsp) {
+          const idx = urls.indexOf(t.url);
+          if (idx !== -1) { target = wspId; urls.splice(idx, 1); break; }
+        }
+      }
+      if (!target && filedUnder.has(t.id)) target = filedUnder.get(t.id);
+      if (target) {
+        desiredOf.set(t.id, target);
+        needsTag.push([t.id, target]);
+      }
+    }
+
+    // Change detection: any tab whose desired home differs from its current one,
+    // or any tab filed under more than one workspace.
+    let changed = false;
+    for (const [tabId, want] of desiredOf) {
+      if (filedUnder.get(tabId) !== want) { changed = true; break; }
+    }
+    if (!changed) {
+      const seen = new Set();
+      for (const w of workspaces) {
+        for (const id of w.tabs) {
+          if (!desiredOf.has(id)) continue;
+          if (seen.has(id)) { changed = true; break; }
+          seen.add(id);
+        }
+        if (changed) break;
+      }
+    }
+    if (!changed) {
+      console.log("[Brainer][_reconcileFromSessionValues] arrays agree with session values -- no change");
+      return false;
+    }
+
+    // Rebuild each workspace's tab list from desiredOf, preserving order: first
+    // keep tabs in their existing per-workspace order, then append any tab that
+    // moved in, ordered by its position in the live tab list.
+    const nextByWsp = new Map(workspaces.map(w => [w.id, []]));
+    const placed = new Set();
+    for (const w of workspaces) {
+      for (const id of w.tabs) {
+        const want = desiredOf.get(id);
+        if (want === undefined || placed.has(id)) continue;
+        nextByWsp.get(want).push(id);
+        placed.add(id);
+      }
+    }
+    for (const t of tabs) {
+      const want = desiredOf.get(t.id);
+      if (want === undefined || placed.has(t.id)) continue;
+      nextByWsp.get(want).push(t.id);
+      placed.add(t.id);
+    }
+
+    const summary = [];
+    for (const w of workspaces) {
+      const next = nextByWsp.get(w.id) || [];
+      const same = next.length === w.tabs.length && next.every((id, i) => id === w.tabs[i]);
+      if (same) { summary.push(`${w.name}:${next.length}`); continue; }
+      const movedIn = next.filter(id => filedUnder.get(id) !== w.id).length;
+      const fresh = await WSPStorageManager.getWorkspace(w.id);
+      fresh.tabs = next;
+      // Group membership is rebuilt on activate; just drop IDs that left.
+      const nextSet = new Set(next);
+      for (const g of fresh.groups) g.tabs = g.tabs.filter(id => nextSet.has(id));
+      await fresh._saveState();
+      summary.push(`${w.name}:${next.length}(+${movedIn})`);
+    }
+
+    // Re-tag tabs that had no (valid) session value so the NEXT restart is clean
+    // even if it is also undetected. Only the assigned ones; truly untracked
+    // tabs are left for _reconcileLateTabs.
+    if (needsTag.length > 0) {
+      await Promise.all(needsTag.map(([id, w]) => TabService.setTabSessionValue(id, w)));
+      console.log("[Brainer][_reconcileFromSessionValues] re-tagged", needsTag.length, "untagged tabs with session values");
+    }
+
+    console.warn("[Brainer][_reconcileFromSessionValues] repaired tab assignments after undetected restart (urlFallback=" + useUrlFallback + ") --",
+      summary.join(" "));
+    return true;
+  }
+
+  // Full repair sequence for the already-running init path (and the
+  // onStartup-fired-after-ready safety net): drop stale IDs, re-file open tabs
+  // by session value (and URL snapshot when a restart is likely), assign any
+  // leftovers, then re-apply visibility if anything moved. Idempotent: a no-op
+  // when assignments already match session values.
+  static async _repairTabAssignments(windowId, restartLikely = false) {
+    await Brainer._cleanStaleTabIds(windowId);
+    const corrected = await Brainer._reconcileFromSessionValues(windowId, restartLikely);
+    await Brainer._reconcileLateTabs(windowId);
+    if (corrected) {
+      const active = await WorkspaceService.getActiveWsp(windowId);
+      if (active) {
+        const activeObj = await WSPStorageManager.getWorkspace(active.id);
+        await activeObj.activate();
+        WorkspaceService._updateActiveCache(windowId, activeObj.tabs, activeObj.id);
+      }
+      await WorkspaceService.hideInactiveWspTabs(windowId, active ? active.id : null);
+    }
+    return corrected;
   }
 
   // Catch tabs that Firefox session-restored during the 'restoring' phase.
@@ -642,6 +933,9 @@ class Brainer {
         await TabService.setTabSessionValue(tab.id, wspId);
       }
       await wsp._saveState();
+      // Keep tabSnapshot fresh for restart resilience (IC3) -- this site
+      // mutates tabs[] without going through TabService.addTabToWorkspace.
+      TabService._scheduleSnapshotRefresh(windowId, wspId);
       if (!wsp.active) {
         toHide.push(...tabs.map(t => t.id));
       } else {
@@ -659,6 +953,8 @@ class Brainer {
         WorkspaceService._activeCache?.tabIds.add(tab.id);
       }
       await fresh._saveState();
+      // Keep tabSnapshot fresh for restart resilience (IC3).
+      TabService._scheduleSnapshotRefresh(windowId, activeWsp.id);
       console.log("[Brainer][_reconcileLateTabs] assigned", noSession.length, "untagged tabs to active workspace");
     }
 
@@ -775,8 +1071,16 @@ class Brainer {
 
     // Cache tab info (url/title) for closed-tab tracking — must run unconditionally
     // (no state/window guards) so the cache is always warm when onRemoved fires.
+    // Also schedule a debounced tabSnapshot refresh when a URL changes inside the
+    // active workspace, so restart resilience doesn't depend on the user
+    // activate/deactivate-cycling each workspace.
     browser.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
       TabService.cacheTabInfo(tab);
+      if (Brainer._state !== 'ready' || changeInfo.url == null) return;
+      const cache = WorkspaceService._activeCache;
+      if (!cache || cache.windowId !== tab.windowId || !cache.tabIds.has(tabId)) return;
+      const activeWspId = cache.activeWspId;
+      if (activeWspId) TabService._scheduleSnapshotRefresh(tab.windowId, activeWspId);
     }, {properties: ["url", "title"]});
 
     // Two separate onUpdated listeners exist because they use different filter

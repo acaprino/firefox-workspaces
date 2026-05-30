@@ -10,7 +10,7 @@ class WorkspaceService {
   // In-memory cache of the active workspace's tab IDs for fast onTabActivated lookups.
   // Avoids a storage read on every tab click in the common case (tab already in active workspace).
   // Invalidated by activateWsp (replaced) and tab add/remove ops (updated or cleared).
-  static _activeCache = null; // { windowId: number, tabIds: Set<number> } | null
+  static _activeCache = null; // { windowId: number, activeWspId: string|null, tabIds: Set<number> } | null
 
   static isActivating() {
     return this._activationInProgress;
@@ -66,9 +66,10 @@ class WorkspaceService {
     await WorkspaceService._flushLastActiveTabImpl();
   }
 
-  static _updateActiveCache(windowId, tabIds) {
-    WorkspaceService._activeCache = { windowId, tabIds: new Set(tabIds) };
-    console.log("[WorkspaceService][_updateActiveCache] windowId:", windowId, "tabIds:", tabIds.length);
+  static _updateActiveCache(windowId, tabIds, activeWspId = null) {
+    WorkspaceService._activeCache = { windowId, activeWspId, tabIds: new Set(tabIds) };
+    console.log("[WorkspaceService][_updateActiveCache] windowId:", windowId,
+      "activeWspId:", activeWspId, "tabIds:", tabIds.length);
   }
 
   static _buildDefaultWspData(windowId, tabs = []) {
@@ -400,7 +401,7 @@ class WorkspaceService {
       console.log("[WorkspaceService][activateWsp] activating:", wsp.id, wsp.name,
         "tabs:", wsp.tabs.length);
       await wsp.activate(activeTabId);
-      WorkspaceService._updateActiveCache(windowId, wsp.tabs);
+      WorkspaceService._updateActiveCache(windowId, wsp.tabs, wsp.id);
       await WorkspaceService._hideInactiveFromList(workspaces, windowId, wspId);
       await MenuService.refreshTabMenu();
       await UIService.updateToolbarButton(windowId);
@@ -522,6 +523,8 @@ class WorkspaceService {
           await TabService.setTabSessionValue(tab.id, wspId);
         }
         await freshWsp._saveState();
+        // Keep tabSnapshot fresh for restart resilience (IC3).
+        TabService._scheduleSnapshotRefresh(windowId, wspId);
       }
 
       // Assign remaining orphaned tabs to the active workspace
@@ -536,6 +539,8 @@ class WorkspaceService {
           await TabService.setTabSessionValue(tab.id, activeWspId);
         }
         await freshActive._saveState();
+        // Keep tabSnapshot fresh for restart resilience (IC3).
+        TabService._scheduleSnapshotRefresh(windowId, activeWspId);
       }
 
       if (toHide.length > 0) {
@@ -656,10 +661,13 @@ class WorkspaceService {
     // Tag new tabs with session values
     const newTabIds = [...oldToNew.values()];
     await Promise.all(newTabIds.map(id => TabService.setTabSessionValue(id, wspId)));
+    // Keep tabSnapshot fresh for restart resilience (IC3) -- tabs[] was
+    // rebuilt with brand-new IDs.
+    TabService._scheduleSnapshotRefresh(wsp.windowId, wspId);
 
     // If workspace is active: update cache
     if (wsp.active) {
-      WorkspaceService._updateActiveCache(wsp.windowId, rebuiltTabs);
+      WorkspaceService._updateActiveCache(wsp.windowId, rebuiltTabs, wsp.id);
       console.log("[WorkspaceService][_migrateTabsToContainer] updated active cache");
     } else {
       // Inactive workspace: new tabs are created visible by default — hide them

@@ -73,6 +73,60 @@ class TabService {
     }
   }
 
+  // ── tabSnapshot refresh (resilience) ──
+  //
+  // tabSnapshot is the URL list per workspace consulted by _restoreWorkspaces
+  // when the sessions API drops `wspId` tags across restart. Without a fresh
+  // snapshot, restore can only fall back to "all tabs go to active workspace"
+  // and inactive workspaces end up empty.
+  //
+  // Originally tabSnapshot was only written on activate/deactivate. For a
+  // workspace the user hasn't touched in days, that means the snapshot is
+  // stale. This scheduler refreshes the snapshot on every tab change inside
+  // a workspace, debounced per (windowId, wspId) so a flurry of changes
+  // collapses into one storage write.
+
+  static _snapshotTimers = new Map(); // key: `${windowId}:${wspId}` -> timeout
+  static _SNAPSHOT_DEBOUNCE_MS = 5000;
+
+  static _scheduleSnapshotRefresh(windowId, wspId) {
+    if (typeof windowId !== "number" || typeof wspId !== "string") return;
+    const key = `${windowId}:${wspId}`;
+    const existing = TabService._snapshotTimers.get(key);
+    if (existing) clearTimeout(existing);
+    const timer = setTimeout(async () => {
+      TabService._snapshotTimers.delete(key);
+      try {
+        // Acquire the per-workspace lock so a concurrent
+        // addTabToWorkspace/removeTabFromWorkspace doesn't get its tabs[]
+        // change clobbered by our full-record _saveState here.
+        await WSPStorageManager.withWorkspaceLock(wspId, async () => {
+          const wsp = await WSPStorageManager.getWorkspace(wspId);
+          // Workspace may have been destroyed or rebound to a new window
+          // between schedule and fire. Either way, abort silently.
+          if (!wsp || !wsp.id || wsp.windowId !== windowId) return;
+          const tabs = await browser.tabs.query({ windowId, pinned: false });
+          const tabMap = new Map(tabs.map(t => [t.id, t]));
+          const fresh = wsp.tabs
+            .map(id => tabMap.get(id))
+            .filter(t => t && t.url)
+            .map(t => t.url);
+          // Avoid a redundant write if nothing changed
+          const same = fresh.length === wsp.tabSnapshot.length
+            && fresh.every((u, i) => u === wsp.tabSnapshot[i]);
+          if (same) return;
+          wsp.tabSnapshot = fresh;
+          await wsp._saveState();
+          console.log("[TabService][_scheduleSnapshotRefresh] refreshed wspId:", wspId,
+            "windowId:", windowId, "URLs:", fresh.length);
+        });
+      } catch (e) {
+        console.debug("[TabService][_scheduleSnapshotRefresh] failed:", e.message);
+      }
+    }, TabService._SNAPSHOT_DEBOUNCE_MS);
+    TabService._snapshotTimers.set(key, timer);
+  }
+
   // ── Sessions API helpers (Tier 1) ──
 
   static async setTabSessionValue(tabId, wspId) {
@@ -158,21 +212,38 @@ class TabService {
         // Skip for privileged about: URLs that can't be opened in containers.
         let clearContainerId = false;
         if (!skipForceContainer && activeWsp.containerId
-            && tab.cookieStoreId !== activeWsp.containerId
-            && TabService._canReopenInContainer(tab.url)) {
-          console.log("[TabService][addTabToWorkspace] container mismatch — tab:", tab.cookieStoreId,
-            "workspace wants:", activeWsp.containerId, "— reopening in container");
-          const reopened = await TabService._reopenInContainer(tab, activeWsp.containerId, { suppressOnCreated: false });
-          if (reopened) {
-            console.log("[TabService][addTabToWorkspace] reopened — deferring to onCreated for new tab:", reopened.id);
+            && tab.cookieStoreId !== activeWsp.containerId) {
+          // Re-fetch tab to get its latest URL. Between onCreated and now there
+          // have been multiple awaits; for flows like a bookmark click on
+          // about:config Firefox can fire onCreated with a transient about:blank
+          // and only set the privileged URL on the next tick. Using the stale
+          // captured tab.url here would reopen the tab in the container and
+          // drop the about:config destination, redirecting the user to the
+          // new-tab page.
+          let currentTab;
+          try { currentTab = await browser.tabs.get(tab.id); }
+          catch (e) {
+            console.debug("[TabService][addTabToWorkspace] tab gone before reopen check:", e.message);
             return false;
           }
-          // Reopen failed (stale/deleted container). Clear containerId as part of
-          // the freshWsp save below (single save) to avoid a concurrent
-          // removeTabFromWorkspace overwriting a separate clear save.
-          console.warn("[Workspaces] addTabToWorkspace: container %s unavailable for workspace %s, clearing",
-            activeWsp.containerId, activeWsp.name);
-          clearContainerId = true;
+          if (TabService._canReopenInContainer(currentTab.url)) {
+            console.log("[TabService][addTabToWorkspace] container mismatch — tab:", currentTab.cookieStoreId,
+              "workspace wants:", activeWsp.containerId, "— reopening in container");
+            const reopened = await TabService._reopenInContainer(currentTab, activeWsp.containerId, { suppressOnCreated: false });
+            if (reopened) {
+              console.log("[TabService][addTabToWorkspace] reopened — deferring to onCreated for new tab:", reopened.id);
+              return false;
+            }
+            // Reopen failed (stale/deleted container). Clear containerId as part of
+            // the freshWsp save below (single save) to avoid a concurrent
+            // removeTabFromWorkspace overwriting a separate clear save.
+            console.warn("[Workspaces] addTabToWorkspace: container %s unavailable for workspace %s, clearing",
+              activeWsp.containerId, activeWsp.name);
+            clearContainerId = true;
+          } else {
+            console.log("[TabService][addTabToWorkspace] container mismatch but URL not reopenable — keeping tab as-is:",
+              currentTab.url);
+          }
         }
         // Lock the workspace to prevent concurrent add/remove from overwriting each other
         await WSPStorageManager.withWorkspaceLock(activeWsp.id, async () => {
@@ -193,6 +264,7 @@ class TabService {
           }
         });
         await TabService.setTabSessionValue(tab.id, activeWsp.id);
+        TabService._scheduleSnapshotRefresh(tab.windowId, activeWsp.id);
         await MenuService.refreshTabMenu();
         await UIService.updateToolbarButton(tab.windowId);
         return true;
@@ -211,11 +283,23 @@ class TabService {
         // addTabToWorkspace with a fresh tab ID and will hit the active-wsp
         // path on the second pass — there is no double-assign risk here).
         if (targetWsp.containerId
-            && tab.cookieStoreId !== targetWsp.containerId
-            && TabService._canReopenInContainer(tab.url)) {
-          console.log("[TabService][addTabToWorkspace] container mismatch in fallback path — reopening");
-          await TabService._reopenInContainer(tab, targetWsp.containerId, { suppressOnCreated: false });
-          return false;
+            && tab.cookieStoreId !== targetWsp.containerId) {
+          // Re-fetch tab so a transient about:blank / empty URL captured at
+          // onCreated time doesn't trick us into reopening a tab that's
+          // actually mid-navigation to a privileged about: URL.
+          let currentTab;
+          try { currentTab = await browser.tabs.get(tab.id); }
+          catch (e) {
+            console.debug("[TabService][addTabToWorkspace] tab gone before fallback reopen check:", e.message);
+            return false;
+          }
+          if (TabService._canReopenInContainer(currentTab.url)) {
+            console.log("[TabService][addTabToWorkspace] container mismatch in fallback path — reopening");
+            await TabService._reopenInContainer(currentTab, targetWsp.containerId, { suppressOnCreated: false });
+            return false;
+          }
+          console.log("[TabService][addTabToWorkspace] fallback path: URL not reopenable, keeping as-is:",
+            currentTab.url);
         }
         // IMPORTANT: push the new tab into targetWsp's tab list BEFORE calling
         // activateWsp. Otherwise activateWsp's _updateActiveCache runs with a
@@ -265,6 +349,7 @@ class TabService {
           WorkspaceService._activeCache?.tabIds.delete(tabId);
           console.log("[TabService][removeTabFromWorkspace] removed — workspace now has", freshWsp.tabs.length, "tabs");
         });
+        TabService._scheduleSnapshotRefresh(windowId, wsp.id);
         await MenuService.refreshTabMenu();
         return;
       }
@@ -331,6 +416,8 @@ class TabService {
 
     // Update session value to new workspace
     await TabService.setTabSessionValue(effectiveTabId, toWspId);
+    TabService._scheduleSnapshotRefresh(freshToWsp.windowId, toWspId);
+    if (wasInSource) TabService._scheduleSnapshotRefresh(fromWsp.windowId, fromWspId);
 
     if (wasInSource) {
       const sourceDestroyed = fromWsp.tabs.length === 0;
@@ -442,12 +529,30 @@ class TabService {
   }
 
   // Check if a URL can be meaningfully reopened in a different container.
-  // Delegates to _isUrlAllowed for protocol checks. Additionally allows
-  // null/about:blank/about:newtab since those are just empty/new tabs that
-  // can adopt any container. (_isUrlAllowed rejects those because they are
-  // not valid for session-restore purposes.)
+  //
+  // Allow only:
+  //  - about:newtab: Firefox's default new-tab URL. Reopening is fine because
+  //    about:newtab is a generic blank state -- losing the URL during the
+  //    close-reopen cycle just lands the user on... the same new-tab page in
+  //    the container. This is required to make Ctrl+T behave as "open new
+  //    tab in this workspace's container".
+  //  - URLs _isUrlAllowed accepts (http/https/own moz-extension): preservable
+  //    verbatim across the reopen via tabs.create({url}).
+  //
+  // Internal Firefox pages (about:config, about:preferences, about:addons,
+  // about:debugging, about:profiles, about:home, about:performance, ...,
+  // plus chrome://, resource://, view-source:, javascript:, etc.) cannot be
+  // set via tabs.create({url}) -- they require chrome privileges -- so
+  // reopening would silently drop the destination URL and land the user on
+  // the new-tab page. They MUST stay in their original (default) container.
+  //
+  // Null/undefined/empty/about:blank are NOT in the allowlist either: those
+  // are transient states for tabs whose final URL is not yet known (e.g.,
+  // a bookmark click on about:config that briefly shows about:blank in
+  // onCreated before navigating). Reopening such tabs would race the
+  // navigation and drop the destination URL.
   static _canReopenInContainer(url) {
-    if (!url || url === "about:blank" || url === "about:newtab") return true;
+    if (url === "about:newtab") return true;
     return TabService._isUrlAllowed(url);
   }
 
