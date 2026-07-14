@@ -10,7 +10,7 @@ class WorkspaceService {
   // In-memory cache of the active workspace's tab IDs for fast onTabActivated lookups.
   // Avoids a storage read on every tab click in the common case (tab already in active workspace).
   // Invalidated by activateWsp (replaced) and tab add/remove ops (updated or cleared).
-  static _activeCache = null; // { windowId: number, activeWspId: string|null, tabIds: Set<number> } | null
+  static _activeCache = null; // { windowId: number, activeWspId: string|null, tabIds: Set<number>, containerId: string|null } | null
 
   static isActivating() {
     return this._activationInProgress;
@@ -66,10 +66,10 @@ class WorkspaceService {
     await WorkspaceService._flushLastActiveTabImpl();
   }
 
-  static _updateActiveCache(windowId, tabIds, activeWspId = null) {
-    WorkspaceService._activeCache = { windowId, activeWspId, tabIds: new Set(tabIds) };
+  static _updateActiveCache(windowId, tabIds, activeWspId = null, containerId = null) {
+    WorkspaceService._activeCache = { windowId, activeWspId, tabIds: new Set(tabIds), containerId: containerId ?? null };
     console.log("[WorkspaceService][_updateActiveCache] windowId:", windowId,
-      "activeWspId:", activeWspId, "tabIds:", tabIds.length);
+      "activeWspId:", activeWspId, "containerId:", containerId ?? null, "tabIds:", tabIds.length);
   }
 
   static _buildDefaultWspData(windowId, tabs = []) {
@@ -401,7 +401,7 @@ class WorkspaceService {
       console.log("[WorkspaceService][activateWsp] activating:", wsp.id, wsp.name,
         "tabs:", wsp.tabs.length);
       await wsp.activate(activeTabId);
-      WorkspaceService._updateActiveCache(windowId, wsp.tabs, wsp.id);
+      WorkspaceService._updateActiveCache(windowId, wsp.tabs, wsp.id, wsp.containerId);
       await WorkspaceService._hideInactiveFromList(workspaces, windowId, wspId);
       await MenuService.refreshTabMenu();
       await UIService.updateToolbarButton(windowId);
@@ -581,6 +581,14 @@ class WorkspaceService {
     if (containerId && containerId !== oldContainerId) {
       await WorkspaceService._migrateTabsToContainer(wspId, containerId);
     }
+
+    // Keep the active-workspace cache's containerId in sync so navigation-time
+    // enforcement (TabService.forceTabIntoActiveContainer) uses the current
+    // binding. Covers clearing the container too -- _migrateTabsToContainer is
+    // not called in that case, so it would otherwise leave a stale containerId.
+    if (WorkspaceService._activeCache?.activeWspId === wspId) {
+      WorkspaceService._activeCache.containerId = containerId || null;
+    }
   }
 
   // Reopen all tabs of a workspace in a new container, preserving order.
@@ -667,7 +675,7 @@ class WorkspaceService {
 
     // If workspace is active: update cache
     if (wsp.active) {
-      WorkspaceService._updateActiveCache(wsp.windowId, rebuiltTabs, wsp.id);
+      WorkspaceService._updateActiveCache(wsp.windowId, rebuiltTabs, wsp.id, containerId);
       console.log("[WorkspaceService][_migrateTabsToContainer] updated active cache");
     } else {
       // Inactive workspace: new tabs are created visible by default — hide them

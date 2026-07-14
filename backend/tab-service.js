@@ -20,6 +20,14 @@ class TabService {
   // is in _forceReopenIds), it is still blocked from auto-assigning the tab.
   static _reopeningCount = 0;
 
+  // Navigation-time force-container loop guard. forceTabIntoActiveContainer
+  // records each URL it reopens here; if the same URL would be reopened again
+  // within _FORCE_NAV_GUARD_MS, a conflicting rule (e.g. Multi-Account
+  // Containers "always open this site in X") is fighting us, so we bail instead
+  // of ping-ponging the tab between containers.
+  static _forceNavGuard = new Map(); // url -> last forced timestamp (ms)
+  static _FORCE_NAV_GUARD_MS = 4000;
+
   // Close a tab and reopen it in the specified container.
   // Returns the new tab, or null if the reopen failed (original tab kept).
   //
@@ -326,6 +334,88 @@ class TabService {
       }
     }
     return false;
+  }
+
+  // Navigation-time container enforcement.
+  //
+  // The creation-time force in addTabToWorkspace only fires when the tab
+  // already has a reopenable URL at onCreated. Tabs born as about:blank
+  // (window.open, target="_blank", links from external apps) or tabs whose URL
+  // is navigated in place escape the workspace container, because nothing
+  // re-checks once the URL settles. This runs on tabs.onUpdated(url) and
+  // reopens such a tab in the active workspace's container.
+  //
+  // Cheap by design: returns immediately (sync, no storage) unless the active
+  // workspace is container-bound AND this tab is a member AND it is in the
+  // wrong container AND the settled URL is reopenable -- so only tabs that
+  // actually escaped ever reach the reopen path. Firefox-internal pages
+  // (about:settings, about:config, about:addons, ...) are not reopenable, so
+  // they are left untouched automatically.
+  static async forceTabIntoActiveContainer(tab, url) {
+    const cache = WorkspaceService._activeCache;
+    if (!cache || !cache.containerId || !cache.activeWspId) return;
+    if (cache.windowId !== tab.windowId) return;          // only the active window
+    if (!cache.tabIds.has(tab.id)) return;                // only active-workspace tabs
+    if (tab.cookieStoreId === cache.containerId) return;  // already correct (common case)
+    if (TabService._reopeningCount > 0 || TabService._forceReopenIds.has(tab.id)) return;
+    if (!TabService._canReopenInContainer(url)) return;   // internal/about: pages stay put
+    if (TabService._recentlyForced(url)) {
+      console.warn("[TabService][forceTabIntoActiveContainer] skipping repeated reopen for", url,
+        "-- possible container-assignment conflict (e.g. Multi-Account Containers)");
+      return;
+    }
+
+    const { containerId, activeWspId } = cache;
+    console.log("[TabService][forceTabIntoActiveContainer] tab", tab.id,
+      "in container", tab.cookieStoreId, "but active workspace wants", containerId,
+      "-- reopening; url:", url);
+
+    // Remove-before-reopen (same pattern as _migrateTabsToContainer / moveTabToWsp):
+    // pull the old tab out of workspace storage first so the close fired by
+    // _reopenInContainer does NOT save a closed-tab entry. suppressOnCreated=true
+    // (the default) so we assign the new tab here instead of via onCreated.
+    TabService._markForced(url);
+    await TabService.removeTabFromWorkspace(tab.windowId, tab.id);
+    TabService._reopeningCount++;
+    try {
+      const newTab = await TabService._reopenInContainer(tab, containerId);
+      if (!newTab) {
+        console.warn("[TabService][forceTabIntoActiveContainer] reopen failed -- tab kept as-is");
+        return;
+      }
+      await WSPStorageManager.withWorkspaceLock(activeWspId, async () => {
+        const fresh = await WSPStorageManager.getWorkspace(activeWspId);
+        if (fresh && fresh.id && !fresh.tabs.includes(newTab.id)) {
+          fresh.tabs.push(newTab.id);
+          await fresh._saveState();
+        }
+      });
+      WorkspaceService._activeCache?.tabIds.add(newTab.id);
+      await TabService.setTabSessionValue(newTab.id, activeWspId);
+      TabService._scheduleSnapshotRefresh(tab.windowId, activeWspId);
+      await MenuService.refreshTabMenu();
+      await UIService.updateToolbarButton(tab.windowId);
+      console.log("[TabService][forceTabIntoActiveContainer] reopened tab", tab.id,
+        "->", newTab.id, "in container", containerId);
+    } finally {
+      TabService._reopeningCount--;
+    }
+  }
+
+  // Loop-guard helpers for forceTabIntoActiveContainer (see _forceNavGuard).
+  static _recentlyForced(url) {
+    const t = TabService._forceNavGuard.get(url);
+    return t != null && (Date.now() - t) < TabService._FORCE_NAV_GUARD_MS;
+  }
+
+  static _markForced(url) {
+    const now = Date.now();
+    TabService._forceNavGuard.set(url, now);
+    if (TabService._forceNavGuard.size > 50) {
+      for (const [u, t] of TabService._forceNavGuard) {
+        if (now - t >= TabService._FORCE_NAV_GUARD_MS) TabService._forceNavGuard.delete(u);
+      }
+    }
   }
 
   // Search ALL workspaces for the tab, not just the active one

@@ -59,21 +59,54 @@ class Brainer {
       // Detect restart vs first-ever startup BEFORE _ensureDefaultWorkspace
       // to eliminate the race with onStartup event.
       let existingPrimary = await WSPStorageManager.getPrimaryWindowId();
-      const lastId = await WSPStorageManager.getPrimaryWindowLastId();
+      let lastId = await WSPStorageManager.getPrimaryWindowLastId();
       console.log("[Brainer][initialize] existingPrimary:", existingPrimary, "| lastId:", lastId);
 
-      // Validate stored primaryWindowId still exists. After a non-clean shutdown,
-      // storage may reference a window from a previous session that is now gone.
+      // Validate stored primaryWindowId still exists AND is the same physical
+      // window. After a non-clean shutdown (crash, kill, power loss)
+      // onWindowRemoved never fired, so primaryWindowLastId was never armed and
+      // the stored primaryWindowId belongs to the PREVIOUS session. Firefox
+      // reassigns window IDs from low numbers each session, so that stale ID
+      // may be gone entirely, or -- worse -- may now name a different physical
+      // window. Either case used to fall through to _ensureDefaultWorkspace /
+      // _repairTabAssignments against the wrong window, which destroyed
+      // recoverable workspace state. Convert both into the detected-restart
+      // signal so the guarded restore path below handles them.
       // NOTE: TOCTOU limitation -- the window could close between this check and
       // subsequent use. This is a sub-millisecond race; onWindowRemoved provides
       // eventual consistency if it occurs.
       if (existingPrimary != null) {
+        let staleReason = null;
         try {
           await browser.windows.get(existingPrimary);
         } catch {
-          console.log("[Brainer][initialize] stored primaryWindowId", existingPrimary, "is stale -- clearing");
+          staleReason = "no longer exists";
+        }
+        if (staleReason == null) {
+          try {
+            if (!(await Brainer._primaryWindowHoldsItsWorkspaces(existingPrimary))) {
+              staleReason = "names a different physical window (its workspace tabs live elsewhere)";
+            }
+          } catch (e) {
+            // Identity check is best-effort: on failure trust the stored ID
+            // (the pre-guard behavior) rather than triggering a restore.
+            console.warn("[Brainer][initialize] primary-window identity check failed -- trusting stored ID:", e?.message);
+          }
+        }
+        if (staleReason != null) {
+          console.warn("[Brainer][initialize] stored primaryWindowId", existingPrimary,
+            staleReason, "-- treating as undetected restart");
           await WSPStorageManager.removePrimaryWindowId();
           Brainer._primaryWindowId = null;
+          // Arm the restart-retry signal so the guarded restore path runs,
+          // instead of _ensureDefaultWorkspace absorbing every tab into a
+          // fresh default workspace and overwriting their session values.
+          // Only when there is actually workspace state to restore.
+          if (lastId == null &&
+              (await WSPStorageManager.getWorkspaces(existingPrimary)).length > 0) {
+            await WSPStorageManager.setPrimaryWindowLastId(existingPrimary);
+            lastId = existingPrimary;
+          }
           existingPrimary = null;
         }
       }
@@ -173,8 +206,32 @@ class Brainer {
           currentTabs.map(tab => tab.id)
         );
         await WorkspaceService.createWorkspace(wsp);
+        // Preserve session tags that reference a workspace still present in
+        // storage: they are the last-line recovery data after an undetected
+        // restart. The tabs are still absorbed into the default workspace so
+        // they stay tracked, but the original tag survives for the
+        // repair/restore machinery. Tags referencing wiped workspaces (or no
+        // tag at all) are (re)written to the new default as before.
+        const keepTag = new Set();
+        await Promise.all(currentTabs.map(async (tab) => {
+          try {
+            const sv = await browser.sessions.getTabValue(tab.id, "wspId");
+            if (sv && UUID_RE.test(sv)) {
+              const state = await WSPStorageManager.getWspState(sv);
+              if (state && Object.keys(state).length > 0) keepTag.add(tab.id);
+            }
+          } catch (e) {
+            console.debug("[Brainer][_ensureDefaultWorkspace] session lookup failed for tab",
+              tab.id, ":", e.message);
+          }
+        }));
         for (const tab of currentTabs) {
+          if (keepTag.has(tab.id)) continue;
           await TabService.setTabSessionValue(tab.id, wsp.id);
+        }
+        if (keepTag.size > 0) {
+          console.warn("[Brainer][_ensureDefaultWorkspace] preserved original session tags on",
+            keepTag.size, "tab(s) referencing stored workspaces");
         }
         console.log("[Brainer][_ensureDefaultWorkspace] default workspace created:", wsp.id);
       } else {
@@ -302,6 +359,30 @@ class Brainer {
         await MenuService.refreshTabMenu();
       } catch (e) { console.error("[Workspaces] onThemeUpdated error:", e); }
     });
+
+    // OS-level scheme flips (System/"Automatic" theme, adaptive colorways) do
+    // not reliably fire theme.onUpdated -- the theme object itself is unchanged.
+    // The background document's prefers-color-scheme tracks the effective
+    // browser scheme, so its change event is the recovery signal. Seed the
+    // dark-mode hint from it: _isThemeDark resolves from theme colors first,
+    // so the seed only takes effect when colors are inconclusive (System
+    // theme) -- exactly the case where the browser scheme IS the OS scheme.
+    // Under resistFingerprinting the query is pinned to light and never
+    // fires; the popup's setDarkModeHint path still recovers in that case.
+    const schemeQuery = self.matchMedia?.("(prefers-color-scheme: dark)");
+    if (schemeQuery?.addEventListener) {
+      schemeQuery.addEventListener("change", async (e) => {
+        try {
+          console.log("[Brainer][onSchemeChanged] prefers-color-scheme flipped -> dark:", e.matches);
+          UIService._svgCache.clear();
+          UIService.clearThemeCache();
+          UIService._darkModeHint = e.matches;
+          browser.storage.local.set({ "ld-wsp-dark-hint": e.matches }).catch(() => {});
+          const primaryWindowId = await WSPStorageManager.getPrimaryWindowId();
+          if (primaryWindowId) await UIService.updateToolbarButton(primaryWindowId);
+        } catch (err) { console.error("[Workspaces] onSchemeChanged error:", err); }
+      });
+    }
   }
 
   static async _onWindowCreated(window) {
@@ -364,6 +445,48 @@ class Brainer {
     } else {
       console.log("[Brainer][_onWindowCreated] additional window opened (primary already:", primaryId, ") — no action");
     }
+  }
+
+  // Identity check for the stored primaryWindowId (undetected-restart guard).
+  // After a crash the stored ID can match a LIVE window that is a different
+  // physical window than the one the workspaces belong to (Firefox reassigns
+  // window IDs from low numbers each session). Trusting it would run
+  // _cleanStaleTabIds against the wrong window, stripping every real tab ID
+  // from the stored workspaces before reconciliation can use them.
+  // Identity is tested via the per-tab session values Firefox preserves
+  // across restarts: the ID is rejected only when the presumed primary
+  // window holds ZERO tabs tagged for its stored workspaces while another
+  // window holds at least one. Indeterminate evidence (no tagged tabs
+  // anywhere, e.g. session restore disabled) trusts the stored ID -- the
+  // same behavior as before this guard existed.
+  static async _primaryWindowHoldsItsWorkspaces(windowId) {
+    const workspaces = await WSPStorageManager.getWorkspaces(windowId);
+    if (workspaces.length === 0) return true; // nothing to protect
+    const allWindows = await browser.windows.getAll();
+    if (allWindows.length <= 1) return true;  // no other window to confuse it with
+    const wspIds = new Set(workspaces.map(w => w.id));
+
+    const countTagged = async (winId) => {
+      const tabs = await browser.tabs.query({ windowId: winId, pinned: false });
+      const tags = await Promise.all(tabs.map(async (t) => {
+        try { return await browser.sessions.getTabValue(t.id, "wspId"); }
+        catch { return null; }
+      }));
+      return tags.filter(sv => sv && wspIds.has(sv)).length;
+    };
+
+    const ownCount = await countTagged(windowId);
+    if (ownCount > 0) return true; // fast path: identity confirmed
+    for (const win of allWindows) {
+      if (win.id === windowId) continue;
+      const count = await countTagged(win.id);
+      if (count > 0) {
+        console.warn("[Brainer][_primaryWindowHoldsItsWorkspaces] window", win.id,
+          "holds", count, "tab(s) tagged for workspaces stored under window", windowId);
+        return false;
+      }
+    }
+    return true;
   }
 
   // Pick the window that corresponds to the old primary window.
@@ -643,7 +766,7 @@ class Brainer {
       if (activeWspData) {
         const activeWspObj = await WSPStorageManager.getWorkspace(activeWspData.id);
         await activeWspObj.activate();
-        WorkspaceService._updateActiveCache(window.id, activeWspObj.tabs, activeWspObj.id);
+        WorkspaceService._updateActiveCache(window.id, activeWspObj.tabs, activeWspObj.id, activeWspObj.containerId);
       }
 
       await WorkspaceService.hideInactiveWspTabs(window.id, activeWspData ? activeWspData.id : null);
@@ -884,7 +1007,7 @@ class Brainer {
       if (active) {
         const activeObj = await WSPStorageManager.getWorkspace(active.id);
         await activeObj.activate();
-        WorkspaceService._updateActiveCache(windowId, activeObj.tabs, activeObj.id);
+        WorkspaceService._updateActiveCache(windowId, activeObj.tabs, activeObj.id, activeObj.containerId);
       }
       await WorkspaceService.hideInactiveWspTabs(windowId, active ? active.id : null);
     }
@@ -1082,6 +1205,21 @@ class Brainer {
       const activeWspId = cache.activeWspId;
       if (activeWspId) TabService._scheduleSnapshotRefresh(tab.windowId, activeWspId);
     }, {properties: ["url", "title"]});
+
+    // Navigation-time container enforcement. The creation-time force in
+    // addTabToWorkspace only fires when the tab already has a reopenable URL at
+    // onCreated; tabs born as about:blank (window.open, target="_blank", links
+    // from external apps) or tabs navigated in place would otherwise escape the
+    // active workspace's container. Re-check when the URL settles and reopen if
+    // it mismatches. forceTabIntoActiveContainer is a cheap no-op unless the tab
+    // actually escaped, so running it on every URL change is fine.
+    browser.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
+      try {
+        if (Brainer._state !== 'ready') return;
+        if (WorkspaceService.isActivating()) return;
+        await TabService.forceTabIntoActiveContainer(tab, changeInfo.url);
+      } catch (e) { console.error("[Workspaces] onUpdated(container-force) error:", e); }
+    }, {properties: ["url"]});
 
     // Two separate onUpdated listeners exist because they use different filter
     // properties ("pinned" vs "groupId"). Firefox requires separate registrations

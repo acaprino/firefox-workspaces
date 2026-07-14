@@ -220,19 +220,33 @@ async function _handleMessage(message) {
     case "exportWorkspaceToBookmarks": {
       _validateWspId(message.wspId);
       result = await BookmarkService.exportWorkspace(message.wspId);
-      console.log("[Handler] exportWorkspaceToBookmarks -> exported:", result?.exported);
+      console.log("[Handler] exportWorkspaceToBookmarks -> exported:", result?.exported, "of", result?.total);
       // Atomic export+destroy: if the popup requested destroy, handle it here
       // so the operation completes even if the popup closes mid-flow.
       if (message.destroyAfter && result) {
-        if (message.windowId != null) _validateWindowId(message.windowId);
-        try {
-          const destroyResult = await WorkspaceService.destroyWsp(message.wspId, message.windowId ?? null);
-          result.destroyed = true;
-          result.activatedWspId = destroyResult?.activatedWspId;
-        } catch (e) {
-          const msg = e?.message ?? String(e);
-          console.warn("[Handler] exportWorkspaceToBookmarks destroy failed:", msg);
+        if (result.exported < result.total) {
+          // Partial export: some tabs were skipped (non-bookmarkable URLs
+          // like about:, file:, reader view) or their bookmarks.create failed.
+          // Destroying now would close tabs that have no bookmark backup.
+          console.warn("[Handler] exportWorkspaceToBookmarks destroy refused: exported",
+            result.exported, "of", result.total);
           result.destroyed = false;
+          result.destroyRefusedMessage =
+            `Only ${result.exported} of ${result.total} tabs could be exported to bookmarks ` +
+            `(pages like about:, file: or reader view cannot be bookmarked). ` +
+            `The workspace was NOT closed, so no tab was lost.`;
+        } else {
+          if (message.windowId != null) _validateWindowId(message.windowId);
+          try {
+            const destroyResult = await WorkspaceService.destroyWsp(message.wspId, message.windowId ?? null);
+            result.destroyed = true;
+            result.activatedWspId = destroyResult?.activatedWspId;
+          } catch (e) {
+            const msg = e?.message ?? String(e);
+            console.warn("[Handler] exportWorkspaceToBookmarks destroy failed:", msg);
+            result.destroyed = false;
+            result.destroyRefusedMessage = `Export succeeded but the workspace could not be closed: ${msg}`;
+          }
         }
       }
       return result;
@@ -300,14 +314,26 @@ async function _handleMessage(message) {
       return result;
 
     // Dark-mode hint from popup (popup has real DOM, bypasses resistFingerprinting)
-    case "setDarkModeHint":
-      UIService._darkModeHint = message.isDark === true;
-      UIService._isDarkCache = UIService._darkModeHint;
+    case "setDarkModeHint": {
+      const newHint = message.isDark === true;
+      const changed = UIService._isDarkCache !== newHint;
+      UIService._darkModeHint = newHint;
+      UIService._isDarkCache = newHint;
       // Persist to storage so the hint survives across popup closings and is
       // available even before the popup is opened (e.g. keyboard shortcut switch).
-      browser.storage.local.set({ "ld-wsp-dark-hint": UIService._darkModeHint }).catch(() => {});
-      console.log("[Handler] setDarkModeHint ->", UIService._darkModeHint);
+      browser.storage.local.set({ "ld-wsp-dark-hint": newHint }).catch(() => {});
+      console.log("[Handler] setDarkModeHint ->", newHint, "(changed:", changed, ")");
+      if (changed) {
+        // The hint just corrected a stale detection (e.g. the OS scheme flipped
+        // and the hidden background page could not see it). Redraw now --
+        // without this the old icon variant lingers until an unrelated
+        // tab/focus event happens to call updateToolbarButton.
+        UIService._cachedBadgeColor = null;
+        const hintPrimaryWindowId = await WSPStorageManager.getPrimaryWindowId();
+        if (hintPrimaryWindowId) await UIService.updateToolbarButton(hintPrimaryWindowId);
+      }
       return { success: true };
+    }
 
     default:
       console.warn("[Workspaces] Unknown message action:", action);

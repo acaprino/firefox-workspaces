@@ -46,12 +46,16 @@ class BookmarkService {
     console.log("[BookmarkService][exportWorkspace] wspId:", wspId,
       "name:", wsp.name, "tabs:", wsp.tabs.length);
 
-    // Batch-fetch all tab info and pre-check for bookmarkable tabs
+    // Batch-fetch all tab info and pre-check for bookmarkable tabs.
+    // `openTabs` (IDs actually open right now) is the honest denominator for
+    // "did we back up everything a destroy would close" -- stale IDs in
+    // wsp.tabs correspond to nothing closable and must not count.
     const allTabs = await browser.tabs.query({ windowId: wsp.windowId });
     const tabMap = new Map(allTabs.map(t => [t.id, t]));
-    const bookmarkableTabs = wsp.tabs.filter(tabId => {
+    const openTabs = wsp.tabs.filter(tabId => tabMap.has(tabId));
+    const bookmarkableTabs = openTabs.filter(tabId => {
       const tab = tabMap.get(tabId);
-      return tab && tab.url && TabService._isUrlAllowed(tab.url);
+      return tab.url && TabService._isUrlAllowed(tab.url);
     });
     if (bookmarkableTabs.length === 0) {
       throw new Error("No bookmarkable tabs to export");
@@ -97,8 +101,8 @@ class BookmarkService {
         console.debug("[BookmarkService][exportWorkspace] failed to export tab:", tabId, e.message);
       }
     }
-    console.log("[BookmarkService][exportWorkspace] exported", exported, "of", wsp.tabs.length, "tabs");
-    return { folderId: folder.id, folderTitle, exported, total: wsp.tabs.length };
+    console.log("[BookmarkService][exportWorkspace] exported", exported, "of", openTabs.length, "open tabs");
+    return { folderId: folder.id, folderTitle, exported, total: openTabs.length };
   }
 
   // List bookmark folders under "Workspaces" parent that can be restored.
@@ -215,7 +219,7 @@ class BookmarkService {
 
       // Hide inactive workspace tabs
       await WorkspaceService.hideInactiveWspTabs(windowId, wspId);
-      WorkspaceService._updateActiveCache(windowId, tabIds, wspId);
+      WorkspaceService._updateActiveCache(windowId, tabIds, wspId, freshWsp.containerId);
       await MenuService.refreshTabMenu();
       await UIService.updateToolbarButton(windowId);
 

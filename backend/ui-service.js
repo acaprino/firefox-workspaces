@@ -80,33 +80,15 @@ class UIService {
       console.log("[UIService][_isThemeDark] returning cached result:", UIService._isDarkCache);
       return UIService._isDarkCache;
     }
-    // Popup-sourced hint takes priority: popup has a real rendering context where
-    // -moz-Dialog resolves correctly (background page is hidden, may not).
-    if (UIService._darkModeHint !== null) {
-      console.log("[UIService][_isThemeDark] branch=popupHint -> isDark:", UIService._darkModeHint);
-      UIService._isDarkCache = UIService._darkModeHint;
-      return UIService._darkModeHint;
-    }
-    // Try reading persisted hint from storage (set by popup via setDarkModeHint).
-    // This survives popup closings and is available before the popup is opened.
-    try {
-      const stored = await browser.storage.local.get("ld-wsp-dark-hint");
-      const storedHint = stored["ld-wsp-dark-hint"];
-      if (storedHint !== undefined && storedHint !== null) {
-        console.log("[UIService][_isThemeDark] branch=storedHint -> isDark:", storedHint);
-        UIService._darkModeHint = storedHint;
-        UIService._isDarkCache = storedHint;
-        return storedHint;
-      }
-    } catch (e) {
-      console.warn("[UIService][_isThemeDark] storage read failed:", e);
-    }
     console.log("[UIService][_isThemeDark] cache miss -- detecting theme...");
     let result;
+    // 1. Theme colors are ground truth and come first. Hints rank BELOW color
+    // detection on purpose: a stale persisted hint (saved while the previous
+    // theme was active) must never override what the current theme's colors
+    // say -- the toolbar icon used to stay white after a dark -> light theme
+    // switch exactly because the old hint won this race.
     // If the caller supplied theme colors (e.g. from theme.onUpdated callback),
     // use them directly instead of re-querying browser.theme.getCurrent().
-    // This avoids races and works even in the background page which has no
-    // rendering context for DOM-based probes.
     if (themeColors) {
       result = UIService._detectDarkFromColors(themeColors) ?? undefined;
       console.log("[UIService][_isThemeDark] branch=callerColors -> isDark:", result);
@@ -123,6 +105,29 @@ class UIService {
         }
       } catch (e) {
         console.warn("[UIService][_isThemeDark] browser.theme.getCurrent() threw:", e);
+      }
+    }
+    // 2. Color detection was inconclusive (System/"Automatic" theme returns
+    // empty colors). Fall back to the popup-sourced hint: the popup has a real
+    // rendering context where -moz-Dialog resolves correctly (the hidden
+    // background page does not -- see the probes further down).
+    if (result === undefined && UIService._darkModeHint !== null) {
+      result = UIService._darkModeHint;
+      console.log("[UIService][_isThemeDark] branch=popupHint -> isDark:", result);
+    }
+    // Persisted hint (set by popup via setDarkModeHint). Survives popup
+    // closings and browser restarts, available before the popup is opened.
+    if (result === undefined) {
+      try {
+        const stored = await browser.storage.local.get("ld-wsp-dark-hint");
+        const storedHint = stored["ld-wsp-dark-hint"];
+        if (storedHint !== undefined && storedHint !== null) {
+          console.log("[UIService][_isThemeDark] branch=storedHint -> isDark:", storedHint);
+          UIService._darkModeHint = storedHint;
+          result = storedHint;
+        }
+      } catch (e) {
+        console.warn("[UIService][_isThemeDark] storage read failed:", e);
       }
     }
     // Before matchMedia (which privacy.resistFingerprinting forces to 'light'),

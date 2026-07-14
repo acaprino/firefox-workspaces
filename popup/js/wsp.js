@@ -165,10 +165,30 @@ class WorkspaceUI {
     // second, and each applyTheme() call writes ~9 CSS custom properties and
     // may trigger a -moz-Dialog DOM probe (forced reflow). 80ms coalescing
     // is below the perception threshold but absorbs bursts.
+    // Re-forward the recomputed hint after every re-apply: the background
+    // cannot probe -moz-Dialog itself, and without this a theme switch while
+    // the popup is open would leave the toolbar icon on the stale variant.
     let _themeUpdateTimer = null;
     browser.theme.onUpdated.addListener(({ theme }) => {
       clearTimeout(_themeUpdateTimer);
-      _themeUpdateTimer = setTimeout(() => applyTheme(theme), 80);
+      _themeUpdateTimer = setTimeout(() => {
+        const dark = applyTheme(theme);
+        browser.runtime.sendMessage({ action: "setDarkModeHint", isDark: dark })
+          .catch(e => console.debug("[WSP] setDarkModeHint failed:", e?.message));
+      }, 80);
+    });
+
+    // OS scheme flips do not fire theme.onUpdated when the System theme is
+    // active -- re-detect with fresh theme data and re-forward the hint.
+    window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', async () => {
+      try {
+        const freshTheme = await browser.theme.getCurrent();
+        const dark = applyTheme(freshTheme);
+        browser.runtime.sendMessage({ action: "setDarkModeHint", isDark: dark })
+          .catch(e => console.debug("[WSP] setDarkModeHint failed:", e?.message));
+      } catch (e) {
+        console.warn("[WSP] scheme-change re-apply failed:", e);
+      }
     });
 
     const primaryWindowId = await this._callBackgroundTask("getPrimaryWindowId");
@@ -184,6 +204,11 @@ class WorkspaceUI {
       noWspLi.className = "no-wsp";
       noWspLi.textContent = "Workspaces are only available in the primary window.";
       document.getElementById("wsp-list").replaceChildren(noWspLi);
+      // A failed or aborted restore leaves NO primary window at all, so this
+      // branch is the only UI the user can reach in that state. The recovery
+      // banner and diagnostics link need messaging only, not workspace data.
+      this._setupDiagnosticsLink();
+      await this._setupRestoreErrorBanner();
       return;
     }
 
@@ -700,7 +725,21 @@ class WorkspaceUI {
           console.log("[WorkspaceUI][exportBtn] export failed");
           return;
         }
-        console.log("[WorkspaceUI][exportBtn] exported", exportResult.exported, "tabs to:", exportResult.folderTitle);
+        console.log("[WorkspaceUI][exportBtn] exported", exportResult.exported,
+          "of", exportResult.total, "tabs to:", exportResult.folderTitle);
+
+        // Surface partial exports and destroy refusals: silently closing (or
+        // silently not closing) tabs the user believes are backed up is the
+        // data-loss path this dialog exists to prevent.
+        if (result.checked && !exportResult.destroyed && exportResult.destroyRefusedMessage) {
+          await showCustomDialog({ message: exportResult.destroyRefusedMessage });
+        } else if (exportResult.exported < exportResult.total) {
+          await showCustomDialog({
+            message: `Exported ${exportResult.exported} of ${exportResult.total} tabs. ` +
+              `${exportResult.total - exportResult.exported} tab(s) could not be bookmarked ` +
+              `(pages like about:, file: or reader view cannot be saved as bookmarks).`
+          });
+        }
 
         if (exportResult.destroyed) {
           const wasActive = li.classList.contains("active");
