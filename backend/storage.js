@@ -224,14 +224,22 @@ class WSPStorageManager {
     await browser.storage.local.remove(key);
   }
 
-  static async removeClosedTab(wspId, index) {
-    const key = STORAGE_KEYS.closedTabs(wspId);
-    const results = await browser.storage.local.get(key);
-    const closedTabs = results[key] || [];
-    if (index >= 0 && index < closedTabs.length) {
-      closedTabs.splice(index, 1);
-      await browser.storage.local.set({[key]: closedTabs});
-    }
+  // Remove a closed-tab entry by identity (url + closedAt) instead of by
+  // index: the array mutates while the popup is open (new closures unshift),
+  // so a render-time index can point at the wrong entry. Runs under the same
+  // per-workspace mutex as saveClosedTab so a concurrent save cannot be lost
+  // to this read-modify-write.
+  static async removeClosedTab(wspId, { url, closedAt } = {}) {
+    return _storageMutex.run(`closed-${wspId}`, async () => {
+      const key = STORAGE_KEYS.closedTabs(wspId);
+      const results = await browser.storage.local.get(key);
+      const closedTabs = results[key] || [];
+      const index = closedTabs.findIndex(t => t.url === url && t.closedAt === closedAt);
+      if (index >= 0) {
+        closedTabs.splice(index, 1);
+        await browser.storage.local.set({[key]: closedTabs});
+      }
+    });
   }
 
   // Per-workspace mutex for read-modify-write cycles.
@@ -239,6 +247,23 @@ class WSPStorageManager {
   // each other's changes when they interleave at await points.
   static async withWorkspaceLock(wspId, fn) {
     return _storageMutex.run(`wsp-${wspId}`, fn);
+  }
+
+  // Per-window mutex serializing whole destroy operations. The
+  // "cannot destroy the last workspace" invariant is cross-entity: two
+  // concurrent destroys of DIFFERENT workspaces do not meet on any
+  // per-workspace lock, so without this both can pass the count check and
+  // leave the window with zero workspaces. Distinct key from the
+  // `window-${id}` mutex used by addWsp/removeWsp, which destroy acquires
+  // nested inside this one (the AsyncMutex is not re-entrant).
+  static async withDestroyLock(windowId, fn) {
+    return _storageMutex.run(`destroy-window-${windowId}`, fn);
+  }
+
+  // Per-window mutex for read-modify-write of the workspace order array
+  // (createWorkspace appends, destroyWsp splices; interleaving can drop an id).
+  static async withOrderLock(windowId, fn) {
+    return _storageMutex.run(`order-${windowId}`, fn);
   }
 
   // ── Diagnostic dump (Tier 4 -- incident response) ──

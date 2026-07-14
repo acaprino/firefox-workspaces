@@ -7,6 +7,19 @@
    execution context.
    ============================================================ */
 
+// Debug logging switch, shared by both contexts (this file loads first in
+// each). Production builds ship with verbose logging OFF: the extension logs
+// full tab URLs/titles on every tab event, which is both a per-event perf tax
+// (eager argument evaluation, console buffer retention in the persistent
+// background page) and privacy-hostile in shared debugging sessions.
+// console.warn / console.error always stay live. Flip to true when developing.
+const WSP_DEBUG = false;
+if (!WSP_DEBUG) {
+  console.log = () => {};
+  console.debug = () => {};
+  console.info = () => {};
+}
+
 // Priority chain of theme.colors keys used to derive an "accent" color.
 // Consumed by:
 //   - backend/ui-service.js UIService._pickAccentColor (toolbar badge)

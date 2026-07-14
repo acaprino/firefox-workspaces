@@ -75,6 +75,33 @@ class UIService {
     browser.storage.local.remove("ld-wsp-dark-hint").catch(() => {});
   }
 
+  // Full theme-cache invalidation (SVG data URLs + dark/badge caches).
+  // Callers used to clear _svgCache directly alongside clearThemeCache(),
+  // reaching into private state from other modules.
+  static invalidateThemeCaches() {
+    UIService._svgCache.clear();
+    UIService.clearThemeCache();
+  }
+
+  // Record a dark-mode hint and persist it so the correct toolbar icon can
+  // be drawn after a restart before any popup opens.
+  //  - authoritative=false (background prefers-color-scheme listener): only
+  //    seeds _darkModeHint; theme colors still win at the next detection.
+  //  - authoritative=true (popup DOM probe via setDarkModeHint message):
+  //    also overwrites _isDarkCache and, when the value flipped, drops the
+  //    cached badge color so the next toolbar update redraws.
+  // Returns whether the value differed from the cached detection.
+  static setDarkModeHint(isDark, { authoritative = false } = {}) {
+    const changed = UIService._isDarkCache !== isDark;
+    UIService._darkModeHint = isDark;
+    if (authoritative) {
+      UIService._isDarkCache = isDark;
+      if (changed) UIService._cachedBadgeColor = null;
+    }
+    browser.storage.local.set({ "ld-wsp-dark-hint": isDark }).catch(() => {});
+    return changed;
+  }
+
   static async _isThemeDark(themeColors) {
     if (UIService._isDarkCache !== null) {
       console.log("[UIService][_isThemeDark] returning cached result:", UIService._isDarkCache);
@@ -211,7 +238,9 @@ class UIService {
 
   static async updateToolbarButton(windowId, themeColors) {
     console.log("[UIService][updateToolbarButton] called for windowId:", windowId);
-    const activeWsp = await WorkspaceService.getActiveWsp(windowId);
+    // Fast path: this runs on every tab create/remove/focus change; the
+    // cache-backed lookup avoids a window-list + batch storage read per event.
+    const activeWsp = await WorkspaceService.getActiveWspFast(windowId);
     const badgeColor = await UIService._resolveBadgeColor(themeColors);
 
     if (activeWsp) {

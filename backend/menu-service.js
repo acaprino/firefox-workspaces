@@ -54,6 +54,12 @@ class MenuService {
     try {
       console.log("[MenuService][_onMenuClicked] menuItemId:", info.menuItemId,
         "tabId:", tab.id, "windowId:", tab.windowId);
+      // Menu-driven tab moves must not interleave with restore/repair
+      // (same gate as the message handler, keyboard commands and omnibox).
+      if (Brainer._state !== 'ready') {
+        console.log("[MenuService][_onMenuClicked] skipped — state not ready:", Brainer._state);
+        return;
+      }
       const action = MenuService._menuActionMap.get(info.menuItemId);
       if (!action) {
         console.log("[MenuService][_onMenuClicked] no action for menuItemId:", info.menuItemId, "— ignoring");
@@ -150,6 +156,12 @@ class MenuService {
 
     browser.omnibox.onInputEntered.addListener(async (text) => {
       console.log("[MenuService][omnibox.onInputEntered] text:", JSON.stringify(text));
+      // Omnibox-driven activation must not interleave with restore/repair
+      // (same gate as the message handler and keyboard commands).
+      if (Brainer._state !== 'ready') {
+        console.log("[MenuService][omnibox.onInputEntered] skipped — state not ready:", Brainer._state);
+        return;
+      }
       const windowId = (await browser.windows.getCurrent()).id;
       const workspaces = await WorkspaceService.getOrderedWorkspaces(windowId);
       const validIds = new Set(workspaces.map(w => w.id));

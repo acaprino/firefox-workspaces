@@ -38,6 +38,63 @@ class BookmarkService {
       .slice(0, 200) || "Restored Workspace";
   }
 
+  // Resolve a collision-free folder title under the given parent by
+  // suffixing the current date and a counter. Shared by the live export and
+  // the snapshot export.
+  static async _uniqueFolderTitle(parent, baseName) {
+    const children = await browser.bookmarks.getChildren(parent.id);
+    const existingNames = new Set(
+      children.filter(c => c.type === "folder").map(c => c.title)
+    );
+    let folderTitle = baseName;
+    if (existingNames.has(folderTitle)) {
+      const dateSuffix = new Date().toISOString().slice(0, 10);
+      let candidate = `${baseName} (${dateSuffix})`;
+      let counter = 2;
+      while (existingNames.has(candidate) && counter < 1000) {
+        candidate = `${baseName} (${dateSuffix} #${counter})`;
+        counter++;
+      }
+      folderTitle = candidate;
+      console.log("[BookmarkService][_uniqueFolderTitle] name collision, using:", folderTitle);
+    }
+    return folderTitle;
+  }
+
+  // Export orphaned workspaces' tabSnapshot URL lists as bookmark folders.
+  // Used by giveUpRestoreRetry: "give up" used to strand the ld-wsp-* records
+  // with no user-reachable copy of the data, even though the snapshots hold
+  // everything needed. Exported folders are restorable later through the
+  // normal restore-from-bookmarks flow. Returns the number of folders created.
+  static async exportSnapshots(workspaces) {
+    let foldersCreated = 0;
+    for (const wsp of workspaces) {
+      try {
+        const urls = (wsp.tabSnapshot || [])
+          .filter(u => TabService._isUrlAllowed(u))
+          .slice(0, BookmarkService.MAX_RESTORE_TABS);
+        if (urls.length === 0) continue;
+        const parent = await BookmarkService._getOrCreateParentFolder();
+        const title = await BookmarkService._uniqueFolderTitle(
+          parent, BookmarkService._sanitizeFolderTitle(wsp.name));
+        const folder = await browser.bookmarks.create({ parentId: parent.id, title });
+        for (const url of urls) {
+          try {
+            await browser.bookmarks.create({ parentId: folder.id, title: url, url });
+          } catch (e) {
+            console.debug("[BookmarkService][exportSnapshots] failed for url:", url, e.message);
+          }
+        }
+        foldersCreated++;
+        console.log("[BookmarkService][exportSnapshots] exported", urls.length,
+          "snapshot URLs for workspace:", wsp.name);
+      } catch (e) {
+        console.warn("[BookmarkService][exportSnapshots] failed for workspace:", wsp.id, e.message);
+      }
+    }
+    return foldersCreated;
+  }
+
   // Export a workspace's tabs as bookmarks under Workspaces/{workspace name}.
   // Returns the created bookmarks folder.
   static async exportWorkspace(wspId) {
@@ -62,24 +119,7 @@ class BookmarkService {
     }
 
     const parent = await BookmarkService._getOrCreateParentFolder();
-
-    // Resolve a unique folder name under the Workspaces parent
-    const children = await browser.bookmarks.getChildren(parent.id);
-    const existingNames = new Set(
-      children.filter(c => c.type === "folder").map(c => c.title)
-    );
-    let folderTitle = wsp.name;
-    if (existingNames.has(folderTitle)) {
-      const dateSuffix = new Date().toISOString().slice(0, 10);
-      let candidate = `${wsp.name} (${dateSuffix})`;
-      let counter = 2;
-      while (existingNames.has(candidate) && counter < 1000) {
-        candidate = `${wsp.name} (${dateSuffix} #${counter})`;
-        counter++;
-      }
-      folderTitle = candidate;
-      console.log("[BookmarkService][exportWorkspace] name collision, using:", folderTitle);
-    }
+    const folderTitle = await BookmarkService._uniqueFolderTitle(parent, wsp.name);
 
     const folder = await browser.bookmarks.create({
       parentId: parent.id,
@@ -171,11 +211,10 @@ class BookmarkService {
     wspData.name = BookmarkService._sanitizeFolderTitle(folder.title);
     wspData.active = true;
 
-    // [M4 + Firefox reviewer] Guard _reopeningCount BEFORE createWorkspace
+    // [M4 + Firefox reviewer] Hold the reopen guard across createWorkspace
     // to prevent the entire workspace creation + tab creation sequence from
     // being intercepted by addTabToWorkspace.
-    TabService._reopeningCount++;
-    try {
+    return TabService.withReopenGuard(async () => {
       // Create the workspace (internally calls deactivateCurrentWsp)
       await WorkspaceService.createWorkspace(wspData);
       const wspId = wspData.id;
@@ -226,8 +265,6 @@ class BookmarkService {
       console.log("[BookmarkService][restoreWorkspace] done - wspId:", wspId,
         "tabs:", tabIds.length);
       return { wspId, name: wspData.name, tabCount: tabIds.length };
-    } finally {
-      TabService._reopeningCount--;
-    }
+    });
   }
 }

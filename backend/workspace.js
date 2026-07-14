@@ -81,11 +81,15 @@ class Workspace {
     console.log("[Workspace][destroy] done — id:", this.id);
   }
 
-  async activate(activeTabId = null) {
+  // `allTabsHint`: optional pre-fetched tabs.query({windowId}) result. The
+  // activation cascade used to issue up to six full-window queries; callers
+  // that already hold the list pass it here to avoid three of them.
+  async activate(activeTabId = null, allTabsHint = null) {
     console.log("[Workspace][activate] id:", this.id, "name:", this.name,
       "tabs:", this.tabs.length, "groups:", this.groups.length,
       "activeTabId param:", activeTabId, "lastActiveTabId:", this.lastActiveTabId);
-    this.tabs = await Workspace._filterValidTabs(this.tabs, this.windowId);
+    this.tabs = await Workspace._filterValidTabs(this.tabs, this.windowId,
+      allTabsHint ? new Set(allTabsHint.map(t => t.id)) : null);
     console.log("[Workspace][activate] valid tabs:", this.tabs.length);
 
     // reconstruct groups
@@ -113,7 +117,9 @@ class Workspace {
     }
 
     // set active tab
-    const pinnedTabIds = (await browser.tabs.query({pinned: true, windowId: this.windowId})).map(tab => tab.id);
+    const pinnedTabIds = (allTabsHint
+      ? allTabsHint.filter(t => t.pinned)
+      : await browser.tabs.query({pinned: true, windowId: this.windowId})).map(tab => tab.id);
     const tabIdToActivate = activeTabId || this.lastActiveTabId;
     const isValid = this.tabs.includes(tabIdToActivate) || pinnedTabIds.includes(tabIdToActivate);
     console.log("[Workspace][activate] tabIdToActivate:", tabIdToActivate,
@@ -127,20 +133,19 @@ class Workspace {
     } else {
       console.log("[Workspace][activate] no tabs at all -- creating fallback tab");
       // Guard against onCreated racing with the manual tabs.push below:
-      // _reopeningCount > 0 tells addTabToWorkspace to skip this tab.
-      TabService._reopeningCount++;
-      try {
+      // the reopen guard tells addTabToWorkspace to skip this tab.
+      await TabService.withReopenGuard(async () => {
         const fallbackTab = await this._createTabFallback();
         this.tabs.push(fallbackTab.id);
         await TabService.setTabSessionValue(fallbackTab.id, this.id);
-      } finally {
-        TabService._reopeningCount--;
-      }
+      });
     }
 
     // Save tab URL snapshot for restart resilience
     try {
-      const allTabs = await browser.tabs.query({windowId: this.windowId, pinned: false});
+      const allTabs = allTabsHint
+        ? allTabsHint.filter(t => !t.pinned)
+        : await browser.tabs.query({windowId: this.windowId, pinned: false});
       const tabMap = new Map(allTabs.map(t => [t.id, t]));
       this.tabSnapshot = this.tabs
         .map(id => tabMap.get(id))
@@ -173,24 +178,36 @@ class Workspace {
 
     console.log("[Workspace][updateTabGroups] id:", this.id,
       "found", this.groups.length, "groups with tabs");
-    await this._saveState();
+    // Persist only the groups field onto a fresh record under the workspace
+    // lock: saving `this` whole would clobber any tabs[] change a concurrent
+    // locked writer landed since we were constructed.
+    await WSPStorageManager.withWorkspaceLock(this.id, async () => {
+      const fresh = await WSPStorageManager.getWorkspace(this.id);
+      if (fresh.windowId == null) return; // destroyed meanwhile
+      fresh.groups = this.groups;
+      await fresh._saveState();
+    });
   }
 
   static async rename(wspId, { name, icon, color } = {}) {
     console.log("[Workspace][rename] wspId:", wspId,
       "name:", name, "icon:", icon, "color:", color);
-    const state = await WSPStorageManager.getWspState(wspId);
-    const oldName = state.name;
-    const oldIcon = state.icon;
-    const oldColor = state.color;
-    if (name !== undefined) state.name = name;
-    if (icon !== undefined) state.icon = icon;
-    if (color !== undefined) state.color = color;
-    console.log("[Workspace][rename] changes — name:", oldName, "->", state.name,
-      "| icon:", oldIcon, "->", state.icon, "| color:", oldColor, "->", state.color);
-    // Re-construct through Workspace to apply constructor normalization
-    const wsp = new Workspace(wspId, state);
-    await wsp._saveState();
+    // Full-record read-modify-write: take the workspace lock so a concurrent
+    // tab add/remove (which also rewrites the record) cannot be lost.
+    await WSPStorageManager.withWorkspaceLock(wspId, async () => {
+      const state = await WSPStorageManager.getWspState(wspId);
+      const oldName = state.name;
+      const oldIcon = state.icon;
+      const oldColor = state.color;
+      if (name !== undefined) state.name = name;
+      if (icon !== undefined) state.icon = icon;
+      if (color !== undefined) state.color = color;
+      console.log("[Workspace][rename] changes — name:", oldName, "->", state.name,
+        "| icon:", oldIcon, "->", state.icon, "| color:", oldColor, "->", state.color);
+      // Re-construct through Workspace to apply constructor normalization
+      const wsp = new Workspace(wspId, state);
+      await wsp._saveState();
+    });
     console.log("[Workspace][rename] done — wspId:", wspId);
   }
 

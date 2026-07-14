@@ -298,14 +298,23 @@ class WorkspaceUI {
       const ok = await showCustomDialog({
         message:
           "Give up the automatic restore retry?\n\n" +
-          "Workspaces from before the failed restart will become unrecoverable from " +
-          "this UI (they remain in storage but unattached). The next Firefox start " +
-          "will create a fresh default workspace.\n\n" +
+          "Where possible, the saved tab lists of the old workspaces will first be " +
+          "exported to bookmarks (under \"Workspaces\"), so you can bring them back " +
+          "later via \"Restore from bookmarks\". The next Firefox start will create " +
+          "a fresh default workspace.\n\n" +
           "If you have not copied the diagnostic dump yet, do that first."
       });
       if (!ok) return;
       banner.hidden = true;
-      try { await this._callBackgroundTask("giveUpRestoreRetry"); }
+      try {
+        const result = await this._callBackgroundTask("giveUpRestoreRetry");
+        if (result && result.exportedWorkspaces > 0) {
+          await showCustomDialog({
+            message: `Saved ${result.exportedWorkspaces} workspace(s) to bookmarks ` +
+              `under "Workspaces". Restore them any time via "Restore from bookmarks".`
+          });
+        }
+      }
       catch (e) { console.debug("[WSP][giveUpRestoreRetry] failed:", e?.message); }
     });
   }
@@ -353,47 +362,60 @@ class WorkspaceUI {
 
   _setupCreateButton() {
     document.getElementById("createNewWsp").addEventListener("click", async (e) => {
-      const windowId = this.currentWindowId;
-      console.log("[WorkspaceUI][createNewWsp] clicked, windowId:", windowId);
+      const btn = e.currentTarget;
+      // Re-entrancy guard: a double-click used to open two dialogs on the
+      // same singleton DOM, and one OK click then fired two create calls.
+      if (btn.dataset.busy) return;
+      btn.dataset.busy = "1";
+      try {
+        const windowId = this.currentWindowId;
+        console.log("[WorkspaceUI][createNewWsp] clicked, windowId:", windowId);
 
-      const result = await showCustomDialog({
-        message: "Create workspace:",
-        withInput: true,
-        defaultValue: await this._callBackgroundTask("getWorkspaceName"),
-        showContainerPicker: this.containers.length > 0,
-        containers: this.containers,
-        showColorPicker: true
-      });
-      if (result === false) {
-        console.log("[WorkspaceUI][createNewWsp] dialog cancelled");
-        return;
+        const result = await showCustomDialog({
+          message: "Create workspace:",
+          withInput: true,
+          defaultValue: await this._callBackgroundTask("getWorkspaceName"),
+          showContainerPicker: this.containers.length > 0,
+          containers: this.containers,
+          showColorPicker: true
+        });
+        if (result === false) {
+          console.log("[WorkspaceUI][createNewWsp] dialog cancelled");
+          return;
+        }
+
+        const wspName = result.name.trim().slice(0, 100);
+        if (wspName.length === 0) return;
+        console.log("[WorkspaceUI][createNewWsp] creating workspace:", wspName,
+          "icon:", result.icon || "(none)", "color:", result.color || null,
+          "containerId:", result.containerId || null);
+
+        const wsp = {
+          name: wspName,
+          icon: result.icon || "",
+          color: result.color || null,
+          active: true,
+          tabs: [],
+          windowId: windowId,
+          containerId: result.containerId || null
+        };
+
+        const created = await this._callBackgroundTask("createWorkspaceWithTab", wsp);
+        if (!created) {
+          console.log("[WorkspaceUI][createNewWsp] create failed");
+          return;
+        }
+
+        wsp.id = created.wspId;
+        wsp.tabs.push(created.tabId);
+        this.workspaces.push(wsp);
+        console.log("[WorkspaceUI][createNewWsp] workspace created — wspId:", wsp.id, "tabId:", created.tabId);
+
+        this._removePreviouslyActiveLi();
+        this._addWorkspace(wsp);
+      } finally {
+        delete btn.dataset.busy;
       }
-
-      const wspName = result.name.trim().slice(0, 100);
-      if (wspName.length === 0) return;
-      console.log("[WorkspaceUI][createNewWsp] creating workspace:", wspName,
-        "icon:", result.icon || "(none)", "color:", result.color || null,
-        "containerId:", result.containerId || null);
-
-      const wsp = {
-        name: wspName,
-        icon: result.icon || "",
-        color: result.color || null,
-        active: true,
-        tabs: [],
-        windowId: windowId,
-        containerId: result.containerId || null
-      };
-
-      const created = await this._callBackgroundTask("createWorkspaceWithTab", wsp);
-
-      wsp.id = created.wspId;
-      wsp.tabs.push(created.tabId);
-      this.workspaces.push(wsp);
-      console.log("[WorkspaceUI][createNewWsp] workspace created — wspId:", wsp.id, "tabId:", created.tabId);
-
-      this._removePreviouslyActiveLi();
-      this._addWorkspace(wsp);
     });
   }
 
@@ -498,12 +520,13 @@ class WorkspaceUI {
           wspEl.textContent = r.wspName;
           item.appendChild(wspEl);
 
-          item.addEventListener("click", async () => {
-            await this._callBackgroundTask("activateWorkspace", {
+          item.addEventListener("click", () => {
+            // Fire-and-forget, same rationale as the workspace click.
+            this._callBackgroundTask("activateWorkspace", {
               wspId: r.wspId,
               windowId: this.currentWindowId,
               tabId: r.tabId
-            });
+            }).catch(() => {});
             window.close();
           });
 
@@ -564,16 +587,19 @@ class WorkspaceUI {
       restoreBtn.classList.add("wsp-closed-tab-restore");
       restoreBtn.title = "Restore tab";
 
-      const idx = i;
       li.addEventListener("click", async () => {
-        // Disable all closed-tab items to prevent stale-index clicks
+        // Disable all closed-tab items to prevent double clicks
         const allItems = list.querySelectorAll(".wsp-closed-tab-item");
         for (const item of allItems) item.style.pointerEvents = "none";
 
-        console.log("[WorkspaceUI][restoreClosedTab] restoring index:", idx, "url:", tab.url);
+        // Address the entry by identity (url + closedAt), not by index: the
+        // stored array mutates while the popup is open (new closures
+        // unshift), so a render-time index can restore the wrong tab.
+        console.log("[WorkspaceUI][restoreClosedTab] restoring:", tab.url);
         await this._callBackgroundTask("restoreClosedTab", {
           wspId: activeWsp.id,
-          index: idx,
+          url: tab.url,
+          closedAt: tab.closedAt,
           windowId: this.currentWindowId
         });
         this.showClosedTabs();
@@ -592,17 +618,37 @@ class WorkspaceUI {
 
   async _callBackgroundTask(action, args) {
     const message = { action, ...args };
-    console.log("[WorkspaceUI][_callBackgroundTask] ->", action,
-      args ? JSON.stringify(args) : "");
-    const result = await browser.runtime.sendMessage(message);
-    if (result && result._error) {
-      console.error(`[Workspaces] ${action} failed:`, result.message);
+    if (WSP_DEBUG) {
+      console.log("[WorkspaceUI][_callBackgroundTask] ->", action,
+        args ? JSON.stringify(args) : "");
+    }
+    let result;
+    try {
+      result = await browser.runtime.sendMessage(message);
+    } catch (e) {
+      // Messaging failure (e.g. background not ready on a cold start): fail
+      // soft like an _error reply instead of an unhandled rejection.
+      console.error(`[Workspaces] ${action} failed:`, e?.message);
       return null;
     }
-    console.log("[WorkspaceUI][_callBackgroundTask] <-", action, "result:",
-      result === null ? "null" :
-      Array.isArray(result) ? `[array len=${result.length}]` :
-      typeof result === "object" ? `{${Object.keys(result).join(",")}}` : result);
+    if (result && result._error) {
+      console.error(`[Workspaces] ${action} failed:`, result.message);
+      // Deliberate, user-actionable refusals from the handler ("Cannot
+      // destroy the last workspace", "still starting up", ...) used to be
+      // flattened to null here, so the user clicked a button and nothing
+      // visibly happened. Surface them; fire-and-forget so callers that
+      // close the popup right after are not blocked.
+      if (result._userFacing && result.message) {
+        showCustomDialog({ message: result.message }).catch(() => {});
+      }
+      return null;
+    }
+    if (WSP_DEBUG) {
+      console.log("[WorkspaceUI][_callBackgroundTask] <-", action, "result:",
+        result === null ? "null" :
+        Array.isArray(result) ? `[array len=${result.length}]` :
+        typeof result === "object" ? `{${Object.keys(result).join(",")}}` : result);
+    }
     return result;
   }
 
@@ -687,10 +733,13 @@ class WorkspaceUI {
       }
       li.classList.add("active");
 
-      await this._callBackgroundTask("activateWorkspace", {
+      // Fire-and-forget: the background completes the activation regardless
+      // of popup lifetime (persistent MV2 page). Awaiting the full hide/show
+      // cascade here only froze the popup on large windows.
+      this._callBackgroundTask("activateWorkspace", {
         wspId: workspace.id,
         windowId: workspace.windowId
-      });
+      }).catch(() => {});
       console.log("[WorkspaceUI][switchWorkspace] done — closing popup");
       window.close();
     });
@@ -760,6 +809,10 @@ class WorkspaceUI {
     // Rename
     renameBtn.addEventListener("click", async (e) => {
       e.stopPropagation();
+      // Re-entrancy guard: same double-dialog hazard as the create button.
+      if (renameBtn.dataset.busy) return;
+      renameBtn.dataset.busy = "1";
+      try {
       console.log("[WorkspaceUI][renameBtn] clicked for workspace:", workspace.id, workspace.name);
 
       const result = await showCustomDialog({
@@ -845,6 +898,9 @@ class WorkspaceUI {
           }
         }
 
+      }
+      } finally {
+        delete renameBtn.dataset.busy;
       }
     });
 

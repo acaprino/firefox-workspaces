@@ -65,17 +65,45 @@ function _sanitizeCreatePayload(message) {
   _validateContainerId(message.containerId);
 }
 
+// Actions that mutate workspace/tab state. Rejected while the background is
+// initializing or restoring: during that window the stored tab arrays may
+// reference reused tab IDs from the previous session, so a destroy/activate
+// could act on the WRONG live tabs or interleave with the repair machinery.
+// Read-only actions and the recovery surface (banner actions, diagnostics,
+// dark-mode hint) stay available in every state.
+const _MUTATING_ACTIONS = new Set([
+  "createWorkspace", "createWorkspaceWithTab", "renameWorkspace",
+  "destroyWsp", "activateWorkspace", "hideInactiveWspTabs",
+  "setWorkspaceContainer", "restoreClosedTab", "clearClosedTabs",
+  "saveWorkspaceOrder", "exportWorkspaceToBookmarks",
+  "restoreWorkspaceFromBookmarks",
+]);
+
 async function _handleMessage(message) {
   const { action, ...args } = message;
-  // Summarize args to avoid dumping large workspace objects in logs
-  const argsSummary = Object.fromEntries(
-    Object.entries(args).map(([k, v]) =>
-      Array.isArray(v) ? [k, `[array len=${v.length}]`] :
-      (v && typeof v === "object") ? [k, `{${Object.keys(v).join(",")}}` ] :
-      [k, v]
-    )
-  );
-  console.log("[Handler] action:", action, "args:", JSON.stringify(argsSummary));
+  if (WSP_DEBUG) {
+    // Summarize args to avoid dumping large workspace objects in logs.
+    // Gated: building + stringifying this on every message is a hot-path tax.
+    const argsSummary = Object.fromEntries(
+      Object.entries(args).map(([k, v]) =>
+        Array.isArray(v) ? [k, `[array len=${v.length}]`] :
+        (v && typeof v === "object") ? [k, `{${Object.keys(v).join(",")}}` ] :
+        [k, v]
+      )
+    );
+    console.log("[Handler] action:", action, "args:", JSON.stringify(argsSummary));
+  }
+
+  if (_MUTATING_ACTIONS.has(action) && Brainer._state !== 'ready') {
+    console.warn("[Handler] refused", action, "while state is", Brainer._state);
+    return {
+      _error: true,
+      _userFacing: true,
+      retriable: true,
+      message: "Workspaces is still starting up (restoring the previous session). Please try again in a moment.",
+    };
+  }
+
   let result;
 
   switch (action) {
@@ -139,7 +167,7 @@ async function _handleMessage(message) {
         const msg = e?.message ?? String(e);
         if (msg.startsWith("Cannot destroy") || msg.startsWith("Workspace not found")) {
           console.log("[Handler] destroyWsp -> refused:", msg);
-          return { _error: true, message: msg };
+          return { _error: true, _userFacing: true, message: msg };
         }
         throw e;
       }
@@ -180,7 +208,13 @@ async function _handleMessage(message) {
     case "restoreClosedTab":
       _validateWspId(message.wspId);
       _validateWindowId(message.windowId);
-      result = await TabService.restoreClosedTab(message.wspId, message.index, message.windowId);
+      // Entries are addressed by identity (url + closedAt), not index: the
+      // stored array can mutate while the popup is open.
+      if (typeof message.url !== "string" || !Number.isInteger(message.closedAt)) {
+        throw new Error("Invalid closed-tab identity");
+      }
+      result = await TabService.restoreClosedTab(message.wspId,
+        { url: message.url, closedAt: message.closedAt }, message.windowId);
       console.log("[Handler] restoreClosedTab -> url:", result?.url);
       return result;
     case "clearClosedTabs":
@@ -268,7 +302,7 @@ async function _handleMessage(message) {
             msg.startsWith("Bookmark folder") || msg.startsWith("Folder is not") ||
             msg.startsWith("Failed to restore")) {
           console.log("[Handler] restoreWorkspaceFromBookmarks -> refused:", msg);
-          return { _error: true, message: msg };
+          return { _error: true, _userFacing: true, message: msg };
         }
         throw e;
       }
@@ -294,15 +328,33 @@ async function _handleMessage(message) {
       return result;
     case "acknowledgeLastRestoreError":
       await WSPStorageManager.clearLastRestoreError();
-      Brainer._refuseToWipeActive = false;
+      Brainer.setRefuseToWipeActive(false);
       console.log("[Handler] acknowledgeLastRestoreError -> banner cleared, retry signal kept");
       return { success: true };
-    case "giveUpRestoreRetry":
+    case "giveUpRestoreRetry": {
+      // Before orphaning the old records, export their URL snapshots to
+      // bookmark folders: the extension holds everything needed to rebuild
+      // (names + ordered URL lists), and "give up" used to discard the only
+      // user-reachable copy. Exported folders are restorable later via the
+      // normal restore-from-bookmarks flow. Best-effort: a bookmarks failure
+      // must not block the user from clearing the retry loop.
+      let exportedWorkspaces = 0;
+      try {
+        const lastId = await WSPStorageManager.getPrimaryWindowLastId();
+        if (lastId != null) {
+          const orphans = await WSPStorageManager.getWorkspaces(lastId);
+          exportedWorkspaces = await BookmarkService.exportSnapshots(orphans);
+        }
+      } catch (e) {
+        console.warn("[Handler] giveUpRestoreRetry snapshot export failed:", e?.message);
+      }
       await WSPStorageManager.clearLastRestoreError();
       await WSPStorageManager.removePrimaryWindowLastId();
-      Brainer._refuseToWipeActive = false;
-      console.log("[Handler] giveUpRestoreRetry -> banner + retry signal cleared (destructive)");
-      return { success: true };
+      Brainer.setRefuseToWipeActive(false);
+      console.log("[Handler] giveUpRestoreRetry -> banner + retry signal cleared,",
+        exportedWorkspaces, "workspace snapshot(s) exported to bookmarks");
+      return { success: true, exportedWorkspaces };
+    }
 
     // Diagnostic dump for incident response. Returns every ld-wsp-* key plus
     // primary IDs and schema version. URL contents are returned as-is so the
@@ -316,19 +368,16 @@ async function _handleMessage(message) {
     // Dark-mode hint from popup (popup has real DOM, bypasses resistFingerprinting)
     case "setDarkModeHint": {
       const newHint = message.isDark === true;
-      const changed = UIService._isDarkCache !== newHint;
-      UIService._darkModeHint = newHint;
-      UIService._isDarkCache = newHint;
-      // Persist to storage so the hint survives across popup closings and is
-      // available even before the popup is opened (e.g. keyboard shortcut switch).
-      browser.storage.local.set({ "ld-wsp-dark-hint": newHint }).catch(() => {});
+      // Authoritative: the popup probe has a real rendering context. The
+      // accessor persists the hint (survives popup closings, available before
+      // any popup opens) and drops the badge-color cache when it flipped.
+      const changed = UIService.setDarkModeHint(newHint, { authoritative: true });
       console.log("[Handler] setDarkModeHint ->", newHint, "(changed:", changed, ")");
       if (changed) {
         // The hint just corrected a stale detection (e.g. the OS scheme flipped
         // and the hidden background page could not see it). Redraw now --
         // without this the old icon variant lingers until an unrelated
         // tab/focus event happens to call updateToolbarButton.
-        UIService._cachedBadgeColor = null;
         const hintPrimaryWindowId = await WSPStorageManager.getPrimaryWindowId();
         if (hintPrimaryWindowId) await UIService.updateToolbarButton(hintPrimaryWindowId);
       }

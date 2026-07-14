@@ -25,6 +25,16 @@ class Brainer {
   // uses it to enable the URL-snapshot fallback, and onStartup itself uses it to
   // run a post-init repair if it fires after initialize() already settled.
   static _browserStarted = false;
+  // Synchronous re-entrancy flag for _onWindowCreated: its state guards run
+  // before its storage reads, so without this two concurrent invocations can
+  // both enter the restore path (FLW-007).
+  static _restoreInFlight = false;
+
+  // Accessor for the refuse-to-wipe circuit breaker so the message handler
+  // doesn't write private state directly (banner acknowledge / give-up).
+  static setRefuseToWipeActive(value) {
+    Brainer._refuseToWipeActive = value === true;
+  }
   // Guards the onStartup-fired-after-ready repair so it runs at most once.
   static _postStartupRepairDone = false;
 
@@ -55,6 +65,24 @@ class Brainer {
       this._registerCommandListeners();
       MenuService.registerOmniboxListeners();
       await WSPStorageManager.ensureSchemaVersion();
+
+      // Crash-proof restart evidence via storage.session (in-memory, cleared
+      // when the browser session ends; Firefox 115+, available in MV2): if
+      // the sentinel written at the end of every init is gone, the browser
+      // (or the extension) restarted -- no matter how the previous session
+      // ended. This complements the onWindowRemoved-based lastId signal,
+      // which unclean shutdowns (crash, kill, power loss) bypass entirely.
+      // Used only to arm `restartLikely` for the repair pass; a false
+      // positive on a plain extension reload is harmless because the repair
+      // is a no-op when stored arrays already agree with session values.
+      let sessionRestartEvidence = false;
+      try {
+        const sentinel = await browser.storage.session.get("wsp-session-alive");
+        sessionRestartEvidence = !sentinel["wsp-session-alive"];
+        await browser.storage.session.set({ "wsp-session-alive": true });
+      } catch (e) {
+        console.debug("[Brainer][initialize] storage.session unavailable:", e?.message);
+      }
 
       // Detect restart vs first-ever startup BEFORE _ensureDefaultWorkspace
       // to eliminate the race with onStartup event.
@@ -143,7 +171,8 @@ class Brainer {
         // confirmed, by URL snapshot). No-op on a genuine already-running reload.
         const pid = await WSPStorageManager.getPrimaryWindowId();
         if (pid) {
-          await Brainer._repairTabAssignments(pid, Brainer._browserStarted);
+          await Brainer._repairTabAssignments(pid,
+            Brainer._browserStarted || sessionRestartEvidence);
         }
         // Ensure state is 'ready' even if onInstalled fired before its listener
         // was registered (during the ensureSchemaVersion() await above).
@@ -351,8 +380,7 @@ class Brainer {
         console.log("[Brainer][onThemeUpdated] fired -- themeWindowId:", themeWindowId,
           "| colors:", JSON.stringify(theme?.colors ?? null));
         // Invalidate caches: custom icons must be regenerated with the new theme colors
-        UIService._svgCache.clear();
-        UIService.clearThemeCache();
+        UIService.invalidateThemeCaches();
         const primaryWindowId = await WSPStorageManager.getPrimaryWindowId();
         console.log("[Brainer][onThemeUpdated] primaryWindowId:", primaryWindowId);
         if (primaryWindowId) await UIService.updateToolbarButton(primaryWindowId, theme?.colors);
@@ -374,10 +402,8 @@ class Brainer {
       schemeQuery.addEventListener("change", async (e) => {
         try {
           console.log("[Brainer][onSchemeChanged] prefers-color-scheme flipped -> dark:", e.matches);
-          UIService._svgCache.clear();
-          UIService.clearThemeCache();
-          UIService._darkModeHint = e.matches;
-          browser.storage.local.set({ "ld-wsp-dark-hint": e.matches }).catch(() => {});
+          UIService.invalidateThemeCaches();
+          UIService.setDarkModeHint(e.matches);
           const primaryWindowId = await WSPStorageManager.getPrimaryWindowId();
           if (primaryWindowId) await UIService.updateToolbarButton(primaryWindowId);
         } catch (err) { console.error("[Workspaces] onSchemeChanged error:", err); }
@@ -408,42 +434,61 @@ class Brainer {
       console.log("[Brainer][_onWindowCreated] windowId:", window.id, "skipped -- refuse-to-wipe active");
       return;
     }
-    console.log("[Brainer][_onWindowCreated] windowId:", window.id, "state:", Brainer._state,
-      "initStarted:", Brainer._initStarted);
-
-    const primaryId = await WSPStorageManager.getPrimaryWindowId();
-    const lastId = await WSPStorageManager.getPrimaryWindowLastId();
-    console.log("[Brainer][_onWindowCreated] primaryId:", primaryId, "lastId:", lastId);
-
-    // First-ever startup (no primary window recorded)
-    if (primaryId == null && lastId == null) {
-      console.log("[Brainer][_onWindowCreated] first-ever startup — setting primary to:", window.id);
-      await WSPStorageManager.setPrimaryWindowId(window.id);
-
-      const wsp = WorkspaceService._buildDefaultWspData(window.id);
-      await WorkspaceService.createWorkspace(wsp);
-      Brainer._state = 'ready';
-      console.log("[Brainer][_onWindowCreated] default workspace created, state: ready");
+    // Check-then-act guard: the state checks above happen before the storage
+    // reads below, so two near-simultaneous onCreated events (multi-window
+    // session restore, or onCreated racing the onStartup fallback) could both
+    // pass them and run _restoreWorkspaces concurrently against different
+    // windows. The flag is set synchronously before the first await.
+    if (Brainer._restoreInFlight) {
+      console.log("[Brainer][_onWindowCreated] windowId:", window.id, "skipped -- restore already in flight");
       return;
     }
+    Brainer._restoreInFlight = true;
+    try {
+      console.log("[Brainer][_onWindowCreated] windowId:", window.id, "state:", Brainer._state,
+        "initStarted:", Brainer._initStarted);
 
-    // Browser restart — restore workspaces using Sessions API
-    if (primaryId == null) {
-      console.log("[Brainer][_onWindowCreated] restart path — lastId:", lastId, "entering restore");
-      // Set flag before any awaits to close the race window with
-      // _ensureDefaultWorkspace (which runs from initialize()).
-      Brainer._state = 'restoring';
-      try {
-        await Brainer._restoreWorkspaces(window);
-        Brainer._state = 'ready';
-        console.log("[Brainer][_onWindowCreated] restore complete — state: ready");
-      } catch (e) {
-        Brainer._state = 'uninitialized';
-        console.error("[Brainer][_onWindowCreated] restore failed:", e);
-        throw e;
+      const primaryId = await WSPStorageManager.getPrimaryWindowId();
+      const lastId = await WSPStorageManager.getPrimaryWindowLastId();
+      console.log("[Brainer][_onWindowCreated] primaryId:", primaryId, "lastId:", lastId);
+
+      // Re-check after the awaits: initialize() may have claimed the restore
+      // while we were reading storage.
+      if (Brainer._state === 'restoring' || Brainer._state === 'initializing') {
+        console.log("[Brainer][_onWindowCreated] windowId:", window.id, "skipped post-read -- state is", Brainer._state);
+        return;
       }
-    } else {
-      console.log("[Brainer][_onWindowCreated] additional window opened (primary already:", primaryId, ") — no action");
+
+      // First-ever startup (no primary window recorded)
+      if (primaryId == null && lastId == null) {
+        console.log("[Brainer][_onWindowCreated] first-ever startup — setting primary to:", window.id);
+        await WSPStorageManager.setPrimaryWindowId(window.id);
+
+        const wsp = WorkspaceService._buildDefaultWspData(window.id);
+        await WorkspaceService.createWorkspace(wsp);
+        Brainer._state = 'ready';
+        console.log("[Brainer][_onWindowCreated] default workspace created, state: ready");
+        return;
+      }
+
+      // Browser restart — restore workspaces using Sessions API
+      if (primaryId == null) {
+        console.log("[Brainer][_onWindowCreated] restart path — lastId:", lastId, "entering restore");
+        Brainer._state = 'restoring';
+        try {
+          await Brainer._restoreWorkspaces(window);
+          Brainer._state = 'ready';
+          console.log("[Brainer][_onWindowCreated] restore complete — state: ready");
+        } catch (e) {
+          Brainer._state = 'uninitialized';
+          console.error("[Brainer][_onWindowCreated] restore failed:", e);
+          throw e;
+        }
+      } else {
+        console.log("[Brainer][_onWindowCreated] additional window opened (primary already:", primaryId, ") — no action");
+      }
+    } finally {
+      Brainer._restoreInFlight = false;
     }
   }
 
@@ -1047,35 +1092,44 @@ class Brainer {
       }
     }
 
-    // Assign session-tagged tabs to their correct workspaces
+    // Assign session-tagged tabs to their correct workspaces (locked
+    // read-modify-write, same discipline as add/remove)
     const toHide = [];
     for (const [wspId, tabs] of byWsp) {
-      const wsp = await WSPStorageManager.getWorkspace(wspId);
-      for (const tab of tabs) {
-        if (!wsp.tabs.includes(tab.id)) wsp.tabs.push(tab.id);
-        await TabService.setTabSessionValue(tab.id, wspId);
-      }
-      await wsp._saveState();
+      let wspActive = false;
+      await WSPStorageManager.withWorkspaceLock(wspId, async () => {
+        const wsp = await WSPStorageManager.getWorkspace(wspId);
+        if (wsp.windowId == null) return; // destroyed meanwhile
+        for (const tab of tabs) {
+          if (!wsp.tabs.includes(tab.id)) wsp.tabs.push(tab.id);
+        }
+        await wsp._saveState();
+        wspActive = wsp.active;
+        console.log("[Brainer][_reconcileLateTabs] assigned", tabs.length, "tabs to workspace", wsp.name);
+      });
+      await Promise.all(tabs.map(tab => TabService.setTabSessionValue(tab.id, wspId)));
       // Keep tabSnapshot fresh for restart resilience (IC3) -- this site
       // mutates tabs[] without going through TabService.addTabToWorkspace.
       TabService._scheduleSnapshotRefresh(windowId, wspId);
-      if (!wsp.active) {
+      if (!wspActive) {
         toHide.push(...tabs.map(t => t.id));
       } else {
-        for (const tab of tabs) WorkspaceService._activeCache?.tabIds.add(tab.id);
+        for (const tab of tabs) WorkspaceService.addTabToActiveCache(tab.id);
       }
-      console.log("[Brainer][_reconcileLateTabs] assigned", tabs.length, "tabs to workspace", wsp.name);
     }
 
     // Assign untagged tabs to active workspace (last resort)
     if (noSession.length > 0 && activeWsp) {
-      const fresh = await WSPStorageManager.getWorkspace(activeWsp.id);
-      for (const tab of noSession) {
-        if (!fresh.tabs.includes(tab.id)) fresh.tabs.push(tab.id);
-        await TabService.setTabSessionValue(tab.id, activeWsp.id);
-        WorkspaceService._activeCache?.tabIds.add(tab.id);
-      }
-      await fresh._saveState();
+      await WSPStorageManager.withWorkspaceLock(activeWsp.id, async () => {
+        const fresh = await WSPStorageManager.getWorkspace(activeWsp.id);
+        if (fresh.windowId == null) return; // destroyed meanwhile
+        for (const tab of noSession) {
+          if (!fresh.tabs.includes(tab.id)) fresh.tabs.push(tab.id);
+        }
+        await fresh._saveState();
+      });
+      await Promise.all(noSession.map(tab => TabService.setTabSessionValue(tab.id, activeWsp.id)));
+      for (const tab of noSession) WorkspaceService.addTabToActiveCache(tab.id);
       // Keep tabSnapshot fresh for restart resilience (IC3).
       TabService._scheduleSnapshotRefresh(windowId, activeWsp.id);
       console.log("[Brainer][_reconcileLateTabs] assigned", noSession.length, "untagged tabs to active workspace");
@@ -1233,6 +1287,14 @@ class Brainer {
           console.log("[Brainer][onTabUpdated/pinned] skipped — state not ready");
           return;
         }
+        // An unpin mid-activation would run a locked addTabToWorkspace whose
+        // result the activation's deactivation save then overwrites (lost
+        // update). Skip like the other tab listeners; the catch-all in
+        // _hideInactiveFromList picks the tab up right after activation.
+        if (WorkspaceService.isActivating()) {
+          console.log("[Brainer][onTabUpdated/pinned] skipped — workspace activating");
+          return;
+        }
         const primaryId = await Brainer.getCachedPrimaryWindowId();
         if (primaryId !== tab.windowId) {
           console.log("[Brainer][onTabUpdated/pinned] skipped — not primary window");
@@ -1279,6 +1341,12 @@ class Brainer {
     browser.commands.onCommand.addListener(async (command) => {
       try {
         console.log("[Brainer][onCommand] command:", command);
+        // Keyboard-driven activation must not interleave with restore/repair:
+        // during that window the popup is gated too (handler state gate).
+        if (Brainer._state !== 'ready') {
+          console.log("[Brainer][onCommand] skipped — state not ready:", Brainer._state);
+          return;
+        }
         const windowId = (await browser.windows.getCurrent()).id;
         const workspaces = await WorkspaceService.getOrderedWorkspaces(windowId);
         console.log("[Brainer][onCommand] windowId:", windowId, "workspaces:", workspaces.length);
