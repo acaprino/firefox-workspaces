@@ -28,7 +28,10 @@ popup/            # Browser action popup
     ├── tooltip.js   # Tab preview tooltips on workspace hover
     └── drag-drop.js # Workspace reorder via drag & drop
 
-icons/            # Toolbar icons (layered-dark/light SVG + PNG fallbacks)
+icons/            # layered-{light,dark}.svg = toolbar (theme_icons, setIcon)
+                  # layered-{64,128}.png     = manifest `icons` key: AMO listing +
+                  #   about:addons. AMO renders PNG/JPEG only, never SVG -- export
+                  #   the PNGs from the SVG source, do not point `icons` at an SVG.
 ```
 
 **Load order matters:** `manifest.json` `background.scripts` array defines the order. `storage.js` must load first (others depend on `WSPStorageManager`). `brainer.js` and `handler.js` last.

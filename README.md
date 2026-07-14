@@ -110,7 +110,8 @@ popup/                       # Browser action popup
     tooltip.js               # Tab preview tooltips on workspace hover
     drag-drop.js             # Workspace reorder via drag and drop
 
-icons/                       # Toolbar icons (light/dark SVG + PNG fallbacks)
+icons/                       # layered-{light,dark}.svg: toolbar (theme-aware)
+                             # layered-{64,128}.png: AMO listing + about:addons (AMO rejects SVG)
 ```
 
 **Load order matters.** The `background.scripts` array in `manifest.json` defines execution order. `storage.js` loads first (all services depend on `WSPStorageManager`). `brainer.js` and `handler.js` load last.
