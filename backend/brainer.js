@@ -194,6 +194,8 @@ class Brainer {
       await MenuService.refreshTabMenu();
       if (primaryWindowId) await UIService.updateToolbarButton(primaryWindowId);
       console.log("[Brainer][initialize] done — final state:", Brainer._state);
+      // C-19 sweep, fire-and-forget: must not delay or fail startup.
+      Brainer._recoverOrphanWorkspaces().catch(() => {});
     } finally {
       // Always clear _initStarted, even on throw. Without this, any failure in
       // initialize() permanently blocks _onWindowCreated (which guards on
@@ -1112,6 +1114,51 @@ class Brainer {
       orphans.push(id);
     }
     return orphans;
+  }
+
+  // C-19 sweep: export and detach workspaces stranded under dead window ids
+  // (crash leftovers from pre-swap versions, or any historical corruption).
+  // Runs fire-and-forget after init settles: orphan records have no live
+  // tabs, so nothing here races the repair or snapshot-refresh machinery.
+  // Never throws. No popup banner by design -- the exported folders surface
+  // through the existing "Restore from bookmarks" flow.
+  static async _recoverOrphanWorkspaces() {
+    try {
+      const [snapshot, wins, primaryId, lastId] = await Promise.all([
+        browser.storage.local.get(null),
+        browser.windows.getAll(),
+        WSPStorageManager.getPrimaryWindowId(),
+        WSPStorageManager.getPrimaryWindowLastId(),
+      ]);
+      const orphanIds = Brainer._findOrphanWindowIds(snapshot, {
+        liveWindowIds: new Set(wins.map(w => w.id)),
+        primaryId,
+        lastId,
+      });
+      if (orphanIds.length === 0) return;
+      for (const windowId of orphanIds) {
+        const workspaces = await WSPStorageManager.getWorkspaces(windowId);
+        const exportable = workspaces.filter(w => (w.tabSnapshot || []).length > 0);
+        console.warn("[Brainer][_recoverOrphanWorkspaces] dead window", windowId,
+          "still owns", workspaces.length, "workspace(s),", exportable.length, "with snapshots");
+        if (exportable.length > 0) {
+          const exported = await Brainer._exportSnapshotsSafe(exportable);
+          if (exported.folders === 0 && !exported.deduped) {
+            // Export failed outright: keep the records so the next start
+            // retries. Detaching now would strand data with no bookmark copy.
+            console.warn("[Brainer][_recoverOrphanWorkspaces] export failed for window",
+              windowId, "-- keeping records for retry");
+            continue;
+          }
+        }
+        // Data (if any) is in bookmarks; drop only the window-keyed indexes.
+        // Per-workspace ld-wsp-{id} records stay for the diagnostics dump.
+        await WSPStorageManager.detachWindow(windowId);
+        console.warn("[Brainer][_recoverOrphanWorkspaces] detached dead window", windowId);
+      }
+    } catch (e) {
+      console.warn("[Brainer][_recoverOrphanWorkspaces] failed:", e?.message);
+    }
   }
 
   // Remove tab IDs from workspaces that no longer correspond to open tabs.
