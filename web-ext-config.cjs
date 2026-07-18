@@ -15,6 +15,8 @@ module.exports = {
     "scripts/**",
     "screenshots",
     "screenshots/**",
+    "tests",
+    "tests/**",
     "web-ext-artifacts",
     ".env",
     ".env.example",
