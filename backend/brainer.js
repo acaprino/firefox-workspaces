@@ -1094,6 +1094,26 @@ class Brainer {
     }
   }
 
+  // C-19: classify window-keyed workspace indexes against reality. A window
+  // key whose id is neither a live window, nor the primary, nor the armed
+  // restart signal (primaryWindowLastId) belongs to a window that will never
+  // come back -- its workspaces are invisible to every windowId-keyed
+  // recovery path. Pure function: all I/O stays in the caller.
+  static _findOrphanWindowIds(storageSnapshot, { liveWindowIds, primaryId, lastId }) {
+    const prefix = "ld-wsp-window-";
+    const orphans = [];
+    for (const [key, value] of Object.entries(storageSnapshot)) {
+      if (!key.startsWith(prefix)) continue;
+      const id = Number(key.slice(prefix.length));
+      if (!Number.isInteger(id)) continue;
+      if (!Array.isArray(value) || value.length === 0) continue;
+      if (id === primaryId || id === lastId) continue;
+      if (liveWindowIds.has(id)) continue;
+      orphans.push(id);
+    }
+    return orphans;
+  }
+
   // Remove tab IDs from workspaces that no longer correspond to open tabs.
   // Called during the "already-running" init path to handle non-clean restarts
   // where onWindowRemoved never fired (crash, kill, power loss).
