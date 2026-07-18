@@ -354,11 +354,16 @@ class Brainer {
         console.log("[Brainer][onWindowRemoved] windowId:", windowId);
         const primaryId = await WSPStorageManager.getPrimaryWindowId();
         if (primaryId === windowId) {
-          console.log("[Brainer][onWindowRemoved] primary window closed — flushing last active tab, clearing primary, saving lastId");
+          console.log("[Brainer][onWindowRemoved] primary window closed -- flushing last active tab, arming lastId, clearing primary");
           await WorkspaceService.flushLastActiveTab();
+          // Arm the restart signal BEFORE dropping the primary claim. A crash
+          // between these two writes then leaves BOTH keys set -- a state
+          // initialize() already handles via the stale-primary check --
+          // instead of NEITHER, which read as a first-ever startup and
+          // silently orphaned every workspace under the dead windowId (C-19).
+          await WSPStorageManager.setPrimaryWindowLastId(windowId);
           await WSPStorageManager.removePrimaryWindowId();
           Brainer._primaryWindowId = null;
-          await WSPStorageManager.setPrimaryWindowLastId(windowId);
           Brainer._state = 'uninitialized';
           console.log("[Brainer][onWindowRemoved] state reset to uninitialized");
         } else {
