@@ -135,6 +135,10 @@ export function loadBackend({ storageData = {}, overrides = {} } = {}) {
     // `crypto` (Web Crypto, e.g. crypto.randomUUID()) is a global in the MV2
     // background page; reuse Node's built-in implementation.
     crypto,
+    // `URL` is a global in the MV2 background page (TabService._isUrlAllowed
+    // parses with `new URL(...)`); a vm sandbox does not inherit it, so add it
+    // explicitly or every URL fails to parse and exports create zero folders.
+    URL,
     fetch: async () => ({ status: 200, text: async () => "<svg></svg>" }),
   };
   sandbox.globalThis = sandbox;

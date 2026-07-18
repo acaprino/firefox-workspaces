@@ -67,6 +67,8 @@ const LIMITS = {
   // live tabs.
   SESSION_LOSS_MIN_SNAPSHOT_URLS: 2,
   SESSION_LOSS_SURVIVAL_RATIO: 0.5,
+  // How many distinct export-set fingerprints to remember for dedup.
+  MAX_EXPORT_FINGERPRINTS: 8,
 };
 
 class WSPStorageManager {
@@ -221,16 +223,24 @@ class WSPStorageManager {
     if (typeof UIService !== "undefined") UIService.invalidateWarnBadgeCache();
   }
 
-  // ── Session-loss export fingerprint (idempotency for the automatic export) ──
+  // ── Session-loss export fingerprints (idempotency for automatic exports) ──
+  // Bounded list, not a single slot: the session-loss export and the orphan
+  // sweep (C-19) export different workspace sets; one slot would let each
+  // caller evict the other's record and re-export forever.
 
-  static async getSessionLossExportFingerprint() {
+  static async getSessionLossExportFingerprints() {
     const key = STORAGE_KEYS.sessionLossExport;
     const result = await browser.storage.local.get(key);
-    return result[key] || null;
+    const value = result[key];
+    if (typeof value === "string") return [value]; // pre-list dev format
+    return Array.isArray(value) ? value : [];
   }
 
-  static async setSessionLossExportFingerprint(fingerprint) {
-    await browser.storage.local.set({ [STORAGE_KEYS.sessionLossExport]: fingerprint });
+  static async addSessionLossExportFingerprint(fingerprint) {
+    const list = await WSPStorageManager.getSessionLossExportFingerprints();
+    if (!list.includes(fingerprint)) list.push(fingerprint);
+    while (list.length > LIMITS.MAX_EXPORT_FINGERPRINTS) list.shift();
+    await browser.storage.local.set({ [STORAGE_KEYS.sessionLossExport]: list });
   }
 
   // ── Closed Tabs (Tier 2) ──

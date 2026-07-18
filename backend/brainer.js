@@ -967,8 +967,8 @@ class Brainer {
   static async _exportSnapshotsSafe(workspaces) {
     try {
       const fingerprint = Brainer._snapshotFingerprint(workspaces);
-      const last = await WSPStorageManager.getSessionLossExportFingerprint();
-      if (last === fingerprint) {
+      const known = await WSPStorageManager.getSessionLossExportFingerprints();
+      if (known.includes(fingerprint)) {
         console.log("[Brainer][_exportSnapshotsSafe] identical snapshot content already exported -- skipping");
         return { folders: 0, urls: 0, deduped: true };
       }
@@ -976,7 +976,7 @@ class Brainer {
       console.log("[Brainer][_exportSnapshotsSafe] exported", result.urls,
         "URL(s) across", result.folders, "folder(s)");
       if (result.folders > 0) {
-        await WSPStorageManager.setSessionLossExportFingerprint(fingerprint);
+        await WSPStorageManager.addSessionLossExportFingerprint(fingerprint);
       }
       return { ...result, deduped: false };
     } catch (e) {
