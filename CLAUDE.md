@@ -111,6 +111,10 @@ web-ext build
 
 # Sign for distribution (requires .env with WEB_EXT_API_KEY/WEB_EXT_API_SECRET)
 web-ext sign --channel=unlisted
+
+# Run the test suite from the repo root (Node >= 20, no dependencies;
+# `node --test tests/` does NOT work on Node 21+)
+node --test
 ```
 
 No build step required - load directly via `about:debugging` -> "Load Temporary Add-on" -> select `manifest.json`.
@@ -125,7 +129,7 @@ No build step required - load directly via `about:debugging` -> "Load Temporary 
 4. **Container reopen race:** `TabService._reopenInContainer()` uses `_isReopening` + `_forceReopenIds` guards to prevent `onCreated` from double-assigning tabs during the close-reopen window.
 5. **Background page has no rendering context:** Theme dark/light detection via `-moz-Dialog` probe only works in the popup (which has a DOM). The popup forwards the result to background via `setDarkModeHint`.
 6. **MV2 only:** This extension uses `browser_action`, `background.scripts`, and `tabHide` - all MV2 APIs. No MV3 migration planned (Firefox still supports MV2).
-7. **Session-loss detection:** WebExtensions cannot read `about:config` prefs (e.g. "clear history on close", which also wipes the session store). Instead, Brainer detects the symptom at startup: restart likely + live content tabs present + zero session-tagged tabs + almost no `tabSnapshot` URL matches (single predicate: `Brainer._isSessionLost`, thresholds in `LIMITS`). On detection it exports snapshots to bookmarks BEFORE any snapshot refresh can overwrite them, then surfaces a warning (popup banner via the `lastRestoreError` surface with reason `session-not-restored`, plus a red "!" toolbar badge). The export is deduplicated via a persisted content fingerprint (`ld-wsp-session-loss-export`), because for a clear-history-on-close user the same loss is re-detected on EVERY start. Known blind spot: with only the default homepage open (`about:home` is a placeholder URL), the refuse-to-wipe guard trips instead.
+7. **Session-loss detection:** WebExtensions cannot read `about:config` prefs (e.g. "clear history on close", which also wipes the session store). Instead, Brainer detects the symptom at startup: restart likely + live content tabs present + zero session-tagged tabs + almost no `tabSnapshot` URL matches (single predicate: `Brainer._isSessionLost`, thresholds in `LIMITS`). On detection it exports snapshots to bookmarks BEFORE any snapshot refresh can overwrite them, then surfaces a warning (popup banner via the `lastRestoreError` surface with reason `session-not-restored`, plus a red "!" toolbar badge). The export is deduplicated via a persisted content fingerprint (`ld-wsp-session-loss-export`, bounded list), because for a clear-history-on-close user the same loss is re-detected on EVERY start. Known blind spot: with only the default homepage open (`about:home` is a placeholder URL), the refuse-to-wipe guard trips instead. A startup sweep (`Brainer._recoverOrphanWorkspaces`) additionally exports and detaches workspaces stranded under dead window ids (crash leftovers), reusing the same fingerprint dedup.
 8. **`lastRestoreError` write discipline:** every writer of the `ld-wsp-last-restore-error` key MUST go through `WSPStorageManager.setLastRestoreError`/`clearLastRestoreError` - they invalidate UIService's warn-badge cache at the single write point. A raw `browser.storage.local` write to that key silently desyncs the "!" toolbar badge.
 
 ---
