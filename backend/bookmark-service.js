@@ -61,13 +61,16 @@ class BookmarkService {
     return folderTitle;
   }
 
-  // Export orphaned workspaces' tabSnapshot URL lists as bookmark folders.
-  // Used by giveUpRestoreRetry: "give up" used to strand the ld-wsp-* records
-  // with no user-reachable copy of the data, even though the snapshots hold
-  // everything needed. Exported folders are restorable later through the
-  // normal restore-from-bookmarks flow. Returns the number of folders created.
+  // Export workspaces' tabSnapshot URL lists as bookmark folders. Used by the
+  // automatic session-loss safety net and by giveUpRestoreRetry: "give up"
+  // used to strand the ld-wsp-* records with no user-reachable copy of the
+  // data, even though the snapshots hold everything needed. Exported folders
+  // are restorable later through the normal restore-from-bookmarks flow.
+  // Returns { folders, urls } with the counts actually created, so callers
+  // can report partial success honestly instead of "all N URLs exported".
   static async exportSnapshots(workspaces) {
     let foldersCreated = 0;
+    let urlsCreated = 0;
     for (const wsp of workspaces) {
       try {
         const urls = (wsp.tabSnapshot || [])
@@ -78,21 +81,25 @@ class BookmarkService {
         const title = await BookmarkService._uniqueFolderTitle(
           parent, BookmarkService._sanitizeFolderTitle(wsp.name));
         const folder = await browser.bookmarks.create({ parentId: parent.id, title });
-        for (const url of urls) {
-          try {
-            await browser.bookmarks.create({ parentId: folder.id, title: url, url });
-          } catch (e) {
-            console.debug("[BookmarkService][exportSnapshots] failed for url:", url, e.message);
-          }
+        // Parallel creates with an explicit index to preserve snapshot order.
+        // Sequential awaits made large exports stretch the pre-ready startup
+        // window (this runs during 'restoring', when tab events no-op).
+        const results = await Promise.allSettled(urls.map((url, i) =>
+          browser.bookmarks.create({ parentId: folder.id, title: url, url, index: i })));
+        const created = results.filter(r => r.status === "fulfilled").length;
+        urlsCreated += created;
+        if (created < urls.length) {
+          console.debug("[BookmarkService][exportSnapshots]", urls.length - created,
+            "URL(s) failed to export for workspace:", wsp.name);
         }
         foldersCreated++;
-        console.log("[BookmarkService][exportSnapshots] exported", urls.length,
-          "snapshot URLs for workspace:", wsp.name);
+        console.log("[BookmarkService][exportSnapshots] exported", created, "of",
+          urls.length, "snapshot URLs for workspace:", wsp.name);
       } catch (e) {
         console.warn("[BookmarkService][exportSnapshots] failed for workspace:", wsp.id, e.message);
       }
     }
-    return foldersCreated;
+    return { folders: foldersCreated, urls: urlsCreated };
   }
 
   // Export a workspace's tabs as bookmarks under Workspaces/{workspace name}.

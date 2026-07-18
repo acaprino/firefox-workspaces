@@ -2,6 +2,8 @@
 // Note: the shared THEME_ACCENT_KEYS list and pickAccentFromThemeColors()
 // live in backend/theme-utils.js (loaded first via manifest background.scripts).
 const BADGE_FALLBACK_COLOR = "#0078D4";
+// Badge background while a restore-error / session-loss warning is pending.
+const BADGE_WARNING_COLOR = "#d70022";
 
 // Strict CSS color validator. Accepts hex (#abc / #aabbcc / #aabbccdd),
 // rgb()/rgba()/hsl()/hsla() with numeric args, and a small named-color
@@ -31,6 +33,54 @@ class UIService {
   // round-trip on every focus change, tab create, and tab remove, adding
   // sustained background traffic for users with high tab churn.
   static _cachedBadgeColor = null;
+  // Cached presence of the lastRestoreError surface, read on every toolbar
+  // update (hot path). null = unknown (re-read from storage on next update);
+  // reset to null via invalidateWarnBadgeCache() from
+  // WSPStorageManager.setLastRestoreError/clearLastRestoreError.
+  static _warnBadgeCache = null;
+
+  // Monotonic counter bumped whenever the warn state changes. updateToolbarButton
+  // snapshots it at entry and skips its badge writes if it changed mid-flight:
+  // without this, an in-flight update that captured the pre-warning state could
+  // overwrite a freshly raised "!" with a stale tab count (last-write-wins).
+  // Every bump site is followed by a refreshWarnBadge/updateToolbarButton call,
+  // so a skipped write is always repainted by the newer pass.
+  static _warnGeneration = 0;
+
+  // Accessor for the warn-badge cache so other layers (storage.js write
+  // points) don't touch the private field directly -- same precedent as
+  // Brainer.setRefuseToWipeActive.
+  static invalidateWarnBadgeCache() {
+    UIService._warnBadgeCache = null;
+    UIService._warnGeneration++;
+  }
+
+  // Force the warn badge on without a storage read. Used when storing the
+  // warning payload itself failed: the banner is lost for this session, but
+  // the toolbar can still signal that something happened. Self-corrects at
+  // the next invalidation (which re-reads storage).
+  static forceWarnBadge() {
+    UIService._warnBadgeCache = true;
+    UIService._warnGeneration++;
+  }
+
+  // Refresh the toolbar badge after a lastRestoreError write or clear.
+  // Resolves the target window (explicit -> primary -> last focused) so the
+  // refresh also works in the no-primary recovery states (refuse-to-wipe /
+  // phase4-failure), where getPrimaryWindowId() is null. Never throws.
+  static async refreshWarnBadge(windowId = null) {
+    try {
+      let target = windowId;
+      if (target == null) target = await WSPStorageManager.getPrimaryWindowId();
+      if (target == null) {
+        const win = await browser.windows.getLastFocused().catch(() => null);
+        target = win?.id ?? null;
+      }
+      if (target != null) await UIService.updateToolbarButton(target);
+    } catch (e) {
+      console.debug("[UIService][refreshWarnBadge] failed:", e?.message);
+    }
+  }
   // Dark-mode hint forwarded from the popup (popup has a real rendering context
   // where -moz-Dialog resolves correctly, unlike the hidden background page).
   // Set via "setDarkModeHint" message. null = no hint yet.
@@ -243,6 +293,27 @@ class UIService {
     const activeWsp = await WorkspaceService.getActiveWspFast(windowId);
     const badgeColor = await UIService._resolveBadgeColor(themeColors);
 
+    // Warning badge: while a restore-error / session-loss banner is pending,
+    // show "!" instead of the tab count so the user notices even without
+    // opening the popup. Cleared when the banner is dismissed (handler
+    // acknowledge/giveUp re-run this update after clearing the surface).
+    if (UIService._warnBadgeCache === null) {
+      try {
+        UIService._warnBadgeCache = (await WSPStorageManager.getLastRestoreError()) != null;
+      } catch (e) {
+        // Leave the cache null (= retry on the next update) per the tri-state
+        // contract; caching a definitive `false` here would suppress the
+        // warning badge until the next writer-side invalidation, which a
+        // pending un-dismissed warning has no reason to trigger.
+        console.debug("[UIService][updateToolbarButton] warn-badge lookup failed:", e?.message);
+      }
+    }
+    const warnBadge = UIService._warnBadgeCache === true;
+    // Snapshot for the stale-write guard: if the warn state changes while the
+    // awaits below are in flight, this pass skips its badge writes and leaves
+    // the paint to the newer pass that follows every state change.
+    const warnGen = UIService._warnGeneration;
+
     if (activeWsp) {
       console.log("[UIService][updateToolbarButton] activeWsp:", activeWsp.id,
         "name:", activeWsp.name, "icon:", activeWsp.icon || "(none)",
@@ -250,17 +321,23 @@ class UIService {
       await browser.browserAction.setTitle({ title: activeWsp.name });
 
       const tabCount = activeWsp.tabs.length;
-      await browser.browserAction.setBadgeText({ text: tabCount > 0 ? tabCount.toString() : "", windowId });
-      // setBadgeBackgroundColor throws on invalid color strings. Even though
-      // _pickAccentColor/_isSafeCssColor validate, wrap defensively so a
-      // malformed theme or future Firefox API change cannot break the whole
-      // toolbar update cascade (which is called from many hot paths).
-      try {
-        await browser.browserAction.setBadgeBackgroundColor({ color: badgeColor, windowId });
-      } catch (e) {
-        console.warn("[UIService][updateToolbarButton] setBadgeBackgroundColor rejected", badgeColor, "-- falling back:", e);
-        UIService._cachedBadgeColor = BADGE_FALLBACK_COLOR;
-        await browser.browserAction.setBadgeBackgroundColor({ color: BADGE_FALLBACK_COLOR, windowId }).catch(() => {});
+      const badgeText = warnBadge ? "!" : (tabCount > 0 ? tabCount.toString() : "");
+      const badgeBg = warnBadge ? BADGE_WARNING_COLOR : badgeColor;
+      if (UIService._warnGeneration === warnGen) {
+        await browser.browserAction.setBadgeText({ text: badgeText, windowId });
+        // setBadgeBackgroundColor throws on invalid color strings. Even though
+        // _pickAccentColor/_isSafeCssColor validate, wrap defensively so a
+        // malformed theme or future Firefox API change cannot break the whole
+        // toolbar update cascade (which is called from many hot paths).
+        try {
+          await browser.browserAction.setBadgeBackgroundColor({ color: badgeBg, windowId });
+        } catch (e) {
+          console.warn("[UIService][updateToolbarButton] setBadgeBackgroundColor rejected", badgeBg, "-- falling back:", e);
+          UIService._cachedBadgeColor = BADGE_FALLBACK_COLOR;
+          await browser.browserAction.setBadgeBackgroundColor({ color: BADGE_FALLBACK_COLOR, windowId }).catch(() => {});
+        }
+      } else {
+        console.log("[UIService][updateToolbarButton] warn state changed mid-flight -- badge write skipped");
       }
 
       const validIcon = activeWsp.icon && UIService._VALID_ICONS.has(activeWsp.icon) ? activeWsp.icon : null;
@@ -309,7 +386,18 @@ class UIService {
     } else {
       console.log("[UIService][updateToolbarButton] no active workspace for windowId:", windowId, "-> default icon + clear badge");
       await browser.browserAction.setTitle({ title: "Workspaces" });
-      await browser.browserAction.setBadgeText({ text: "" });
+      // Window-scoped like the active branch: a global write here would paint
+      // every window and only another pass through this branch could clear it.
+      if (UIService._warnGeneration === warnGen) {
+        if (warnBadge) {
+          await browser.browserAction.setBadgeText({ text: "!", windowId });
+          await browser.browserAction.setBadgeBackgroundColor({ color: BADGE_WARNING_COLOR, windowId }).catch(() => {});
+        } else {
+          await browser.browserAction.setBadgeText({ text: "", windowId });
+        }
+      } else {
+        console.log("[UIService][updateToolbarButton] warn state changed mid-flight -- badge write skipped");
+      }
       await UIService._setDefaultIcon(themeColors);
     }
     console.log("[UIService][updateToolbarButton] done for windowId:", windowId);

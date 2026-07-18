@@ -326,34 +326,63 @@ async function _handleMessage(message) {
       result = await WSPStorageManager.getLastRestoreError();
       console.log("[Handler] getLastRestoreError ->", result ? "present" : "none");
       return result;
-    case "acknowledgeLastRestoreError":
+    case "acknowledgeLastRestoreError": {
+      // Compare-and-clear: the popup echoes the `when` of the payload it
+      // displayed. A mismatch means the background replaced the warning while
+      // the popup was open (e.g. a session-loss flag landing after a stale
+      // refuse-to-wipe banner was rendered) -- clearing blindly would destroy
+      // a warning the user never saw. Old popups that send no `when` keep the
+      // unconditional behavior.
+      const ackWhen = Number.isFinite(message.when) ? message.when : null;
+      if (ackWhen != null) {
+        const pending = await WSPStorageManager.getLastRestoreError();
+        if (pending && Number.isFinite(pending.when) && pending.when !== ackWhen) {
+          console.log("[Handler] acknowledgeLastRestoreError -> stale ack ignored (payload changed since display)");
+          return { success: false, stale: true };
+        }
+      }
       await WSPStorageManager.clearLastRestoreError();
       Brainer.setRefuseToWipeActive(false);
+      // Drop the "!" warning badge now that the banner is dismissed. The
+      // helper falls back to the last-focused window when no primary exists
+      // (refuse-to-wipe / phase4-failure states).
+      await UIService.refreshWarnBadge();
       console.log("[Handler] acknowledgeLastRestoreError -> banner cleared, retry signal kept");
       return { success: true };
+    }
     case "giveUpRestoreRetry": {
+      // Compare-and-clear, same as acknowledgeLastRestoreError: this action
+      // is destructive (drops the retry signal), so a payload that changed
+      // while the confirm dialog was open must not be silently discarded.
+      const giveUpWhen = Number.isFinite(message.when) ? message.when : null;
+      if (giveUpWhen != null) {
+        const pending = await WSPStorageManager.getLastRestoreError();
+        if (pending && Number.isFinite(pending.when) && pending.when !== giveUpWhen) {
+          console.log("[Handler] giveUpRestoreRetry -> stale request ignored (payload changed since display)");
+          return { success: false, stale: true };
+        }
+      }
       // Before orphaning the old records, export their URL snapshots to
       // bookmark folders: the extension holds everything needed to rebuild
       // (names + ordered URL lists), and "give up" used to discard the only
       // user-reachable copy. Exported folders are restorable later via the
-      // normal restore-from-bookmarks flow. Best-effort: a bookmarks failure
-      // must not block the user from clearing the retry loop.
-      let exportedWorkspaces = 0;
-      try {
-        const lastId = await WSPStorageManager.getPrimaryWindowLastId();
-        if (lastId != null) {
-          const orphans = await WSPStorageManager.getWorkspaces(lastId);
-          exportedWorkspaces = await BookmarkService.exportSnapshots(orphans);
-        }
-      } catch (e) {
-        console.warn("[Handler] giveUpRestoreRetry snapshot export failed:", e?.message);
+      // normal restore-from-bookmarks flow. _exportSnapshotsSafe never throws
+      // and dedupes against the automatic session-loss export, so a loss that
+      // was already backed up is not duplicated here.
+      let exported = { folders: 0, urls: 0, deduped: false };
+      const lastId = await WSPStorageManager.getPrimaryWindowLastId();
+      if (lastId != null) {
+        const orphans = await WSPStorageManager.getWorkspaces(lastId);
+        exported = await Brainer._exportSnapshotsSafe(orphans);
       }
       await WSPStorageManager.clearLastRestoreError();
       await WSPStorageManager.removePrimaryWindowLastId();
       Brainer.setRefuseToWipeActive(false);
+      await UIService.refreshWarnBadge();
       console.log("[Handler] giveUpRestoreRetry -> banner + retry signal cleared,",
-        exportedWorkspaces, "workspace snapshot(s) exported to bookmarks");
-      return { success: true, exportedWorkspaces };
+        exported.folders, "workspace snapshot(s) exported to bookmarks",
+        exported.deduped ? "(deduped -- already exported)" : "");
+      return { success: true, exportedWorkspaces: exported.folders, alreadyExported: exported.deduped };
     }
 
     // Diagnostic dump for incident response. Returns every ld-wsp-* key plus

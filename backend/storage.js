@@ -46,6 +46,12 @@ const STORAGE_KEYS = {
   // guard trips so the popup can show an explanatory banner. Cleared on
   // successful activate/restore.
   lastRestoreError: 'ld-wsp-last-restore-error',
+  // Fingerprint of the last successful session-loss snapshot export. Makes the
+  // automatic bookmark export idempotent across restarts: for a user whose
+  // session store is wiped on every start ("clear history on close"), the same
+  // loss would otherwise be re-detected and re-exported into new bookmark
+  // folders on every launch.
+  sessionLossExport: 'ld-wsp-session-loss-export',
 };
 
 const LIMITS = {
@@ -54,6 +60,13 @@ const LIMITS = {
   RESTORE_DELAY_MS: 500,
   RESTORE_WINDOW_DELAY_MS: 600,
   FORCE_REOPEN_SAFETY_VALVE: 50,
+  // Session-loss detection thresholds (Brainer._isSessionLost). Below
+  // MIN_SNAPSHOT_URLS there is too little evidence to distinguish a lost
+  // session from a fresh profile; a session counts as lost only when fewer
+  // than SURVIVAL_RATIO of the recorded snapshot URLs are found among the
+  // live tabs.
+  SESSION_LOSS_MIN_SNAPSHOT_URLS: 2,
+  SESSION_LOSS_SURVIVAL_RATIO: 0.5,
 };
 
 class WSPStorageManager {
@@ -194,10 +207,30 @@ class WSPStorageManager {
   static async setLastRestoreError(payload) {
     const key = STORAGE_KEYS.lastRestoreError;
     await browser.storage.local.set({ [key]: payload });
+    // Layering exception: UIService caches this key's presence for the "!"
+    // toolbar badge (hot path). Invalidating here, at the single write point,
+    // beats sprinkling resets across every call site. UIService is defined by
+    // the time any of this runs (all background scripts load before init).
+    // Every writer of this key MUST go through set/clearLastRestoreError or
+    // the badge cache silently desyncs.
+    if (typeof UIService !== "undefined") UIService.invalidateWarnBadgeCache();
   }
 
   static async clearLastRestoreError() {
     await browser.storage.local.remove(STORAGE_KEYS.lastRestoreError);
+    if (typeof UIService !== "undefined") UIService.invalidateWarnBadgeCache();
+  }
+
+  // ── Session-loss export fingerprint (idempotency for the automatic export) ──
+
+  static async getSessionLossExportFingerprint() {
+    const key = STORAGE_KEYS.sessionLossExport;
+    const result = await browser.storage.local.get(key);
+    return result[key] || null;
+  }
+
+  static async setSessionLossExportFingerprint(fingerprint) {
+    await browser.storage.local.set({ [STORAGE_KEYS.sessionLossExport]: fingerprint });
   }
 
   // ── Closed Tabs (Tier 2) ──

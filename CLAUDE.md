@@ -10,12 +10,14 @@
 
 ```
 backend/          # Background scripts (loaded in order by manifest.json)
+├── theme-utils.js # Shared theme helpers (accent keys, luminance) - also loaded by the popup
 ├── storage.js    # WSPStorageManager - browser.storage.local wrapper
 ├── workspace.js  # Workspace entity (create, activate, hide, destroy)
 ├── ui-service.js       # Toolbar button icon, badge, SVG cache, theme detection
 ├── menu-service.js     # Tab context menu ("Move Tab to…") + omnibox
 ├── workspace-service.js # Workspace CRUD, activate/deactivate, container binding
 ├── tab-service.js      # Tab add/remove/move, search, closed tabs, sessions, container reopen
+├── bookmark-service.js # Export/restore workspaces as bookmark folders (incl. session-loss safety net)
 ├── brainer.js          # Orchestrator - init, event listener registration, restart recovery
 └── handler.js          # Message router (popup <-> background)
 
@@ -34,7 +36,7 @@ icons/            # layered-{light,dark}.svg = toolbar (theme_icons, setIcon)
                   #   the PNGs from the SVG source, do not point `icons` at an SVG.
 ```
 
-**Load order matters:** `manifest.json` `background.scripts` array defines the order. `storage.js` must load first (others depend on `WSPStorageManager`). `brainer.js` and `handler.js` last.
+**Load order matters:** `manifest.json` `background.scripts` array defines the order. `theme-utils.js` loads first, then `storage.js` (the other services depend on `WSPStorageManager`). `brainer.js` and `handler.js` last.
 
 ---
 
@@ -88,6 +90,13 @@ Messages use `browser.runtime.sendMessage({ action, ... })`. Handler dispatches 
 | `searchTabs` | Search tabs across all workspaces |
 | `getTabPreviews` | Get tab title/URL previews for tooltip |
 | `setDarkModeHint` | Forward popup's dark mode detection to background |
+| `exportWorkspaceToBookmarks` | Save a workspace's open tabs as a bookmarks folder |
+| `getBookmarkWorkspaces` | List restorable folders under Other Bookmarks > Workspaces |
+| `restoreWorkspaceFromBookmarks` | Recreate a workspace from a bookmarks folder |
+| `getLastRestoreError` | Read the pending restore-error/warning payload (banner) |
+| `acknowledgeLastRestoreError` | Dismiss the banner (compare-and-clear via `when` echo; refreshes the "!" badge) |
+| `giveUpRestoreRetry` | Drop the restore-retry signal; exports orphan snapshots to bookmarks first |
+| `getDiagnostics` | Dump all ld-wsp-* storage keys for incident response |
 
 ---
 
@@ -116,6 +125,8 @@ No build step required - load directly via `about:debugging` -> "Load Temporary 
 4. **Container reopen race:** `TabService._reopenInContainer()` uses `_isReopening` + `_forceReopenIds` guards to prevent `onCreated` from double-assigning tabs during the close-reopen window.
 5. **Background page has no rendering context:** Theme dark/light detection via `-moz-Dialog` probe only works in the popup (which has a DOM). The popup forwards the result to background via `setDarkModeHint`.
 6. **MV2 only:** This extension uses `browser_action`, `background.scripts`, and `tabHide` - all MV2 APIs. No MV3 migration planned (Firefox still supports MV2).
+7. **Session-loss detection:** WebExtensions cannot read `about:config` prefs (e.g. "clear history on close", which also wipes the session store). Instead, Brainer detects the symptom at startup: restart likely + live content tabs present + zero session-tagged tabs + almost no `tabSnapshot` URL matches (single predicate: `Brainer._isSessionLost`, thresholds in `LIMITS`). On detection it exports snapshots to bookmarks BEFORE any snapshot refresh can overwrite them, then surfaces a warning (popup banner via the `lastRestoreError` surface with reason `session-not-restored`, plus a red "!" toolbar badge). The export is deduplicated via a persisted content fingerprint (`ld-wsp-session-loss-export`), because for a clear-history-on-close user the same loss is re-detected on EVERY start. Known blind spot: with only the default homepage open (`about:home` is a placeholder URL), the refuse-to-wipe guard trips instead.
+8. **`lastRestoreError` write discipline:** every writer of the `ld-wsp-last-restore-error` key MUST go through `WSPStorageManager.setLastRestoreError`/`clearLastRestoreError` - they invalidate UIService's warn-badge cache at the single write point. A raw `browser.storage.local` write to that key silently desyncs the "!" toolbar badge.
 
 ---
 
@@ -124,4 +135,4 @@ No build step required - load directly via `about:debugging` -> "Load Temporary 
 - Always bump the patch version in `manifest.json` before building/signing for AMO - AMO rejects re-submissions of the same version.
 - Do NOT invent workarounds (enterprise policies, proxy files). Follow the established workflow.
 - Always verify file paths exist before referencing them.
-- NEVER use the em dash character anywhere - in code, comments, commit messages, or documentation. Use a regular hyphen `-` or double hyphen `--` instead.
+- NEVER use the em dash character in NEW text - code, comments, commit messages, or documentation. Use a regular hyphen `-` or double hyphen `--` instead. (Older files still contain em dashes; do not mass-rewrite them, just keep new text clean.)

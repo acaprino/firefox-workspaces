@@ -238,15 +238,19 @@ class WorkspaceUI {
     console.log("[WorkspaceUI][initialize] done");
   }
 
-  // Render an inline banner if the previous restart aborted via the
-  // refuse-to-wipe guard (see backend/brainer.js _restoreWorkspaces).
+  // Render an inline banner when a restore-error payload is pending (see
+  // backend/brainer.js: refuse-to-wipe, phase4-failure, session-not-restored).
   //
-  // Two user actions are exposed:
-  //   - Dismiss (acknowledgeLastRestoreError): clears the banner only. The
-  //     restart-retry signal stays armed; the next Firefox restart will try
-  //     again.
+  // User actions:
+  //   - Dismiss (acknowledgeLastRestoreError): clears the banner. For the two
+  //     retry-able reasons the restart-retry signal stays armed.
   //   - Give up (giveUpRestoreRetry): clears the banner AND the retry signal
-  //     (destructive; old workspaces become orphaned). Confirms first.
+  //     (destructive; old workspaces become orphaned). Confirms first. Hidden
+  //     for session-not-restored, where there is no retry to give up on.
+  // Both actions echo the displayed payload's `when` so the background can
+  // refuse a stale dismiss (compare-and-clear): if a fresh warning replaced
+  // the displayed one mid-popup, the newer payload survives and is re-shown.
+  // The banner stays in sync with the background via storage.onChanged.
   async _setupRestoreErrorBanner() {
     const banner = document.getElementById("wsp-error-banner");
     if (!banner) return;
@@ -257,7 +261,6 @@ class WorkspaceUI {
       console.debug("[WSP][_setupRestoreErrorBanner] getLastRestoreError failed:", e?.message);
       return;
     }
-    if (!info) return;
     // Popup may have been torn down while we awaited the background reply.
     // Re-fetch DOM nodes after the await and bail if any are missing.
     const text = document.getElementById("wsp-error-banner-text");
@@ -269,29 +272,100 @@ class WorkspaceUI {
     // Storage values can be edited via about:debugging; validate before
     // formatting them into user-visible text.
     const isFiniteNum = (v) => typeof v === "number" && Number.isFinite(v);
-    const when = isFiniteNum(info.when) ? new Date(info.when).toLocaleString() : "earlier";
-    const wspCount = isFiniteNum(info.wspCount) ? info.wspCount : "?";
-    const urlCount = isFiniteNum(info.snapshotUrlCount) ? info.snapshotUrlCount : "?";
-    const reason = info.reason === "phase4-failure"
-      ? `A previous restore attempt failed mid-way at ${when}.`
-      : `Workspace restore was paused at ${when} to prevent data loss.`;
-    text.textContent =
-      `${reason} ${wspCount} workspace(s) had ${urlCount} previously open URL(s) recorded. ` +
-      `User data was left untouched. ` +
-      `Try restarting Firefox to retry the restore. ` +
-      `Use "Give up" only if you no longer need the workspaces from before the failed restart.`;
-    banner.hidden = false;
+    // `when` of the payload currently rendered; echoed with dismiss/give-up.
+    let displayedWhen = null;
 
+    const render = (payload) => {
+      if (!payload) {
+        displayedWhen = null;
+        banner.hidden = true;
+        return;
+      }
+      displayedWhen = isFiniteNum(payload.when) ? payload.when : null;
+      const when = isFiniteNum(payload.when) ? new Date(payload.when).toLocaleString() : "earlier";
+      const wspCount = isFiniteNum(payload.wspCount) ? payload.wspCount : "?";
+      const urlCount = isFiniteNum(payload.snapshotUrlCount) ? payload.snapshotUrlCount : "?";
+      const exportedUrls = isFiniteNum(payload.exportedUrls) ? payload.exportedUrls : null;
+      const exportedNote = (folders) => {
+        if (folders <= 0) return `No tab list could be exported to bookmarks. `;
+        // Honest counts: the export filters non-bookmarkable URLs and can
+        // partially fail, so prefer the actual exported-URL count when the
+        // background provided it.
+        const counts = exportedUrls != null && exportedUrls !== urlCount
+          ? `${exportedUrls} of ${urlCount} URL(s)`
+          : `${urlCount} URL(s)`;
+        return `The saved tab lists (${counts}) were exported to bookmarks under ` +
+          `"Workspaces", use "Restore from bookmarks" to reopen them. `;
+      };
+      if (payload.reason === "session-not-restored") {
+        // Session-loss warning: the browser started without restoring the
+        // previous session, so the old workspace tabs are gone for good.
+        // There is no retry to give up on, so only "Dismiss" applies.
+        const exported = isFiniteNum(payload.exportedWorkspaces) ? payload.exportedWorkspaces : 0;
+        const cause = payload.privateBrowsing === true
+          ? `This browser runs in permanent private browsing mode, which disables session restore.`
+          : `This usually means "Clear history when the browser closes" is enabled ` +
+            `(it also deletes the saved session), or "Open previous windows and tabs" is off. ` +
+            `Check Settings > Privacy & Security > History.`;
+        text.textContent =
+          `The browser started at ${when} without restoring the previous session, ` +
+          `so the tabs of ${wspCount} workspace(s) could not be brought back. ` +
+          `${exportedNote(exported)}${cause}`;
+        giveUpBtn.hidden = true;
+      } else {
+        const reason = payload.reason === "phase4-failure"
+          ? `A previous restore attempt failed mid-way at ${when}.`
+          : `Workspace restore was paused at ${when} to prevent data loss.`;
+        // A phase4 failure that happened on a session-loss start carries the
+        // verdict: retrying cannot bring the tabs back, but the bookmark
+        // backup already exists -- say so instead of plain retry advice.
+        const lossNote = payload.sessionLost === true
+          ? ` Note: the previous session itself was not restored, so the lost tabs ` +
+            `cannot come back via retry. ` +
+            exportedNote(isFiniteNum(payload.exportedWorkspaces) ? payload.exportedWorkspaces : 0)
+          : ` Try restarting Firefox to retry the restore. `;
+        text.textContent =
+          `${reason} ${wspCount} workspace(s) had ${urlCount} previously open URL(s) recorded. ` +
+          `User data was left untouched.` + lossNote +
+          `Use "Give up" only if you no longer need the workspaces from before the failed restart.`;
+        giveUpBtn.hidden = false;
+      }
+      banner.hidden = false;
+    };
+
+    // Keep the banner in sync with the background for the popup's lifetime:
+    // a warning raised or replaced after open (slow session-loss export, a
+    // restore committing mid-popup) re-renders instead of going stale. The
+    // key literal matches STORAGE_KEYS.lastRestoreError in backend/storage.js
+    // (the popup does not load backend scripts).
+    const LAST_RESTORE_ERROR_KEY = "ld-wsp-last-restore-error";
+    browser.storage.onChanged.addListener((changes, area) => {
+      if (area !== "local" || !(LAST_RESTORE_ERROR_KEY in changes)) return;
+      render(changes[LAST_RESTORE_ERROR_KEY].newValue || null);
+    });
+
+    // Bind the action listeners BEFORE the first render: a warning can arrive
+    // after open via storage.onChanged, and its banner must have live buttons.
     copyBtn.addEventListener("click", () => {
       this._copyDiagnostics();
     });
     ackBtn.addEventListener("click", async () => {
       // Optimistic UI: hide the banner immediately so the user sees feedback
-      // even if the background storage write is slow. acknowledge is best-
-      // effort and idempotent.
+      // even if the background storage write is slow. On failure or a stale
+      // ack (payload changed since display) re-sync from storage so the
+      // banner and the toolbar badge cannot disagree.
       banner.hidden = true;
-      try { await this._callBackgroundTask("acknowledgeLastRestoreError"); }
-      catch (e) { console.debug("[WSP][acknowledge] failed:", e?.message); }
+      try {
+        const result = await this._callBackgroundTask("acknowledgeLastRestoreError", { when: displayedWhen });
+        if (result && result.stale) {
+          const fresh = await this._callBackgroundTask("getLastRestoreError");
+          render(fresh);
+        }
+      } catch (e) {
+        console.debug("[WSP][acknowledge] failed:", e?.message);
+        try { render(await this._callBackgroundTask("getLastRestoreError")); }
+        catch { banner.hidden = false; }
+      }
     });
     giveUpBtn.addEventListener("click", async () => {
       // showCustomDialog returns true on OK, false on Cancel for no-input dialogs.
@@ -307,16 +381,28 @@ class WorkspaceUI {
       if (!ok) return;
       banner.hidden = true;
       try {
-        const result = await this._callBackgroundTask("giveUpRestoreRetry");
+        const result = await this._callBackgroundTask("giveUpRestoreRetry", { when: displayedWhen });
+        if (result && result.stale) {
+          const fresh = await this._callBackgroundTask("getLastRestoreError");
+          render(fresh);
+          return;
+        }
         if (result && result.exportedWorkspaces > 0) {
           await showCustomDialog({
             message: `Saved ${result.exportedWorkspaces} workspace(s) to bookmarks ` +
               `under "Workspaces". Restore them any time via "Restore from bookmarks".`
           });
+        } else if (result && result.alreadyExported) {
+          await showCustomDialog({
+            message: `The workspace tab lists were already saved to bookmarks under ` +
+              `"Workspaces". Restore them any time via "Restore from bookmarks".`
+          });
         }
       }
       catch (e) { console.debug("[WSP][giveUpRestoreRetry] failed:", e?.message); }
     });
+
+    render(info);
   }
 
   _setupDiagnosticsLink() {

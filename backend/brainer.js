@@ -72,9 +72,12 @@ class Brainer {
       // (or the extension) restarted -- no matter how the previous session
       // ended. This complements the onWindowRemoved-based lastId signal,
       // which unclean shutdowns (crash, kill, power loss) bypass entirely.
-      // Used only to arm `restartLikely` for the repair pass; a false
-      // positive on a plain extension reload is harmless because the repair
-      // is a no-op when stored arrays already agree with session values.
+      // Arms `restartLikely` for the repair pass AND the session-loss
+      // detector. A false positive on a plain extension reload is harmless
+      // only while session tags stay readable: the repair is a no-op when
+      // stored arrays agree with session values, and _isSessionLost bails on
+      // any tagged tab and treats thrown session lookups as indeterminate
+      // rather than as evidence of loss.
       let sessionRestartEvidence = false;
       try {
         const sentinel = await browser.storage.session.get("wsp-session-alive");
@@ -598,11 +601,16 @@ class Brainer {
     console.log("[Brainer][_restoreWorkspaces] tabs in window:", newTabs.length);
 
     const sessionMap = new Map();
+    // Thrown lookups are counted separately from "no value": a degraded
+    // sessions API must not read as "zero tagged tabs" to the session-loss
+    // detector below (a throw is not evidence of absence).
+    let sessionLookupFailures = 0;
     await Promise.all(newTabs.map(async (tab) => {
       try {
         const wspId = await browser.sessions.getTabValue(tab.id, "wspId");
         if (wspId) sessionMap.set(tab.id, wspId);
       } catch (e) {
+        sessionLookupFailures++;
         console.debug("[Brainer] session lookup failed for tab", tab.id, ":", e.message);
       }
     }));
@@ -698,6 +706,7 @@ class Brainer {
 
     const totalAssigned = [...assigned.values()].reduce((n, a) => n + a.length, 0);
     const hadRecoverableData = wspData.some(w => w.tabSnapshot.length > 0);
+    const snapshotUrlCount = wspData.reduce((n, w) => n + w.tabSnapshot.length, 0);
     console.log("[Brainer][_restoreWorkspaces] in-memory assignment:",
       [...assigned.entries()].map(([id, tabs]) => `${id.slice(0,8)}:${tabs.length}`).join(" "),
       `unmatched=${unmatchedTabs.length} totalAssigned=${totalAssigned} hadRecoverable=${hadRecoverableData}`);
@@ -719,7 +728,7 @@ class Brainer {
         oldWindowId,
         newWindowId: window.id,
         wspCount: wspData.length,
-        snapshotUrlCount: wspData.reduce((n, w) => n + w.tabSnapshot.length, 0),
+        snapshotUrlCount,
         liveTabCount: newTabs.length,
         liveContentTabCount: liveContentTabs.length,
         unmatchedTabCount: unmatchedTabs.length,
@@ -730,11 +739,48 @@ class Brainer {
       // Surface as banner. Storage failure here is not fatal; we still throw.
       try { await WSPStorageManager.setLastRestoreError(errorPayload); }
       catch (writeErr) { console.error("[Brainer][_restoreWorkspaces] failed to surface refuse-to-wipe banner:", writeErr); }
+      // Paint the "!" badge proactively -- in this state no primary window
+      // exists, so without this only an incidental focus change would show it.
+      UIService.refreshWarnBadge().catch(() => {});
       Brainer._refuseToWipeActive = true;
       throw new Error(
         `Refuse-to-wipe: would recreate ${wspData.length} workspaces with 0 tabs ` +
         `while ${errorPayload.snapshotUrlCount} snapshot URLs exist; user data left untouched.`
       );
+    }
+
+    // ── Phase 3b: session-loss detection. ──
+    // The refuse-to-wipe guard above only trips when the window has NO live
+    // content tabs (session-restore lag). When the browser starts WITHOUT
+    // restoring the previous session at all -- e.g. "Clear history when the
+    // browser closes" also wipes the session store, or permanent private
+    // browsing -- the window comes up with a homepage or fresh browsing, so
+    // live content tabs DO exist while zero tabs carry session values and
+    // (almost) no snapshot URL is present. The old tabs are gone for good; a
+    // restart retry cannot bring them back. So: save the snapshots to
+    // bookmarks NOW (before tab activity refreshes them away), let the
+    // restore continue with what is actually there, and surface a warning
+    // banner + toolbar badge after the final commit. The export is
+    // fingerprint-deduplicated (_exportSnapshotsSafe), so the recurring loss
+    // this user's configuration produces on every start does not pile up
+    // duplicate bookmark folders or re-arm a banner for the same loss.
+    // Known blind spot: a clear-history-on-close user whose only startup tab
+    // is the default homepage (about:home, a placeholder URL) lands in
+    // refuse-to-wipe above instead, because zero live content tabs are
+    // indistinguishable from session-restore lag.
+    const sessionLost = Brainer._isSessionLost({
+      snapshotUrlCount,
+      taggedCount: [...sessionMap.values()].filter(v => wspIdSet.has(v)).length,
+      survivingUrlCount: totalAssigned,
+      liveContentCount: liveContentTabs.length,
+      lookupFailures: sessionLookupFailures,
+    });
+    let sessionLossExport = null;
+    if (sessionLost) {
+      console.warn("[Brainer][_restoreWorkspaces] SESSION-LOSS detected --",
+        snapshotUrlCount, "snapshot URL(s) but", totalAssigned,
+        "assigned and 0 session-tagged; exporting snapshots to bookmarks before continuing");
+      sessionLossExport = await Brainer._exportSnapshotsSafe(wspData);
     }
 
     // ── Phase 4: writes. From here on we mutate storage. Wrapped in a single
@@ -825,6 +871,23 @@ class Brainer {
       await WSPStorageManager.removePrimaryWindowLastId();
       await WSPStorageManager.clearLastRestoreError();
       Brainer._refuseToWipeActive = false;
+      if (sessionLost) {
+        if (sessionLossExport?.deduped) {
+          // Same loss content as the last announced one (the steady state for
+          // a clear-history-on-close user): the bookmarks already exist and
+          // the user already saw -- or dismissed -- the banner. Re-arming it
+          // on every start would just train the user to ignore it.
+          console.log("[Brainer][_restoreWorkspaces] session loss unchanged since last export -- banner not re-armed");
+        } else {
+          await Brainer._flagSessionLoss({
+            windowId: window.id,
+            wspCount: wspData.length,
+            snapshotUrlCount,
+            exportedWorkspaces: sessionLossExport?.folders ?? 0,
+            exportedUrls: sessionLossExport?.urls ?? 0,
+          });
+        }
+      }
       console.log("[Brainer][_restoreWorkspaces] done");
     } catch (e) {
       // Phase 4 failed mid-way. Surface as a banner so the user knows what
@@ -837,11 +900,192 @@ class Brainer {
         newWindowId: window.id,
         error: String(e?.message ?? e),
       };
+      // Carry the session-loss verdict into the failure payload: the retry
+      // advice is wrong for a wiped session store, and the popup should tell
+      // the user the bookmark backup already exists.
+      if (sessionLost) {
+        errorPayload.sessionLost = true;
+        errorPayload.exportedWorkspaces = sessionLossExport?.folders ?? 0;
+        errorPayload.exportedUrls = sessionLossExport?.urls ?? 0;
+      }
       console.error("[Brainer][_restoreWorkspaces] Phase 4 threw -- payload:", JSON.stringify(errorPayload), "error:", e);
       try { await WSPStorageManager.setLastRestoreError(errorPayload); }
       catch (writeErr) { console.error("[Brainer][_restoreWorkspaces] failed to surface phase4 banner:", writeErr); }
+      UIService.refreshWarnBadge().catch(() => {});
       Brainer._refuseToWipeActive = true;
       throw e;
+    }
+  }
+
+  // Single source of truth for the session-loss verdict. Both detection paths
+  // (Phase 3b of _restoreWorkspaces and _detectSessionLoss) feed their
+  // evidence through here so the thresholds and semantics can never drift.
+  //  - snapshotUrlCount:  URLs recorded across all workspace tabSnapshots
+  //  - taggedCount:       open tabs whose session value names a stored workspace
+  //  - survivingUrlCount: snapshot URLs found among live tab URLs, counted by
+  //                       consumption (each snapshot entry matches at most one tab)
+  //  - liveContentCount:  live non-placeholder tabs (0 = refuse-to-wipe territory)
+  //  - lookupFailures:    sessions.getTabValue calls that THREW. A throw is
+  //                       not evidence of absence: with zero tags and failed
+  //                       lookups the verdict is indeterminate, not "lost".
+  static _isSessionLost({ snapshotUrlCount, taggedCount, survivingUrlCount,
+                          liveContentCount, lookupFailures = 0 }) {
+    if (snapshotUrlCount < LIMITS.SESSION_LOSS_MIN_SNAPSHOT_URLS) return false;
+    if (taggedCount > 0) return false;
+    if (lookupFailures > 0) return false;
+    if (liveContentCount === 0) return false;
+    return survivingUrlCount < snapshotUrlCount * LIMITS.SESSION_LOSS_SURVIVAL_RATIO;
+  }
+
+  // Stable fingerprint of the exportable snapshot content. Used to make the
+  // automatic bookmark export idempotent: the same loss re-observed on a later
+  // start (identical workspace ids + snapshot URLs) is not exported again.
+  static _snapshotFingerprint(workspaces) {
+    const parts = workspaces
+      .map(w => w.id + ":" + (w.tabSnapshot || []).join("\n"))
+      .sort()
+      .join("\n\n");
+    let h = 5381;
+    for (let i = 0; i < parts.length; i++) {
+      h = ((h << 5) + h + parts.charCodeAt(i)) >>> 0;
+    }
+    return h + ":" + parts.length;
+  }
+
+  // Best-effort bookmark export of workspace URL snapshots. Never throws:
+  // the export is a safety net and must not block restore/repair.
+  // Deduplicated via a persisted content fingerprint -- for a user whose
+  // session store is wiped on every start, the same loss is re-detected at
+  // every launch and would otherwise mint duplicate folders without bound.
+  // Returns { folders, urls, deduped }; a failed export returns zeros WITHOUT
+  // storing the fingerprint, so the next start retries.
+  static async _exportSnapshotsSafe(workspaces) {
+    try {
+      const fingerprint = Brainer._snapshotFingerprint(workspaces);
+      const last = await WSPStorageManager.getSessionLossExportFingerprint();
+      if (last === fingerprint) {
+        console.log("[Brainer][_exportSnapshotsSafe] identical snapshot content already exported -- skipping");
+        return { folders: 0, urls: 0, deduped: true };
+      }
+      const result = await BookmarkService.exportSnapshots(workspaces);
+      console.log("[Brainer][_exportSnapshotsSafe] exported", result.urls,
+        "URL(s) across", result.folders, "folder(s)");
+      if (result.folders > 0) {
+        await WSPStorageManager.setSessionLossExportFingerprint(fingerprint);
+      }
+      return { ...result, deduped: false };
+    } catch (e) {
+      console.error("[Brainer][_exportSnapshotsSafe] export failed:", e?.message);
+      return { folders: 0, urls: 0, deduped: false };
+    }
+  }
+
+  // Surface the session-loss warning: popup banner (via the lastRestoreError
+  // surface, with its own `reason` so the popup words it correctly and hides
+  // the retry actions) plus the "!" toolbar badge.
+  static async _flagSessionLoss(details) {
+    // "Permanent private browsing" is only a safe diagnosis when EVERY window
+    // is private -- a single incognito window picked as restore window proves
+    // nothing about the pref. Computed here so both detection paths agree.
+    let privateBrowsing = false;
+    try {
+      const wins = await browser.windows.getAll();
+      privateBrowsing = wins.length > 0 && wins.every(w => w.incognito);
+    } catch (e) {
+      console.debug("[Brainer][_flagSessionLoss] windows.getAll failed:", e?.message);
+    }
+    const payload = {
+      when: Date.now(),
+      reason: "session-not-restored",
+      privateBrowsing,
+      ...details,
+    };
+    console.warn("[Brainer][_flagSessionLoss] payload:", JSON.stringify(payload));
+    try {
+      await WSPStorageManager.setLastRestoreError(payload);
+    } catch (e) {
+      // The banner is gone for this session, but the badge can still signal:
+      // force the cache to "warning pending" so the user gets at least the
+      // toolbar-level cue that something happened to their tabs.
+      console.error("[Brainer][_flagSessionLoss] failed to store warning:", e?.message);
+      UIService.forceWarnBadge();
+    }
+    await UIService.refreshWarnBadge(details.windowId ?? null);
+  }
+
+  // Session-loss detection for the already-running / undetected-restart path.
+  // Same evidence -> same verdict as Phase 3b of _restoreWorkspaces: both
+  // paths call _isSessionLost; only the evidence gathering differs (here the
+  // window is already live, there it comes from the restore's Phase 1 reads).
+  // Must run BEFORE anything that can trigger a snapshot refresh (the refresh
+  // would overwrite the last good tabSnapshot with the post-loss state).
+  static async _detectSessionLoss(windowId) {
+    try {
+      const workspaces = await WSPStorageManager.getWorkspaces(windowId);
+      const snapshotUrlCount = workspaces.reduce((n, w) => n + (w.tabSnapshot || []).length, 0);
+      const wspIds = new Set(workspaces.map(w => w.id));
+      // All tabs, pinned included: a pinned tagged tab is evidence the
+      // session survived, same as Phase 3b's sessionMap.
+      const tabs = await browser.tabs.query({ windowId });
+      const liveContent = tabs.filter(t => !t.pinned && t.url && !Brainer._PLACEHOLDER_URL_RE.test(t.url));
+      let tagged = 0;
+      let lookupFailures = 0;
+      await Promise.all(tabs.map(async (t) => {
+        try {
+          const sv = await browser.sessions.getTabValue(t.id, "wspId");
+          if (sv && wspIds.has(sv)) tagged++;
+        } catch (e) {
+          lookupFailures++;
+          console.debug("[Brainer][_detectSessionLoss] session lookup failed for tab",
+            t.id, ":", e.message);
+        }
+      }));
+      // Consumption-based matching, same as Phase 3b's URL fallback: each
+      // snapshot entry consumes at most one live tab, so duplicate snapshot
+      // URLs cannot all be "matched" by a single surviving tab.
+      const liveUrlCounts = new Map();
+      for (const t of tabs) {
+        if (t.url) liveUrlCounts.set(t.url, (liveUrlCounts.get(t.url) || 0) + 1);
+      }
+      let matched = 0;
+      for (const u of workspaces.flatMap(w => w.tabSnapshot || [])) {
+        const n = liveUrlCounts.get(u) || 0;
+        if (n > 0) { matched++; liveUrlCounts.set(u, n - 1); }
+      }
+      if (!Brainer._isSessionLost({
+        snapshotUrlCount,
+        taggedCount: tagged,
+        survivingUrlCount: matched,
+        liveContentCount: liveContent.length,
+        lookupFailures,
+      })) return;
+      console.warn("[Brainer][_detectSessionLoss] SESSION-LOSS detected --",
+        snapshotUrlCount, "snapshot URL(s),", matched, "matched, 0 session-tagged");
+      // Export FIRST, before any guard can skip it: the repair that follows
+      // re-tags tabs and schedules snapshot refreshes that destroy this
+      // evidence. The fingerprint inside _exportSnapshotsSafe keeps repeats
+      // cheap and duplicate-free.
+      const exported = await Brainer._exportSnapshotsSafe(workspaces);
+      // Flag only when there is something new to say: an unrelated pending
+      // banner keeps priority on the single-slot surface, and a deduplicated
+      // re-observation of the same loss was already announced.
+      if (await WSPStorageManager.getLastRestoreError()) {
+        console.log("[Brainer][_detectSessionLoss] banner already pending -- export done, flag skipped");
+        return;
+      }
+      if (exported.deduped) {
+        console.log("[Brainer][_detectSessionLoss] loss unchanged since last export -- banner not re-armed");
+        return;
+      }
+      await Brainer._flagSessionLoss({
+        windowId,
+        wspCount: workspaces.length,
+        snapshotUrlCount,
+        exportedWorkspaces: exported.folders,
+        exportedUrls: exported.urls,
+      });
+    } catch (e) {
+      console.warn("[Brainer][_detectSessionLoss] failed:", e?.message);
     }
   }
 
@@ -1044,6 +1288,10 @@ class Brainer {
   // leftovers, then re-apply visibility if anything moved. Idempotent: a no-op
   // when assignments already match session values.
   static async _repairTabAssignments(windowId, restartLikely = false) {
+    // Session-loss check first: _reconcileLateTabs below can assign tabs and
+    // schedule snapshot refreshes, which would destroy the evidence (and the
+    // last good snapshots) this check needs.
+    if (restartLikely) await Brainer._detectSessionLoss(windowId);
     await Brainer._cleanStaleTabIds(windowId);
     const corrected = await Brainer._reconcileFromSessionValues(windowId, restartLikely);
     await Brainer._reconcileLateTabs(windowId);

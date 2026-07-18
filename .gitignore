@@ -18,11 +18,13 @@ desktop.ini
 .env
 .env.local
 
-# Review / forensic / scaffold artifacts -- mirror .webextignore so a stray
-# `git add .` cannot leak them. Forensic scripts in scripts/ may reference
-# raw profile paths and should never end up in public history.
-.deep-dive/
-.team-review/
+# Review / forensic / scaffold artifacts -- kept in sync with
+# web-ext-config.cjs ignoreFiles so a stray `git add .` cannot leak them.
+# Forensic scripts in scripts/ may reference raw profile paths and should
+# never end up in public history. Wildcards cover dated archives
+# (.deep-dive-2026-05-09/ etc.), which hold the same class of material.
+.deep-dive*/
+.team-review*/
 .full-review-pipeline/
 scripts/
 docs/
