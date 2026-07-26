@@ -20,12 +20,12 @@
 
 ---
 
-Workspaces lets you organize your browser tabs into named groups. Switch between workspaces to show one set of tabs and hide the rest -- no closing, no losing your place, no tab bar chaos.
+Workspaces lets you organize your browser tabs into named groups. Switch between workspaces to show one set of tabs and hide the rest - no closing, no losing your place, no tab bar chaos.
 
-- **Instant switching** -- `Alt+.` / `Alt+,` to cycle, `Alt+W` to open the popup
-- **Container integration** -- bind a workspace to a Firefox Container; new tabs auto-reopen in the right container
-- **Customizable** -- 32 Fluent UI icons, 8 colors, drag-and-drop reorder
-- **Survives restarts** -- workspace-to-tab mapping persists via `browser.sessions`
+- **Instant switching** - `Alt+.` / `Alt+,` to cycle, `Alt+W` to open the popup
+- **Container integration** - bind a workspace to a Firefox Container; new tabs auto-reopen in the right container
+- **Customizable** - 32 Fluent UI icons, 8 colors, drag-and-drop reorder
+- **Survives restarts** - workspace-to-tab mapping persists via `browser.sessions`
 
 ## Quick Start
 
@@ -40,7 +40,7 @@ cd firefox-workspaces
 web-ext run --firefox="path/to/firefox"
 ```
 
-Or load temporarily via `about:debugging` -- click "Load Temporary Add-on" and select `manifest.json`.
+Or load temporarily via `about:debugging` - click "Load Temporary Add-on" and select `manifest.json`.
 
 ## Usage
 
@@ -53,28 +53,28 @@ Or load temporarily via `about:debugging` -- click "Load Temporary Add-on" and s
 | Rename / edit | Click the pencil icon on a workspace row |
 | Delete workspace | Click the trash icon (tabs are closed) |
 | Assign container | Select a container in the create/rename dialog |
-| Move tab | Right-click a tab -- *Move Tab to Another Workspace* -- pick target |
+| Move tab | Right-click a tab - *Move Tab to Another Workspace* - pick target |
 | Search tabs | Type in the search bar at the top of the popup |
 | Reorder workspaces | Drag and drop workspace rows |
 | Switch via address bar | Type `ws` + space + workspace name |
 
-Keyboard shortcuts can be customized in `about:addons` -- gear icon -- **Manage Extension Shortcuts**.
+Keyboard shortcuts can be customized in `about:addons` - gear icon - **Manage Extension Shortcuts**.
 
 <details>
 <summary><strong>All Features</strong></summary>
 
-- **Tab workspaces** -- create named workspaces to group related tabs; switch instantly with inactive tabs hidden, not closed
-- **Keyboard shortcuts** -- `Alt+,` / `Alt+.` to cycle workspaces, `Alt+W` to open the popup
-- **Custom icons and colors** -- 32 Fluent UI icons and 8 color options per workspace
-- **Container integration** -- bind a workspace to a Firefox Container; new tabs auto-reopen in the assigned container
-- **Drag-and-drop reorder** -- rearrange workspaces in the popup by dragging
-- **Tab search** -- find any tab across all workspaces from the popup search bar
-- **Context menu** -- right-click a tab to move it to another workspace
-- **Omnibox** -- type `ws` + space + workspace name in the address bar to switch
-- **Recently closed tabs** -- view and restore tabs closed within each workspace
-- **Tab previews** -- hover a workspace to see a tooltip listing its tabs
-- **Theme-aware UI** -- adapts to Firefox light, dark, and custom LWT themes
-- **Session persistence** -- workspaces survive browser restarts via `browser.sessions`
+- **Tab workspaces** - create named workspaces to group related tabs; switch instantly with inactive tabs hidden, not closed
+- **Keyboard shortcuts** - `Alt+,` / `Alt+.` to cycle workspaces, `Alt+W` to open the popup
+- **Custom icons and colors** - 32 Fluent UI icons and 8 color options per workspace
+- **Container integration** - bind a workspace to a Firefox Container; new tabs auto-reopen in the assigned container
+- **Drag-and-drop reorder** - rearrange workspaces in the popup by dragging
+- **Tab search** - find any tab across all workspaces from the popup search bar
+- **Context menu** - right-click a tab to move it to another workspace
+- **Omnibox** - type `ws` + space + workspace name in the address bar to switch
+- **Recently closed tabs** - view and restore tabs closed within each workspace
+- **Tab previews** - hover a workspace to see a tooltip listing its tabs
+- **Theme-aware UI** - adapts to Firefox light, dark, and custom LWT themes
+- **Session persistence** - workspaces survive browser restarts via `browser.sessions`
 
 </details>
 
@@ -116,7 +116,7 @@ icons/                       # layered-{light,dark}.svg: toolbar (theme-aware)
 
 **Load order matters.** The `background.scripts` array in `manifest.json` defines execution order. `storage.js` loads first (all services depend on `WSPStorageManager`). `brainer.js` and `handler.js` load last.
 
-`WorkspaceService` and `TabService` have a bidirectional dependency -- both are singletons in the same MV2 background page scope. The popup communicates with the background via `browser.runtime.sendMessage()` using an `action` field dispatched in `handler.js`.
+`WorkspaceService` and `TabService` have a bidirectional dependency - both are singletons in the same MV2 background page scope. The popup communicates with the background via `browser.runtime.sendMessage()` using an `action` field dispatched in `handler.js`.
 
 </details>
 
@@ -131,7 +131,7 @@ web-ext build
 web-ext sign --channel=unlisted
 ```
 
-To sign: copy `.env.example` to `.env` and fill in your AMO API credentials from https://addons.mozilla.org/developers/addon/api/key/. Always bump the version in `manifest.json` before signing -- AMO rejects duplicate versions.
+To sign: copy `.env.example` to `.env` and fill in your AMO API credentials from https://addons.mozilla.org/developers/addon/api/key/. Always bump the version in `manifest.json` before signing - AMO rejects duplicate versions.
 
 </details>
 
