@@ -239,14 +239,16 @@ class WorkspaceUI {
   }
 
   // Render an inline banner when a restore-error payload is pending (see
-  // backend/brainer.js: refuse-to-wipe, phase4-failure, session-not-restored).
+  // backend/brainer.js: refuse-to-wipe, phase4-failure, session-not-restored,
+  // tabs-closed-at-startup).
   //
   // User actions:
   //   - Dismiss (acknowledgeLastRestoreError): clears the banner. For the two
   //     retry-able reasons the restart-retry signal stays armed.
   //   - Give up (giveUpRestoreRetry): clears the banner AND the retry signal
   //     (destructive; old workspaces become orphaned). Confirms first. Hidden
-  //     for session-not-restored, where there is no retry to give up on.
+  //     for session-not-restored and tabs-closed-at-startup, where there is
+  //     no retry to give up on.
   // Both actions echo the displayed payload's `when` so the background can
   // refuse a stale dismiss (compare-and-clear): if a fresh warning replaced
   // the displayed one mid-popup, the newer payload survives and is re-shown.
@@ -311,6 +313,27 @@ class WorkspaceUI {
           `The browser started at ${when} without restoring the previous session, ` +
           `so the tabs of ${wspCount} workspace(s) could not be brought back. ` +
           `${exportedNote(exported)}${cause}`;
+        giveUpBtn.hidden = true;
+      } else if (payload.reason === "tabs-closed-at-startup") {
+        // The session WAS restored, but something closed the workspace tabs
+        // right after startup - another extension or the browser itself, not
+        // this one. Where possible they were reopened automatically.
+        const closedCount = isFiniteNum(payload.closedMatchCount) ? payload.closedMatchCount : null;
+        const restoredCount = isFiniteNum(payload.restoredCount) ? payload.restoredCount : 0;
+        const exported = isFiniteNum(payload.exportedWorkspaces) ? payload.exportedWorkspaces : 0;
+        const outcome = closedCount != null && restoredCount >= closedCount && restoredCount > 0
+          ? `All ${restoredCount} were reopened automatically and returned to their workspaces. `
+          : restoredCount > 0
+            ? `${restoredCount} of ${closedCount ?? "?"} could be reopened automatically. ` +
+              exportedNote(exported) +
+              `The rest may still be under History > Recently closed tabs. `
+            : `They could not be reopened automatically. ` + exportedNote(exported) +
+              `They may still be under History > Recently closed tabs. `;
+        text.textContent =
+          `The browser start at ${when} restored the previous session, but ` +
+          `${closedCount ?? "?"} workspace tab(s) were closed by something right ` +
+          `after startup - not by this extension. ${outcome}` +
+          `If this repeats, check your other extensions and startup settings.`;
         giveUpBtn.hidden = true;
       } else {
         const reason = payload.reason === "phase4-failure"

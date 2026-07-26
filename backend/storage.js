@@ -67,6 +67,14 @@ const LIMITS = {
   // live tabs.
   SESSION_LOSS_MIN_SNAPSHOT_URLS: 2,
   SESSION_LOSS_SURVIVAL_RATIO: 0.5,
+  // Mass-closure reclassification (Brainer._isMassTabClosure). A session-loss
+  // verdict is downgraded to "tabs closed at startup" when at least
+  // MASS_CLOSE_MATCH_RATIO of the snapshot URLs sit in the recently-closed
+  // list with a closure time within MASS_CLOSE_RECENCY_MS of the check.
+  // The recently-closed list lives in the session store, so this evidence
+  // can only exist when the session itself survived the restart.
+  MASS_CLOSE_MATCH_RATIO: 0.5,
+  MASS_CLOSE_RECENCY_MS: 120000,
   // How many distinct export-set fingerprints to remember for dedup.
   MAX_EXPORT_FINGERPRINTS: 8,
 };
