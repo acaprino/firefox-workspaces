@@ -214,7 +214,7 @@ class TabService {
               await freshTarget._saveState();
             }
             if (freshTarget.active) {
-              WorkspaceService.addTabToActiveCache(tab.id);
+              WorkspaceService.addTabToActiveCache(tab.id, sessionWspId);
             } else {
               try { await browser.tabs.hide(tab.id); }
               catch (e) { console.debug("[TabService][addTabToWorkspace] tabs.hide failed for tab", tab.id, ":", e.message); }
@@ -277,7 +277,7 @@ class TabService {
             freshWsp.tabs.push(tab.id);
             await freshWsp._saveState();
             // Keep active-workspace cache consistent so onTabActivated fast-path stays accurate
-            WorkspaceService.addTabToActiveCache(tab.id);
+            WorkspaceService.addTabToActiveCache(tab.id, freshWsp.id);
             console.log("[TabService][addTabToWorkspace] tab", tab.id, "added to workspace",
               freshWsp.id, "| workspace now has", freshWsp.tabs.length, "tabs");
           } else {
@@ -402,7 +402,7 @@ class TabService {
           await fresh._saveState();
         }
       });
-      WorkspaceService.addTabToActiveCache(newTab.id);
+      WorkspaceService.addTabToActiveCache(newTab.id, activeWspId);
       await TabService.setTabSessionValue(newTab.id, activeWspId);
       TabService._scheduleSnapshotRefresh(tab.windowId, activeWspId);
       await MenuService.refreshTabMenu();

@@ -27,8 +27,24 @@ class WorkspaceService {
   // Keep the _activeCache shape private to this class -- callers used to
   // reach into `_activeCache?.tabIds` directly, which made the cache
   // invariants unenforceable.
-  static addTabToActiveCache(tabId) {
-    WorkspaceService._activeCache?.tabIds.add(tabId);
+  // `wspId` is the workspace the tab was actually filed under. A tab is only
+  // cached when that workspace is the one the cache describes: adding it blind
+  // used to let a stale cache (one that still named the previously active
+  // workspace) claim tabs belonging to another workspace, after which
+  // TabService.forceTabIntoActiveContainer reopened them in the stale entry's
+  // container. A mismatch means the cache is out of date, so drop it rather
+  // than corrupt it -- the next read repopulates from storage.
+  static addTabToActiveCache(tabId, wspId) {
+    const c = WorkspaceService._activeCache;
+    if (!c) return;
+    if (!wspId || c.activeWspId !== wspId) {
+      console.warn("[WorkspaceService][addTabToActiveCache] cache describes",
+        c.activeWspId, "but tab", tabId, "belongs to", wspId ?? "(unknown)",
+        "-- invalidating stale cache");
+      WorkspaceService._activeCache = null;
+      return;
+    }
+    c.tabIds.add(tabId);
   }
 
   static removeTabFromActiveCache(tabId) {
@@ -162,6 +178,22 @@ class WorkspaceService {
     // hideInactiveWspTabs) use the real ID instead of undefined.
     wsp.id = w.id;
     await w.updateTabGroups();
+
+    // Re-point the active cache: deactivateCurrentWsp above stood the previous
+    // workspace down, so leaving its entry in place makes the cache lie about
+    // which workspace (and container) is active. That stale containerId made
+    // TabService.forceTabIntoActiveContainer reopen the new workspace's tabs in
+    // the PREVIOUS workspace's container on first navigation, and file them
+    // under the previous workspace. activateWsp is the only other writer, and
+    // it is not on the create path.
+    if (w.active) {
+      WorkspaceService._updateActiveCache(wsp.windowId, w.tabs, w.id, w.containerId);
+    } else {
+      // Nothing is active in this window any more -- an entry for the workspace
+      // we just deactivated would be just as wrong.
+      WorkspaceService._activeCache = null;
+      console.log("[WorkspaceService][createWorkspace] created inactive workspace -- active cache cleared");
+    }
 
     // Append to workspace order (own mutex: a concurrent destroy splices the
     // same array; an interleaved read-modify-write can drop an id)

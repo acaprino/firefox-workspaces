@@ -1434,7 +1434,7 @@ class Brainer {
       if (!wspActive) {
         toHide.push(...tabs.map(t => t.id));
       } else {
-        for (const tab of tabs) WorkspaceService.addTabToActiveCache(tab.id);
+        for (const tab of tabs) WorkspaceService.addTabToActiveCache(tab.id, wspId);
       }
     }
 
@@ -1449,7 +1449,7 @@ class Brainer {
         await fresh._saveState();
       });
       await Promise.all(noSession.map(tab => TabService.setTabSessionValue(tab.id, activeWsp.id)));
-      for (const tab of noSession) WorkspaceService.addTabToActiveCache(tab.id);
+      for (const tab of noSession) WorkspaceService.addTabToActiveCache(tab.id, activeWsp.id);
       // Keep tabSnapshot fresh for restart resilience (IC3).
       TabService._scheduleSnapshotRefresh(windowId, activeWsp.id);
       console.log("[Brainer][_reconcileLateTabs] assigned", noSession.length, "untagged tabs to active workspace");
