@@ -133,8 +133,8 @@ icons/                       # layered-{light,dark}.svg: toolbar (theme-aware)
 # Package as unsigned .xpi
 web-ext build
 
-# Sign via AMO (requires API credentials)
-web-ext sign --channel=unlisted
+# Sign via AMO (requires API credentials). This addon is listed, so use --channel=listed.
+web-ext sign --channel=listed
 ```
 
 To sign: copy `.env.example` to `.env` and fill in your AMO API credentials from https://addons.mozilla.org/developers/addon/api/key/. Always bump the version in `manifest.json` before signing - AMO rejects duplicate versions.

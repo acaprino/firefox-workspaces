@@ -110,7 +110,8 @@ web-ext run --source-dir=. --firefox="path/to/firefox"
 web-ext build
 
 # Sign for distribution (requires .env with WEB_EXT_API_KEY/WEB_EXT_API_SECRET)
-web-ext sign --channel=unlisted
+# This addon is LISTED on AMO - use --channel=listed (see gotcha 1).
+web-ext sign --channel=listed
 
 # Run the test suite from the repo root (Node >= 20, no dependencies;
 # `node --test tests/` does NOT work on Node 21+)
@@ -123,7 +124,7 @@ No build step required - load directly via `about:debugging` -> "Load Temporary 
 
 ## Known Gotchas
 
-1. **Extension signing:** Release Firefox ignores `xpinstall.signatures.required=false`. Must sign via AMO for distribution. Version in `manifest.json` must be bumped before each AMO submission (duplicates are rejected).
+1. **Extension signing - this addon is LISTED:** Release Firefox ignores `xpinstall.signatures.required=false`. Must sign via AMO for distribution. Version in `manifest.json` must be bumped before each AMO submission (duplicates are rejected). The channel is `listed` (public AMO page, `slug a5051d22878041c6be70`), NOT `unlisted` - older docs said `unlisted` and that mistake shipped 2.6.55/2.6.56 to the unlisted channel, so the public `current_version` stayed at 2.6.54. **AMO cannot move an already-uploaded version between channels and rejects duplicate version numbers**, so a version signed on the wrong channel is a dead end: you must bump again and re-sign on the right channel. Before signing, VERIFY the channel live rather than trusting docs, branch name, or `.amo-upload-uuid` (that file only records the LAST upload's channel): authenticated `GET /api/v5/addons/addon/workspaces%40hardfox/versions/?filter=all_with_unlisted` shows each version's `channel`, and `GET /api/v5/addons/addon/<slug>/` shows the public `current_version`. `scripts/sign.bat` maps `master -> listed`, `dev -> unlisted`; on `master` the listed channel is correct. After signing, re-read the public `current_version` to confirm the release actually landed on the listed page.
 2. **`data_collection_permissions`:** Required in `manifest.json` for Firefox 140+. Omitting it causes AMO validation failure.
 3. **`tabHide` API:** Must be enabled (default in Firefox 140+). Without it, inactive workspace tabs remain visible.
 4. **Container reopen race:** `TabService._reopenInContainer()` uses `_isReopening` + `_forceReopenIds` guards to prevent `onCreated` from double-assigning tabs during the close-reopen window.
