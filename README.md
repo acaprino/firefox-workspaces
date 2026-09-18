@@ -60,6 +60,12 @@ Or load temporarily via `about:debugging` - click "Load Temporary Add-on" and se
 
 Keyboard shortcuts can be customized in `about:addons` - gear icon - **Manage Extension Shortcuts**.
 
+### Recovery after a restart
+
+Workspaces reassigns tabs that Firefox restores to their workspaces. It does not automatically reopen recently closed tabs at startup.
+
+If startup recovery detects missing workspace tabs, it attempts to save their last recorded URL lists under **Other Bookmarks > Workspaces**, then reports the export result in the popup. Review these lists before using **Restore from bookmarks**: snapshots can include tabs you intentionally closed. Restoring a folder creates a new workspace and opens its saved URLs; it does not restore browsing history or form contents.
+
 <details>
 <summary><strong>All Features</strong></summary>
 

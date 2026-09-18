@@ -239,8 +239,8 @@ class WorkspaceUI {
   }
 
   // Render an inline banner when a restore-error payload is pending (see
-  // backend/brainer.js: refuse-to-wipe, phase4-failure, session-not-restored,
-  // tabs-closed-at-startup).
+  // backend/brainer.js: refuse-to-wipe, phase4-failure, session-not-restored).
+  // Also render persisted tabs-closed-at-startup payloads from older versions.
   //
   // User actions:
   //   - Dismiss (acknowledgeLastRestoreError): clears the banner. For the two
@@ -299,52 +299,32 @@ class WorkspaceUI {
         return `The saved tab lists (${counts}) were exported to bookmarks under ` +
           `"Workspaces", use "Restore from bookmarks" to reopen them. `;
       };
-      if (payload.reason === "session-not-restored") {
-        // Session-loss warning: the browser started without restoring the
-        // previous session, so the old workspace tabs are gone for good.
-        // There is no retry to give up on, so only "Dismiss" applies.
+      if (payload.reason === "session-not-restored" || payload.reason === "tabs-closed-at-startup") {
+        // Missing tabs and fresh undo entries do not prove when or why a tab
+        // was closed. Keep recovery voluntary and describe only known facts.
         const exported = isFiniteNum(payload.exportedWorkspaces) ? payload.exportedWorkspaces : 0;
-        const cause = payload.privateBrowsing === true
-          ? `This browser runs in permanent private browsing mode, which disables session restore.`
-          : `This usually means "Clear history when the browser closes" is enabled ` +
-            `(it also deletes the saved session), or "Open previous windows and tabs" is off. ` +
-            `Check Settings > Privacy & Security > History.`;
-        text.textContent =
-          `The browser started at ${when} without restoring the previous session, ` +
-          `so the tabs of ${wspCount} workspace(s) could not be brought back. ` +
-          `${exportedNote(exported)}${cause}`;
-        giveUpBtn.hidden = true;
-      } else if (payload.reason === "tabs-closed-at-startup") {
-        // The session WAS restored, but something closed the workspace tabs
-        // right after startup - another extension or the browser itself, not
-        // this one. Where possible they were reopened automatically.
-        const closedCount = isFiniteNum(payload.closedMatchCount) ? payload.closedMatchCount : null;
+        const legacyRecovery = payload.reason === "tabs-closed-at-startup";
         const restoredCount = isFiniteNum(payload.restoredCount) ? payload.restoredCount : 0;
-        const exported = isFiniteNum(payload.exportedWorkspaces) ? payload.exportedWorkspaces : 0;
-        const outcome = closedCount != null && restoredCount >= closedCount && restoredCount > 0
-          ? `All ${restoredCount} were reopened automatically and returned to their workspaces. `
-          : restoredCount > 0
-            ? `${restoredCount} of ${closedCount ?? "?"} could be reopened automatically. ` +
-              exportedNote(exported) +
-              `The rest may still be under History > Recently closed tabs. `
-            : `They could not be reopened automatically. ` + exportedNote(exported) +
-              `They may still be under History > Recently closed tabs. `;
+        const outcome = legacyRecovery
+          ? (restoredCount > 0
+            ? `An earlier automatic recovery reopened ${restoredCount} tab(s). `
+            : `An earlier automatic recovery did not report any reopened tabs. `)
+          : `Closed tabs were not reopened automatically. `;
         text.textContent =
-          `The browser start at ${when} restored the previous session, but ` +
-          `${closedCount ?? "?"} workspace tab(s) were closed by something right ` +
-          `after startup - not by this extension. ${outcome}` +
-          `If this repeats, check your other extensions and startup settings.`;
+          `Workspace tabs were not fully restored when the browser started at ${when}. ` +
+          `Saved tab lists for ${wspCount} workspace(s) contained ${urlCount} URL(s). ` +
+          outcome + exportedNote(exported) +
+          `Review the saved lists before restoring - they may include tabs you intentionally closed. ` +
+          `You can also check History > Recently closed tabs in Firefox.`;
         giveUpBtn.hidden = true;
       } else {
         const reason = payload.reason === "phase4-failure"
           ? `A previous restore attempt failed mid-way at ${when}.`
           : `Workspace restore was paused at ${when} to prevent data loss.`;
-        // A phase4 failure that happened on a session-loss start carries the
-        // verdict: retrying cannot bring the tabs back, but the bookmark
-        // backup already exists -- say so instead of plain retry advice.
+        // A failed commit after incomplete recovery may already have a
+        // bookmark backup. Report the export counts, not a presumed cause.
         const lossNote = payload.sessionLost === true
-          ? ` Note: the previous session itself was not restored, so the lost tabs ` +
-            `cannot come back via retry. ` +
+          ? ` Some workspace tabs were missing during startup. ` +
             exportedNote(isFiniteNum(payload.exportedWorkspaces) ? payload.exportedWorkspaces : 0)
           : ` Try restarting Firefox to retry the restore. `;
         text.textContent =

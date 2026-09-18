@@ -764,25 +764,14 @@ class Brainer {
       );
     }
 
-    // ── Phase 3b: session-loss detection. ──
-    // The refuse-to-wipe guard above only trips when the window has NO live
-    // content tabs (session-restore lag). When the browser starts WITHOUT
-    // restoring the previous session at all -- e.g. "Clear history when the
-    // browser closes" also wipes the session store, or permanent private
-    // browsing -- the window comes up with a homepage or fresh browsing, so
-    // live content tabs DO exist while zero tabs carry session values and
-    // (almost) no snapshot URL is present. The old tabs are gone for good; a
-    // restart retry cannot bring them back. So: save the snapshots to
-    // bookmarks NOW (before tab activity refreshes them away), let the
-    // restore continue with what is actually there, and surface a warning
-    // banner + toolbar badge after the final commit. The export is
-    // fingerprint-deduplicated (_exportSnapshotsSafe), so the recurring loss
-    // this user's configuration produces on every start does not pile up
-    // duplicate bookmark folders or re-arm a banner for the same loss.
-    // Known blind spot: a clear-history-on-close user whose only startup tab
-    // is the default homepage (about:home, a placeholder URL) lands in
-    // refuse-to-wipe above instead, because zero live content tabs are
-    // indistinguishable from session-restore lag.
+    // Phase 3b: incomplete session restore. Preserve snapshots before any
+    // tab activity can refresh them away, then continue with live tabs only.
+    // Missing tags/URLs do not establish why tabs are absent. In particular,
+    // Firefox can put intentionally closed tabs into the recently-closed
+    // list with fresh timestamps at startup. Never use that list as consent
+    // to reopen tabs; recovery from the bookmark backup is user-initiated.
+    // Fingerprint dedup avoids repeated exports and warnings for the same
+    // snapshot content. Placeholder-only starts still use refuse-to-wipe.
     const sessionLost = Brainer._isSessionLost({
       snapshotUrlCount,
       taggedCount: [...sessionMap.values()].filter(v => wspIdSet.has(v)).length,
@@ -791,42 +780,11 @@ class Brainer {
       lookupFailures: sessionLookupFailures,
     });
     let sessionLossExport = null;
-    let massClosure = null;   // non-null: "loss" reclassified as a startup mass-closure
-    let massRestored = [];
     if (sessionLost) {
-      // Second opinion before announcing a lost session: if the snapshot URLs
-      // sit in the recently-closed list with fresh timestamps, the session
-      // itself was restored fine and something closed the tabs right after
-      // startup. A wiped session store cannot produce this evidence (the
-      // recently-closed list is stored inside it), so the two cases are
-      // cleanly separable -- and this one is recoverable via sessions.restore.
-      const closedEvidence = await Brainer._findRecentlyClosedSnapshotTabs(wspData);
-      if (Brainer._isMassTabClosure({ snapshotUrlCount, recentClosedMatchCount: closedEvidence.matchCount })) {
-        massClosure = closedEvidence;
-        console.warn("[Brainer][_restoreWorkspaces] MASS-CLOSURE detected --",
-          closedEvidence.matchCount, "of", snapshotUrlCount,
-          "snapshot URL(s) were closed moments ago; reopening them instead of declaring session loss");
-      } else {
-        console.warn("[Brainer][_restoreWorkspaces] SESSION-LOSS detected --",
-          snapshotUrlCount, "snapshot URL(s) but", totalAssigned,
-          "assigned and 0 session-tagged; exporting snapshots to bookmarks before continuing");
-      }
-      // Bookmark export happens in BOTH cases -- for a real loss it is the
-      // recovery path, for a mass-closure the safety net in case the reopen
-      // below fails half-way. Fingerprint dedup keeps repeats free.
+      console.warn("[Brainer][_restoreWorkspaces] incomplete session restore --",
+        snapshotUrlCount, "snapshot URL(s) but", totalAssigned,
+        "assigned and 0 session-tagged; exporting snapshots without reopening closed tabs");
       sessionLossExport = await Brainer._exportSnapshotsSafe(wspData);
-      if (massClosure) {
-        massRestored = await Brainer._restoreClosedTabsSafe(massClosure.matches,
-          { windowId: window.id, validWspIds: wspIdSet });
-        // Feed the reopened tabs to the normal Phase 4 machinery as if they
-        // had been present from the start: workspace writes, re-tagging,
-        // activation and hideInactiveWspTabs all just work.
-        for (const { tab, wspId } of massRestored) {
-          if (!assigned.has(wspId)) assigned.set(wspId, []);
-          assigned.get(wspId).push(tab.id);
-          newTabs.push(tab);   // lastActiveTabUrl remap looks tabs up here
-        }
-      }
     }
 
     // ── Phase 4: writes. From here on we mutate storage. Wrapped in a single
@@ -918,21 +876,7 @@ class Brainer {
       await WSPStorageManager.clearLastRestoreError();
       Brainer._refuseToWipeActive = false;
       if (sessionLost) {
-        if (massClosure) {
-          // A mass-closure is fresh, actionable news on every occurrence
-          // (something IS closing this user's tabs at startup), so the banner
-          // arms regardless of the export fingerprint dedup.
-          await Brainer._flagSessionLoss({
-            reason: "tabs-closed-at-startup",
-            windowId: window.id,
-            wspCount: wspData.length,
-            snapshotUrlCount,
-            closedMatchCount: massClosure.matchCount,
-            restoredCount: massRestored.length,
-            exportedWorkspaces: sessionLossExport?.folders ?? 0,
-            exportedUrls: sessionLossExport?.urls ?? 0,
-          });
-        } else if (sessionLossExport?.deduped) {
+        if (sessionLossExport?.deduped) {
           // Same loss content as the last announced one (the steady state for
           // a clear-history-on-close user): the bookmarks already exist and
           // the user already saw -- or dismissed -- the banner. Re-arming it
@@ -960,12 +904,10 @@ class Brainer {
         newWindowId: window.id,
         error: String(e?.message ?? e),
       };
-      // Carry the session-loss verdict into the failure payload: the retry
-      // advice is wrong for a wiped session store, and the popup should tell
-      // the user the bookmark backup already exists. A mass-closure does NOT
-      // set the flag -- there the session store is intact and any reopened
-      // tabs are live, so plain retry advice is correct.
-      if (sessionLost && !massClosure) {
+      // Carry incomplete-restore evidence and actual export counts into the
+      // failure payload so the popup can point to voluntary recovery without
+      // assuming a wiped session store or promising a retry will recover tabs.
+      if (sessionLost) {
         errorPayload.sessionLost = true;
         errorPayload.exportedWorkspaces = sessionLossExport?.folders ?? 0;
         errorPayload.exportedUrls = sessionLossExport?.urls ?? 0;
@@ -997,95 +939,6 @@ class Brainer {
     if (lookupFailures > 0) return false;
     if (liveContentCount === 0) return false;
     return survivingUrlCount < snapshotUrlCount * LIMITS.SESSION_LOSS_SURVIVAL_RATIO;
-  }
-
-  // Companion verdict to _isSessionLost: was the "loss" actually a mass tab
-  // closure AFTER a successful session restore? Evidence: snapshot URLs found
-  // among recently-closed tabs with a fresh closure time. The recently-closed
-  // list is part of the session store, so a populated list proves the session
-  // survived -- the tabs were restored and then closed by something else
-  // (another extension, the browser). Those tabs are recoverable via
-  // sessions.restore, which _isSessionLost's "gone for good" advice is not.
-  static _isMassTabClosure({ snapshotUrlCount, recentClosedMatchCount }) {
-    if (snapshotUrlCount < LIMITS.SESSION_LOSS_MIN_SNAPSHOT_URLS) return false;
-    return recentClosedMatchCount >= snapshotUrlCount * LIMITS.MASS_CLOSE_MATCH_RATIO;
-  }
-
-  // Match workspace snapshot URLs against freshly closed tabs. Consumption-
-  // based like the other matchers (each closed tab satisfies at most one
-  // snapshot entry). Returns { matches, matchCount }; each match carries the
-  // sessionId needed for sessions.restore plus the owning workspace id.
-  // Never throws -- on API failure the caller keeps the plain loss verdict.
-  static async _findRecentlyClosedSnapshotTabs(workspaces) {
-    try {
-      const closed = await browser.sessions.getRecentlyClosed();
-      const now = Date.now();
-      const fresh = [];
-      for (const s of closed) {
-        if (!s.tab || !s.tab.sessionId) continue; // closed windows don't apply
-        // lastModified is documented as ms since epoch, but Firefox has
-        // shipped seconds in some versions; normalize by magnitude.
-        const raw = s.lastModified ?? 0;
-        const closedAt = raw < 1e12 ? raw * 1000 : raw;
-        if (now - closedAt > LIMITS.MASS_CLOSE_RECENCY_MS) continue;
-        fresh.push(s.tab);
-      }
-      const matches = [];
-      if (fresh.length > 0) {
-        const consumed = new Set();
-        for (const wsp of workspaces) {
-          for (const url of (wsp.tabSnapshot || [])) {
-            const tab = fresh.find(t => !consumed.has(t.sessionId) && t.url === url);
-            if (!tab) continue;
-            consumed.add(tab.sessionId);
-            matches.push({ sessionId: tab.sessionId, url, wspId: wsp.id });
-          }
-        }
-      }
-      return { matches, matchCount: matches.length };
-    } catch (e) {
-      console.warn("[Brainer][_findRecentlyClosedSnapshotTabs] failed:", e?.message);
-      return { matches: [], matchCount: 0 };
-    }
-  }
-
-  // Reopen mass-closed tabs via sessions.restore. A restored tab comes back
-  // with its original extData, so the wspId session value is intact and the
-  // normal assignment machinery can re-file it. Returns { tab, wspId } for
-  // the tabs that landed in `windowId` (null = accept any window); the wspId
-  // prefers the tab's own restored session value over the URL match, since a
-  // URL can legitimately appear in more than one workspace's snapshot.
-  // Never throws; individual failures are counted and logged.
-  static async _restoreClosedTabsSafe(matches, { windowId = null, validWspIds = null } = {}) {
-    const restored = [];
-    let failures = 0;
-    for (const m of matches) {
-      try {
-        const session = await browser.sessions.restore(m.sessionId);
-        const tab = session?.tab;
-        if (!tab) { failures++; continue; }
-        if (windowId != null && tab.windowId !== windowId) {
-          // Restored into a different window: leave it alone rather than
-          // filing it under a workspace whose window cannot hide/show it.
-          console.warn("[Brainer][_restoreClosedTabsSafe] tab restored into window",
-            tab.windowId, "instead of", windowId, "-- leaving unassigned:", m.url);
-          continue;
-        }
-        let wspId = m.wspId;
-        try {
-          const sv = await browser.sessions.getTabValue(tab.id, "wspId");
-          if (sv && validWspIds?.has(sv)) wspId = sv;
-        } catch { /* keep the URL-matched id */ }
-        restored.push({ tab, wspId });
-      } catch (e) {
-        failures++;
-        console.warn("[Brainer][_restoreClosedTabsSafe] restore failed for", m.url, ":", e?.message);
-      }
-    }
-    if (failures > 0) {
-      console.warn("[Brainer][_restoreClosedTabsSafe]", failures, "of", matches.length, "restore(s) failed");
-    }
-    return restored;
   }
 
   // Stable fingerprint of the exportable snapshot content. Used to make the
@@ -1131,11 +984,8 @@ class Brainer {
     }
   }
 
-  // Surface the session-loss warning: popup banner (via the lastRestoreError
-  // surface, with its own `reason` so the popup words it correctly and hides
-  // the retry actions) plus the "!" toolbar badge. `details.reason` overrides
-  // the default (the mass-closure reclassification passes
-  // "tabs-closed-at-startup"); the spread below makes that work.
+  // Surface incomplete startup recovery via the existing session-not-restored
+  // reason and "!" badge. This is evidence of missing tabs, not their cause.
   static async _flagSessionLoss(details) {
     // "Permanent private browsing" is only a safe diagnosis when EVERY window
     // is private -- a single incognito window picked as restore window proves
@@ -1212,49 +1062,13 @@ class Brainer {
         liveContentCount: liveContent.length,
         lookupFailures,
       })) return;
-      // Second opinion, same as Phase 3b: fresh recently-closed matches mean
-      // the session survived and the tabs were mass-closed after the restore.
-      const closedEvidence = await Brainer._findRecentlyClosedSnapshotTabs(workspaces);
-      const massClosure = Brainer._isMassTabClosure({
-        snapshotUrlCount, recentClosedMatchCount: closedEvidence.matchCount });
-      if (massClosure) {
-        console.warn("[Brainer][_detectSessionLoss] MASS-CLOSURE detected --",
-          closedEvidence.matchCount, "of", snapshotUrlCount,
-          "snapshot URL(s) were closed moments ago; reopening them");
-      } else {
-        console.warn("[Brainer][_detectSessionLoss] SESSION-LOSS detected --",
-          snapshotUrlCount, "snapshot URL(s),", matched, "matched, 0 session-tagged");
-      }
+      console.warn("[Brainer][_detectSessionLoss] incomplete session restore --",
+        snapshotUrlCount, "snapshot URL(s),", matched, "matched, 0 session-tagged");
       // Export FIRST, before any guard can skip it: the repair that follows
       // re-tags tabs and schedules snapshot refreshes that destroy this
       // evidence. The fingerprint inside _exportSnapshotsSafe keeps repeats
       // cheap and duplicate-free.
       const exported = await Brainer._exportSnapshotsSafe(workspaces);
-      if (massClosure) {
-        // Reopen now; the repair steps that follow in _repairTabAssignments
-        // (_reconcileLateTabs) re-file the reopened tabs by the session value
-        // each carries in its restored extData, and hide the inactive ones.
-        const restored = await Brainer._restoreClosedTabsSafe(closedEvidence.matches,
-          { windowId, validWspIds: wspIds });
-        // The reopen happens unconditionally, but an unrelated pending banner
-        // keeps priority on the single-slot surface (the reopened tabs are
-        // their own visible evidence).
-        if (await WSPStorageManager.getLastRestoreError()) {
-          console.log("[Brainer][_detectSessionLoss] banner already pending -- reopen done, flag skipped");
-          return;
-        }
-        await Brainer._flagSessionLoss({
-          reason: "tabs-closed-at-startup",
-          windowId,
-          wspCount: workspaces.length,
-          snapshotUrlCount,
-          closedMatchCount: closedEvidence.matchCount,
-          restoredCount: restored.length,
-          exportedWorkspaces: exported.folders,
-          exportedUrls: exported.urls,
-        });
-        return;
-      }
       // Flag only when there is something new to say: an unrelated pending
       // banner keeps priority on the single-slot surface, and a deduplicated
       // re-observation of the same loss was already announced.
