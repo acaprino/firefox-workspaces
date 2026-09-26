@@ -1389,3 +1389,67 @@ li.no-wsp {
 .wsp-error-banner-actions button.wsp-error-give-up:hover {
   opacity: 1;
 }
+
+/* ----------------------------------------------------------
+   14. Forced colors (Windows High Contrast, Firefox "Override colors")
+   ---------------------------------------------------------- */
+@media (forced-colors: active) {
+  /* Mask icons are painted with `background`, which forced colors replace
+     with the page background, so the icons vanish. Opt them out and paint
+     them with the text system color. */
+  .title::before,
+  li.wsp-list-item .export-btn::after,
+  li.wsp-list-item .rename-btn::after,
+  li.wsp-list-item .delete-btn::after,
+  li.wsp-list-item .export-btn:hover::after,
+  li.wsp-list-item .rename-btn:hover::after,
+  li.wsp-list-item .delete-btn:hover::after,
+  .wsp-closed-tab-restore::after,
+  .footer#createNewWsp::before,
+  .footer#restoreFromBookmarks::before,
+  .color-swatch-remove::after {
+    forced-color-adjust: none;
+    background: CanvasText;
+  }
+
+  /* Swatch and container colors are information, not decoration: keep
+     them, and mark the selected swatch with system colors (forced colors
+     drop the box-shadow ring used otherwise). */
+  .color-swatch,
+  .wsp-container-dot {
+    forced-color-adjust: none;
+  }
+
+  .color-swatch {
+    border-color: Canvas;
+  }
+
+  .color-swatch-remove {
+    border-color: GrayText;
+  }
+
+  .color-swatch.selected,
+  .color-swatch-remove.selected {
+    border-color: Canvas;
+    box-shadow: 0 0 0 2px Highlight;
+  }
+
+  .color-swatch:focus-visible {
+    outline: 2px solid CanvasText;
+    outline-offset: 2px;
+  }
+
+  .icon-grid button.selected {
+    border-color: Highlight;
+  }
+
+  /* Borderless buttons and the preview panel need an edge to be seen. */
+  .custom-dialog-buttons button,
+  .wsp-error-banner-actions button {
+    border: 1px solid ButtonText;
+  }
+
+  .wsp-tab-preview {
+    outline: 1px solid CanvasText;
+  }
+}
