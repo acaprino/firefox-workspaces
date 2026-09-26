@@ -819,6 +819,8 @@ li.no-wsp {
   font-size: 13px;
   font-weight: 600;
   line-height: 1.4;
+  /* Keep the paragraph breaks of multi-paragraph messages (Give up). */
+  white-space: pre-line;
 }
 
 /* Scrollable form area */
@@ -835,11 +837,15 @@ li.no-wsp {
   border-top: 1px solid var(--wsp-border);
 }
 
-/* Delete confirmation mode - centered message, hidden body */
+/* Delete confirmation mode - centered message, hidden body. A message
+   taller than the popup scrolls (safe center keeps its top reachable)
+   instead of pushing the buttons out of view. */
 .custom-dialog.dialog-confirm .custom-dialog-message {
   flex: 1;
+  min-height: 0;
+  overflow-y: auto;
   display: flex;
-  align-items: center;
+  align-items: safe center;
   justify-content: center;
   padding: 32px 16px;
   text-align: center;

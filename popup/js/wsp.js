@@ -393,12 +393,14 @@ class WorkspaceUI {
         if (result && result.exportedWorkspaces > 0) {
           await showCustomDialog({
             message: `Saved ${result.exportedWorkspaces} workspace(s) to bookmarks ` +
-              `under "Workspaces". Restore them any time via "Restore from bookmarks".`
+              `under "Workspaces". Restore them any time via "Restore from bookmarks".`,
+            infoOnly: true
           });
         } else if (result && result.alreadyExported) {
           await showCustomDialog({
             message: `The workspace tab lists were already saved to bookmarks under ` +
-              `"Workspaces". Restore them any time via "Restore from bookmarks".`
+              `"Workspaces". Restore them any time via "Restore from bookmarks".`,
+            infoOnly: true
           });
         }
       }
@@ -423,7 +425,7 @@ class WorkspaceUI {
       dump = await this._callBackgroundTask("getDiagnostics");
     } catch (e) {
       console.warn("[WSP][_copyDiagnostics] failed:", e?.message);
-      await showCustomDialog({ message: "Failed to read diagnostics: " + (e?.message || e) });
+      await showCustomDialog({ message: "Failed to read diagnostics: " + (e?.message || e), infoOnly: true });
       return;
     }
     const json = JSON.stringify(dump, null, 2);
@@ -432,11 +434,12 @@ class WorkspaceUI {
       console.log("[WSP][_copyDiagnostics] copied", json.length, "chars");
       await showCustomDialog({
         message: `Diagnostics copied to clipboard (${json.length} chars). ` +
-          `Includes workspace metadata + URL snapshots -- review before sharing.`
+          `Includes workspace metadata + URL snapshots -- review before sharing.`,
+        infoOnly: true
       });
     } catch (e) {
       console.warn("[WSP][_copyDiagnostics] clipboard write failed:", e?.message);
-      await showCustomDialog({ message: "Clipboard write blocked. JSON length: " + json.length });
+      await showCustomDialog({ message: "Clipboard write blocked. JSON length: " + json.length, infoOnly: true });
     }
   }
 
@@ -519,7 +522,7 @@ class WorkspaceUI {
 
         const folders = await this._callBackgroundTask("getBookmarkWorkspaces");
         if (!folders || folders.length === 0) {
-          await showCustomDialog({ message: "No saved workspaces found in bookmarks." });
+          await showCustomDialog({ message: "No saved workspaces found in bookmarks.", infoOnly: true });
           return;
         }
 
@@ -728,7 +731,7 @@ class WorkspaceUI {
       // visibly happened. Surface them; fire-and-forget so callers that
       // close the popup right after are not blocked.
       if (result._userFacing && result.message) {
-        showCustomDialog({ message: result.message }).catch(() => {});
+        showCustomDialog({ message: result.message, infoOnly: true }).catch(() => {});
       }
       return null;
     }
@@ -870,12 +873,13 @@ class WorkspaceUI {
         // silently not closing) tabs the user believes are backed up is the
         // data-loss path this dialog exists to prevent.
         if (result.checked && !exportResult.destroyed && exportResult.destroyRefusedMessage) {
-          await showCustomDialog({ message: exportResult.destroyRefusedMessage });
+          await showCustomDialog({ message: exportResult.destroyRefusedMessage, infoOnly: true });
         } else if (exportResult.exported < exportResult.total) {
           await showCustomDialog({
             message: `Exported ${exportResult.exported} of ${exportResult.total} tabs. ` +
               `${exportResult.total - exportResult.exported} tab(s) could not be bookmarked ` +
-              `(pages like about:, file: or reader view cannot be saved as bookmarks).`
+              `(pages like about:, file: or reader view cannot be saved as bookmarks).`,
+            infoOnly: true
           });
         }
 
