@@ -2,7 +2,8 @@
 // Loads the real backend scripts into one shared vm context, mirroring the
 // MV2 background's single global scope and manifest load order. All browser
 // APIs are stubbed; storage.local is backed by a plain object the test can
-// inspect and pre-seed.
+// inspect and pre-seed (values are structured-cloned in and out, as in
+// Firefox). For stateful tab/window scenarios see ./world.mjs.
 import { readFileSync } from "node:fs";
 import { createContext, runInContext } from "node:vm";
 import { fileURLToPath } from "node:url";
@@ -23,36 +24,73 @@ const LOAD_ORDER = [
   "backend/handler.js",
 ];
 
-function makeEvent() {
+// `_listeners` holds the bare functions (tests call them directly);
+// `_entries` pairs each with the optional filter passed as addListener's
+// second argument (e.g. tabs.onUpdated's {properties: [...]}), so a
+// dispatcher such as ./world.mjs can deliver only what Firefox would.
+export function makeEvent() {
   const listeners = [];
+  const entries = [];
   return {
-    addListener: (fn) => listeners.push(fn),
+    addListener: (fn, filter) => { listeners.push(fn); entries.push({ fn, filter }); },
     removeListener: (fn) => {
       const i = listeners.indexOf(fn);
       if (i !== -1) listeners.splice(i, 1);
+      const j = entries.findIndex(e => e.fn === fn);
+      if (j !== -1) entries.splice(j, 1);
     },
     hasListener: (fn) => listeners.includes(fn),
     _listeners: listeners,
+    _entries: entries,
   };
 }
 
-export function makeBrowserStub({ storageData = {}, overrides = {} } = {}) {
+// Real storage.local structured-clones every value on the way in and on the
+// way out, so a caller never shares an object with storage or with another
+// caller. A stub that hands out live references makes two interleaved
+// read-modify-writes compose (both push into the same array) instead of the
+// second overwriting the first, which hides every lost-update race. Values
+// cross the vm boundary as main-realm objects; the backend never uses
+// instanceof on stored data, and tests can deepEqual them directly.
+// `latencyMs` (optional) adds a timer hop per call to model the IPC round
+// trip; 0 (default) keeps a microtask-only stub.
+export function makeStorageArea(storageData = {}, { latencyMs = 0 } = {}) {
+  const clone = (v) => (v === undefined ? undefined : structuredClone(v));
+  const hop = () => (latencyMs > 0 ? new Promise((r) => setTimeout(r, latencyMs)) : null);
+  return {
+    get: async (keys) => {
+      await hop();
+      if (keys == null) return clone({ ...storageData });
+      // Object form: { key: defaultValue } returns the default for a missing key.
+      if (typeof keys === "object" && !Array.isArray(keys)) {
+        const out = {};
+        for (const [k, dflt] of Object.entries(keys)) out[k] = clone(k in storageData ? storageData[k] : dflt);
+        return out;
+      }
+      const out = {};
+      for (const k of [].concat(keys)) if (k in storageData) out[k] = clone(storageData[k]);
+      return out;
+    },
+    set: async (obj) => {
+      // Clone synchronously (before the hop) like the real API, which
+      // serializes its argument at call time: a caller mutating the object
+      // after set() must not change what gets stored.
+      const copy = structuredClone(obj);
+      await hop();
+      Object.assign(storageData, copy);
+    },
+    remove: async (keys) => {
+      await hop();
+      for (const k of [].concat(keys)) delete storageData[k];
+    },
+  };
+}
+
+export function makeBrowserStub({ storageData = {}, overrides = {}, storageLatencyMs = 0 } = {}) {
   let bookmarkSeq = 0;
   const stub = {
     storage: {
-      local: {
-        get: async (keys) => {
-          if (keys == null) return { ...storageData };
-          const list = Array.isArray(keys) ? keys : [keys];
-          const out = {};
-          for (const k of list) if (k in storageData) out[k] = storageData[k];
-          return out;
-        },
-        set: async (obj) => { Object.assign(storageData, obj); },
-        remove: async (keys) => {
-          for (const k of Array.isArray(keys) ? keys : [keys]) delete storageData[k];
-        },
-      },
+      local: makeStorageArea(storageData, { latencyMs: storageLatencyMs }),
       session: { get: async () => ({}), set: async () => {} },
       onChanged: makeEvent(),
     },
@@ -126,8 +164,8 @@ export function makeBrowserStub({ storageData = {}, overrides = {} } = {}) {
   return stub;
 }
 
-export function loadBackend({ storageData = {}, overrides = {} } = {}) {
-  const browser = makeBrowserStub({ storageData, overrides });
+export function loadBackend({ storageData = {}, overrides = {}, storageLatencyMs = 0 } = {}) {
+  const browser = makeBrowserStub({ storageData, overrides, storageLatencyMs });
   const sandbox = {
     browser,
     console: { log() {}, warn() {}, error() {}, debug() {}, info() {} },
