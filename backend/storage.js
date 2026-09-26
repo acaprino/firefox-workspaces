@@ -81,10 +81,10 @@ class WSPStorageManager {
   //  - Downgrades (AMO rollback, an older unlisted build) cannot be migrated
   //    back: the older build keeps running on the newer data, never stamps
   //    the stored version down, warns in the console and flags the mismatch
-  //    in the diagnostics dump (`_storedSchemaVersion`).
+  //    in the diagnostics dump (`_storedSchemaVersion`, `_schemaDowngrade`).
   static SCHEMA_VERSION = 2;
   static _MIGRATIONS = {
-    // 2: v1 -> v2 needed no data rewrite (fields added with defaults only).
+    // 2: none -- v1 -> v2 shipped without a data rewrite.
   };
   // Version found in storage at startup, before any migration (diagnostics).
   static _storedSchemaVersion = null;
