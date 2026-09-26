@@ -219,7 +219,8 @@ body {
   transition: background-color 0.08s ease-out;
 }
 
-.wsp-search-result:hover {
+.wsp-search-result:hover,
+.wsp-search-result:focus-visible {
   background: var(--wsp-hover);
 }
 
@@ -309,6 +310,25 @@ li.wsp-list-item.active.has-color {
   border-left-style: solid;
 }
 
+/* Row body: the focusable switch target (role=button) around the dot, icon,
+   name and tab count. It fills the row; the focus ring goes on the row. */
+li.wsp-list-item .wsp-row-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+}
+
+li.wsp-list-item .wsp-row-main:focus-visible {
+  outline: none;
+}
+
+li.wsp-list-item:has(> .wsp-row-main:focus-visible) {
+  outline: 2px solid var(--wsp-focus);
+  outline-offset: -2px;
+}
+
 li.wsp-list-item img.wsp-icon {
   flex-shrink: 0;
   width: 16px;
@@ -372,13 +392,19 @@ li.wsp-list-item .edit-btn {
   opacity: 0;
 }
 
-li.wsp-list-item:hover .edit-btn {
+/* Also on keyboard focus: a focused control must not be invisible. */
+li.wsp-list-item:hover .edit-btn,
+li.wsp-list-item:has(:focus-visible) .edit-btn {
   opacity: 0.7;
 }
 
 li.wsp-list-item .edit-btn:hover {
   opacity: 1;
   background: var(--wsp-active);
+}
+
+li.wsp-list-item .edit-btn:focus-visible {
+  opacity: 1;
 }
 
 li.wsp-list-item .export-btn {
@@ -666,11 +692,13 @@ li.no-wsp {
   mask-size: contain;
 }
 
-.wsp-closed-tab-item:hover .wsp-closed-tab-restore {
+.wsp-closed-tab-item:hover .wsp-closed-tab-restore,
+.wsp-closed-tab-item:has(:focus-visible) .wsp-closed-tab-restore {
   opacity: 0.7;
 }
 
-.wsp-closed-tab-restore:hover {
+.wsp-closed-tab-restore:hover,
+.wsp-closed-tab-restore:focus-visible {
   opacity: 1 !important;
 }
 

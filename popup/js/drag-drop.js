@@ -45,20 +45,39 @@ class DragDropHandler {
         li.before(this.dragSrcEl);
       }
 
-      // Save new order (wspIds are UUID strings — do NOT coerce to Number)
-      const newOrder = [...wspList.querySelectorAll("li.wsp-list-item")].map(
-        el => el.dataset.wspId
-      );
-      await this._callBackgroundTask("saveWorkspaceOrder", {
-        windowId: this._currentWindowId,
-        orderedIds: newOrder
-      });
+      await this._saveOrder();
     });
 
     li.addEventListener("dragend", () => {
       li.classList.remove("dragging");
       document.querySelectorAll(".drag-over").forEach(el => el.classList.remove("drag-over"));
       this.dragSrcEl = null;
+    });
+  }
+
+  // Keyboard alternative to dragging (Alt+Up / Alt+Down on a row): swap the
+  // row with its neighbour and save. The neighbour is the node that moves,
+  // so the row keeps keyboard focus (moving a focused node drops focus).
+  async moveBy(li, delta) {
+    const sibling = delta < 0 ? li.previousElementSibling : li.nextElementSibling;
+    if (!sibling || !sibling.classList.contains("wsp-list-item")) return;
+    if (delta < 0) {
+      li.after(sibling);
+    } else {
+      li.before(sibling);
+    }
+    await this._saveOrder();
+  }
+
+  async _saveOrder() {
+    // Save new order (wspIds are UUID strings -- do NOT coerce to Number)
+    const wspList = document.getElementById("wsp-list");
+    const newOrder = [...wspList.querySelectorAll("li.wsp-list-item")].map(
+      el => el.dataset.wspId
+    );
+    await this._callBackgroundTask("saveWorkspaceOrder", {
+      windowId: this._currentWindowId,
+      orderedIds: newOrder
     });
   }
 }

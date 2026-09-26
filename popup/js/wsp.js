@@ -133,6 +133,23 @@ function applyTheme(theme) {
 }
 // ─────────────────────────────────────────────────────────────
 
+// Give a role="button" element the keyboard behaviour of a real <button>:
+// Enter activates on keydown (never on auto-repeat), Space on keyup.
+function _bindButtonKeys(el) {
+  el.addEventListener("keydown", (e) => {
+    if (e.target !== el || e.altKey || e.ctrlKey || e.metaKey || e.isComposing) return;
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      if (e.key === "Enter" && !e.repeat) el.click();
+    }
+  });
+  el.addEventListener("keyup", (e) => {
+    if (e.target !== el || e.key !== " ") return;
+    e.preventDefault();
+    el.click();
+  });
+}
+
 class WorkspaceUI {
   constructor() {
     this.workspaces = [];
@@ -229,6 +246,7 @@ class WorkspaceUI {
       "workspaces:", this.workspaces.length,
       this.workspaces.map(w => `"${w.name}"(${w.tabs.length}t,active:${w.active})`));
     this.displayWorkspaces();
+    this._bindArrowNavigation(document.getElementById("wsp-list"), ".wsp-row-main");
     this._setupCreateButton();
     this._setupRestoreButton();
     this._setupDiagnosticsLink();
@@ -564,69 +582,107 @@ class WorkspaceUI {
     const wspList = document.getElementById("wsp-list");
     const closedTabs = document.getElementById("wsp-closed-tabs");
     let debounceTimer = null;
+    let searchSeq = 0;
+    let pendingSearch = null;
+
+    const runSearch = async () => {
+      const seq = ++searchSeq;
+      const query = searchInput.value.trim();
+      if (query.length === 0) {
+        searchResults.hidden = true;
+        searchResults.replaceChildren();
+        wspList.hidden = false;
+        closedTabs.hidden = false;
+        this.showClosedTabs();
+        return;
+      }
+
+      const results = await this._callBackgroundTask("searchTabs", {
+        query,
+        windowId: this.currentWindowId
+      });
+      // A newer keystroke started another search: drop this stale reply.
+      if (seq !== searchSeq) return;
+
+      searchResults.replaceChildren();
+      wspList.hidden = true;
+      closedTabs.hidden = true;
+
+      if (!results || results.length === 0) {
+        const empty = document.createElement("div");
+        empty.className = "wsp-search-empty";
+        empty.textContent = "No matching tabs found";
+        searchResults.replaceChildren(empty);
+        searchResults.hidden = false;
+        return;
+      }
+
+      for (const r of results) {
+        const item = document.createElement("div");
+        item.classList.add("wsp-search-result");
+        item.dataset.wspId = r.wspId;
+        item.dataset.tabId = r.tabId;
+        item.setAttribute("role", "button");
+        item.tabIndex = 0;
+        _bindButtonKeys(item);
+
+        const titleEl = document.createElement("span");
+        titleEl.classList.add("wsp-search-result-title");
+        titleEl.textContent = r.title;
+        item.appendChild(titleEl);
+
+        const wspEl = document.createElement("span");
+        wspEl.classList.add("wsp-search-result-wsp");
+        wspEl.textContent = r.wspName;
+        item.appendChild(wspEl);
+
+        item.addEventListener("click", () => {
+          // Fire-and-forget, same rationale as the workspace click.
+          this._callBackgroundTask("activateWorkspace", {
+            wspId: r.wspId,
+            windowId: this.currentWindowId,
+            tabId: r.tabId
+          }).catch(() => {});
+          window.close();
+        });
+
+        searchResults.appendChild(item);
+      }
+      searchResults.hidden = false;
+    };
 
     searchInput.addEventListener("input", () => {
       clearTimeout(debounceTimer);
-      debounceTimer = setTimeout(async () => {
-        const query = searchInput.value.trim();
-        if (query.length === 0) {
-          searchResults.hidden = true;
-          searchResults.replaceChildren();
-          wspList.hidden = false;
-          closedTabs.hidden = false;
-          this.showClosedTabs();
-          return;
-        }
-
-        const results = await this._callBackgroundTask("searchTabs", {
-          query,
-          windowId: this.currentWindowId
-        });
-
-        searchResults.replaceChildren();
-        wspList.hidden = true;
-        closedTabs.hidden = true;
-
-        if (!results || results.length === 0) {
-          const empty = document.createElement("div");
-          empty.className = "wsp-search-empty";
-          empty.textContent = "No matching tabs found";
-          searchResults.replaceChildren(empty);
-          searchResults.hidden = false;
-          return;
-        }
-
-        for (const r of results) {
-          const item = document.createElement("div");
-          item.classList.add("wsp-search-result");
-          item.dataset.wspId = r.wspId;
-          item.dataset.tabId = r.tabId;
-
-          const titleEl = document.createElement("span");
-          titleEl.classList.add("wsp-search-result-title");
-          titleEl.textContent = r.title;
-          item.appendChild(titleEl);
-
-          const wspEl = document.createElement("span");
-          wspEl.classList.add("wsp-search-result-wsp");
-          wspEl.textContent = r.wspName;
-          item.appendChild(wspEl);
-
-          item.addEventListener("click", () => {
-            // Fire-and-forget, same rationale as the workspace click.
-            this._callBackgroundTask("activateWorkspace", {
-              wspId: r.wspId,
-              windowId: this.currentWindowId,
-              tabId: r.tabId
-            }).catch(() => {});
-            window.close();
-          });
-
-          searchResults.appendChild(item);
-        }
-        searchResults.hidden = false;
+      debounceTimer = setTimeout(() => {
+        debounceTimer = null;
+        pendingSearch = runSearch();
       }, 150);
     });
+
+    // Enter opens the first hit; Down moves into the results (or the list).
+    searchInput.addEventListener("keydown", async (e) => {
+      if (e.isComposing || e.keyCode === 229) return;
+      if (e.key === "Enter" && !e.repeat) {
+        e.preventDefault();
+        // Run a still-debounced search now, so the hit matches what was typed.
+        if (debounceTimer !== null) {
+          clearTimeout(debounceTimer);
+          debounceTimer = null;
+          pendingSearch = runSearch();
+        }
+        await pendingSearch;
+        if (!searchResults.hidden) searchResults.querySelector(".wsp-search-result")?.click();
+      } else if (e.key === "ArrowDown") {
+        const first = searchResults.hidden
+          ? wspList.querySelector(".wsp-row-main")
+          : searchResults.querySelector(".wsp-search-result");
+        if (first) {
+          e.preventDefault();
+          first.focus();
+        }
+      }
+    });
+    this._bindArrowNavigation(searchResults, ".wsp-search-result");
 
     // Focus search on Ctrl+F
     document.addEventListener("keydown", (e) => {
@@ -678,6 +734,7 @@ class WorkspaceUI {
       restoreBtn.type = "button";
       restoreBtn.classList.add("wsp-closed-tab-restore");
       restoreBtn.title = "Restore tab";
+      restoreBtn.setAttribute("aria-label", `Restore "${tab.title || tab.url}"`);
 
       li.addEventListener("click", async () => {
         // Disable all closed-tab items to prevent double clicks
@@ -706,6 +763,25 @@ class WorkspaceUI {
       await this._callBackgroundTask("clearClosedTabs", { wspId: activeWsp.id });
       container.hidden = true;
     };
+  }
+
+  // Up/Down move focus between the items of a list (workspace rows, search
+  // results); Up from the first item returns to the search box.
+  _bindArrowNavigation(container, itemSelector) {
+    container.addEventListener("keydown", (e) => {
+      if (e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+      if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+      const items = [...container.querySelectorAll(itemSelector)];
+      const i = items.indexOf(e.target);
+      if (i === -1) return;
+      e.preventDefault();
+      const next = items[i + (e.key === "ArrowDown" ? 1 : -1)];
+      if (next) {
+        next.focus();
+      } else if (e.key === "ArrowUp" && !document.getElementById("wsp-search").hidden) {
+        document.getElementById("wsp-search-input").focus();
+      }
+    });
   }
 
   async _callBackgroundTask(action, args) {
@@ -751,6 +827,20 @@ class WorkspaceUI {
     li.dataset.wspId = workspace.id;
     li.draggable = true;
 
+    // Row body: the keyboard and screen-reader target for switching, holding
+    // the dot, icon, name and tab count. A role="button" element, not a
+    // <button>, so dragging the row still works (Firefox does not start a
+    // drag from a <button>). The action buttons stay outside it: a button's
+    // children are presentational to assistive technology.
+    const main = document.createElement("div");
+    main.classList.add("wsp-row-main");
+    main.setAttribute("role", "button");
+    main.tabIndex = 0;
+    main.setAttribute("aria-keyshortcuts", "Alt+ArrowUp Alt+ArrowDown");
+    if (workspace.active) main.setAttribute("aria-current", "true");
+    _bindButtonKeys(main);
+    li.appendChild(main);
+
     // Container color dot (Tier 2) — always reserve space for alignment
     const dot = document.createElement("span");
     dot.classList.add("wsp-container-dot");
@@ -763,12 +853,13 @@ class WorkspaceUI {
     } else {
       dot.style.visibility = "hidden";
     }
-    li.appendChild(dot);
+    main.appendChild(dot);
 
     let iconEl = null;
     if (workspace.icon) {
       iconEl = _createIconElement(workspace.icon, "wsp-icon");
-      li.appendChild(iconEl);
+      iconEl.alt = ""; // decorative: the name follows
+      main.appendChild(iconEl);
     }
 
     const span1 = document.createElement("span");
@@ -776,28 +867,39 @@ class WorkspaceUI {
     span1.spellcheck = false;
     span1.textContent = workspace.name;
     span1.title = workspace.name;
-    li.appendChild(span1);
+    main.appendChild(span1);
 
     const span2 = document.createElement("span");
     span2.classList.add("tabs-qty");
     span2.textContent = workspace.tabs.length + " tabs";
-    li.appendChild(span2);
+    main.appendChild(span2);
 
+    // Icon-only actions, in visual order (export, rename, delete) so Tab
+    // follows what the user sees. aria-label names the workspace.
     const exportBtn = document.createElement("button");
     exportBtn.type = "button";
     exportBtn.classList.add("edit-btn", "export-btn");
     exportBtn.title = "Export to bookmarks";
     li.appendChild(exportBtn);
 
-    const deleteBtn = document.createElement("button");
-    deleteBtn.type = "button";
-    deleteBtn.classList.add("edit-btn", "delete-btn");
-    li.appendChild(deleteBtn);
-
     const renameBtn = document.createElement("button");
     renameBtn.type = "button";
     renameBtn.classList.add("edit-btn", "rename-btn");
+    renameBtn.title = "Rename workspace";
     li.appendChild(renameBtn);
+
+    const deleteBtn = document.createElement("button");
+    deleteBtn.type = "button";
+    deleteBtn.classList.add("edit-btn", "delete-btn");
+    deleteBtn.title = "Delete workspace";
+    li.appendChild(deleteBtn);
+
+    const labelActions = (name) => {
+      exportBtn.setAttribute("aria-label", `Export workspace "${name}" to bookmarks`);
+      renameBtn.setAttribute("aria-label", `Rename workspace "${name}"`);
+      deleteBtn.setAttribute("aria-label", `Delete workspace "${name}"`);
+    };
+    labelActions(workspace.name);
 
     li.dataset.originalText = span1.textContent;
     li.dataset.wspIcon = workspace.icon || "";
@@ -811,6 +913,13 @@ class WorkspaceUI {
     // ── Tab preview tooltip on hover (Tier 3) ──
     this._tooltip.attach(li, workspace.id, () => this._dragDrop.dragSrcEl !== null);
 
+    // Keyboard alternative to drag and drop: Alt+Up / Alt+Down.
+    main.addEventListener("keydown", (e) => {
+      if (!e.altKey || e.ctrlKey || e.metaKey || (e.key !== "ArrowUp" && e.key !== "ArrowDown")) return;
+      e.preventDefault();
+      this._dragDrop.moveBy(li, e.key === "ArrowUp" ? -1 : 1);
+    });
+
     // Switch workspace
     li.addEventListener("click", async () => {
       if (li.classList.contains("active")) {
@@ -819,11 +928,8 @@ class WorkspaceUI {
       }
       console.log("[WorkspaceUI][switchWorkspace] activating:", workspace.id, workspace.name);
 
-      const lis = document.querySelectorAll("li.wsp-list-item.active");
-      for (const activeLi of lis) {
-        activeLi.classList.remove("active");
-      }
-      li.classList.add("active");
+      this._removePreviouslyActiveLi();
+      this._setRowActive(li, true);
 
       // Fire-and-forget: the background completes the activation regardless
       // of popup lifetime (persistent MV2 page). Awaiting the full hide/show
@@ -837,10 +943,12 @@ class WorkspaceUI {
     });
 
     // Export to bookmarks
+    // Re-entrancy guards use data-busy, not `disabled`: a disabled button
+    // cannot take focus back when the dialog closes.
     exportBtn.addEventListener("click", async (e) => {
       e.stopPropagation();
-      if (exportBtn.disabled) return;
-      exportBtn.disabled = true;
+      if (exportBtn.dataset.busy) return;
+      exportBtn.dataset.busy = "1";
       try {
         console.log("[WorkspaceUI][exportBtn] clicked for workspace:", workspace.id, workspace.name);
 
@@ -887,15 +995,15 @@ class WorkspaceUI {
           const wasActive = li.classList.contains("active");
           if (li.parentNode) {
             const liParent = li.parentElement;
-            li.parentNode.removeChild(li);
+            this._removeRow(li);
             if (wasActive && exportResult.activatedWspId) {
               const targetLi = liParent.querySelector(`[data-wsp-id="${exportResult.activatedWspId}"]`);
-              if (targetLi) targetLi.classList.add("active");
+              if (targetLi) this._setRowActive(targetLi, true);
             }
           }
         }
       } finally {
-        exportBtn.disabled = false;
+        delete exportBtn.dataset.busy;
       }
     });
 
@@ -943,18 +1051,16 @@ class WorkspaceUI {
         li.dataset.originalText = wspName;
         li.dataset.wspIcon = wspIcon;
         span1.textContent = wspName;
+        span1.title = wspName;
+        labelActions(wspName);
 
         // Update icon element
         if (iconEl && iconEl.parentElement) iconEl.remove();
         if (wspIcon) {
           iconEl = _createIconElement(wspIcon, "wsp-icon");
-          // Insert after container dot if present
-          const firstSpan = li.querySelector("span:not(.wsp-container-dot)");
-          if (firstSpan) {
-            li.insertBefore(iconEl, firstSpan);
-          } else {
-            li.appendChild(iconEl);
-          }
+          iconEl.alt = "";
+          // Between the container dot and the name
+          span1.before(iconEl);
         } else {
           iconEl = null;
         }
@@ -1000,8 +1106,8 @@ class WorkspaceUI {
     // Delete
     deleteBtn.addEventListener("click", async (e) => {
       e.stopPropagation();
-      if (deleteBtn.disabled) return;
-      deleteBtn.disabled = true;
+      if (deleteBtn.dataset.busy) return;
+      deleteBtn.dataset.busy = "1";
       try {
         console.log("[WorkspaceUI][deleteBtn] clicked for workspace:", workspace.id, workspace.name);
 
@@ -1027,19 +1133,19 @@ class WorkspaceUI {
 
         if (li.parentNode) {
           const liParent = li.parentElement;
-          li.parentNode.removeChild(li);
+          this._removeRow(li);
 
           if (wasActive && destroyResult.activatedWspId) {
             const targetLi = liParent.querySelector(`[data-wsp-id="${destroyResult.activatedWspId}"]`);
             if (targetLi) {
               console.log("[WorkspaceUI][deleteBtn] marking activated:", destroyResult.activatedWspId);
-              targetLi.classList.add("active");
+              this._setRowActive(targetLi, true);
             }
           }
         }
         console.log("[WorkspaceUI][deleteBtn] done");
       } finally {
-        deleteBtn.disabled = false;
+        delete deleteBtn.dataset.busy;
       }
     });
 
@@ -1067,8 +1173,26 @@ class WorkspaceUI {
   _removePreviouslyActiveLi() {
     const lis = document.querySelectorAll(".wsp-list-item.active");
     for (const li of lis) {
-      li.classList.remove("active");
+      this._setRowActive(li, false);
     }
+  }
+
+  // Keep the visual "active" class and the screen-reader state in step.
+  _setRowActive(li, active) {
+    li.classList.toggle("active", active);
+    const main = li.querySelector(".wsp-row-main");
+    if (!main) return;
+    if (active) main.setAttribute("aria-current", "true");
+    else main.removeAttribute("aria-current");
+  }
+
+  // Remove a workspace row. If it held keyboard focus, hand focus to the
+  // neighbouring row instead of letting it fall to <body>.
+  _removeRow(li) {
+    const neighbour = li.nextElementSibling || li.previousElementSibling;
+    const hadFocus = li.contains(document.activeElement);
+    li.remove();
+    if (hadFocus) neighbour?.querySelector(".wsp-row-main")?.focus();
   }
 }
 
