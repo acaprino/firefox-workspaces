@@ -134,13 +134,15 @@ export function makeWorld({
 
   // ── Event dispatch ──
   let queued = 0;
+  let stopped = false;
   const inflight = new Set();
   function fire(ns, name, ...args) {
+    if (stopped) return;
     const payload = clone(args);
     queued++;
     setTimeout(() => {
       queued--;
-      const ev = browserRef?.[ns]?.[name];
+      const ev = stopped ? null : browserRef?.[ns]?.[name];
       if (!ev) return;
       const entries = ev._entries ?? ev._listeners.map((fn) => ({ fn }));
       for (const { fn, filter } of [...entries]) {
@@ -168,7 +170,10 @@ export function makeWorld({
       await delay(0);
       if (inflight.size) {
         quiet = 0;
-        await Promise.race([Promise.allSettled([...inflight]), delay(Math.max(1, deadline - Date.now()))]);
+        let timer;
+        const timeout = new Promise((r) => { timer = setTimeout(r, Math.max(1, deadline - Date.now())); });
+        await Promise.race([Promise.allSettled([...inflight]), timeout]);
+        clearTimeout(timer);
         continue;
       }
       quiet = queued === 0 ? quiet + 1 : 0;
@@ -280,7 +285,9 @@ export function makeWorld({
     return pinned ? Math.min(idx, np) : Math.max(np, idx);
   }
 
-  function createTab(props = {}, { restoredValues } = {}) {
+  // `restore` (internal): session values Firefox puts back before the
+  // extension hears about the tab.
+  function createTab(props = {}, restore = null) {
     const w = requireWindow(props.windowId);
     const cookieStoreId = props.cookieStoreId ?? (w.incognito ? "firefox-private" : "firefox-default");
     checkCookieStore(cookieStoreId, w);
@@ -296,7 +303,7 @@ export function makeWorld({
     };
     tabs.set(t.id, t);
     w.tabIds.splice(insertIndex(w, t.pinned, props.index), 0, t.id);
-    if (restoredValues) values.set(t.id, new Map(restoredValues));
+    if (restore?.values) values.set(t.id, new Map(restore.values));
     const mustSelect = props.active !== false || !activeOf(w);
     const activated = mustSelect ? select(t, { deferEvent: true }) : null;
     emit("tabs", "onCreated", snap(t));
@@ -305,13 +312,10 @@ export function makeWorld({
     return t;
   }
 
-  function recordClosedTab(t, w) {
-    closed.unshift({
-      lastModified: now(),
-      tab: { ...snap(t), id: undefined, active: false, sessionId: String(nextSessionId++) },
-      values: new Map(values.get(t.id) ?? []),
-      windowId: w.id,
-    });
+  // Closed-tab objects carry a sessionId instead of an id.
+  function closedSnap(t) {
+    const { id, ...rest } = snap(t);
+    return { ...rest, sessionId: String(nextSessionId++) };
   }
 
   // Close one tab. `exclude` = other tabs removed in the same call (never
@@ -319,36 +323,32 @@ export function makeWorld({
   function removeTab(t, { exclude = new Set() } = {}) {
     if (tabs.get(t.id) !== t) return;
     const w = windows.get(t.windowId);
-    const otherVisible = tabsOf(w).some((o) => o !== t && !o.hidden);
-    if (!t.hidden && !otherVisible) {
+    if (!t.hidden && !tabsOf(w).some((o) => o !== t && !o.hidden)) {
+      // Last visible tab (Firefox ignores hidden tabs when deciding this).
       if (closeWindowWithLastTab) { closeWindow(w.id); return; }
       createTab({ windowId: w.id, url: "about:newtab", active: false });
     }
     const blurTo = t.active ? findTabToBlurTo(t, exclude) : null;
-    recordClosedTab(t, w);
+    closed.unshift({
+      lastModified: now(), tab: { ...closedSnap(t), active: false },
+      values: new Map(values.get(t.id) ?? []), windowId: w.id,
+    });
     w.tabIds.splice(w.tabIds.indexOf(t.id), 1);
     tabs.delete(t.id);
     values.delete(t.id);
     emit("tabs", "onRemoved", t.id, { windowId: w.id, isWindowClosing: false });
-    if (t.active) {
-      const next = blurTo ?? findTabToBlurTo(tabsOf(w)[0] ?? t, exclude) ?? tabsOf(w).find((o) => !o.hidden);
-      if (next) {
-        const info = select(next, { deferEvent: true });
-        if (info) {
-          info.previousTabId = undefined; // the previous tab is gone
-          if (next.hidden === false && info) emit("tabs", "onActivated", info);
-        }
-      }
+    if (blurTo) {
+      // select() cannot see the closed tab any more: previousTabId stays
+      // undefined, as Firefox reports for a closing previous tab.
+      const info = select(blurTo, { deferEvent: true });
+      if (info) emit("tabs", "onActivated", info);
     }
     gcGroups();
   }
 
   function closeWindow(id) {
     const w = requireWindow(id);
-    const entryTabs = tabsOf(w).map((t) => ({
-      tab: { ...snap(t), id: undefined, sessionId: String(nextSessionId++) },
-      values: new Map(values.get(t.id) ?? []),
-    }));
+    const entryTabs = tabsOf(w).map((t) => ({ tab: closedSnap(t), values: new Map(values.get(t.id) ?? []) }));
     for (const t of tabsOf(w)) {
       tabs.delete(t.id);
       values.delete(t.id);
@@ -371,6 +371,9 @@ export function makeWorld({
 
   function createWindow({ type = "normal", incognito = false, state = "normal", focused = true,
     url, tabId, tabs: tabProps } = {}) {
+    if (tabId != null && windows.get(requireTab(tabId).windowId).incognito !== incognito) {
+      throw new Error("Cannot move a tab between private and non-private windows");
+    }
     const w = { id: nextWindowId++, type, incognito, state, tabIds: [] };
     windows.set(w.id, w);
     const prevFocus = focusedId;
@@ -438,10 +441,10 @@ export function makeWorld({
         emit("tabs", "onDetached", t.id, { oldWindowId: src.id, oldPosition: from });
         emit("tabs", "onAttached", t.id, { newWindowId: w.id, newPosition: point });
         if (!tabsOf(src).some((o) => !o.hidden)) {
-          closeWindow(src.id);
+          closeWindow(src.id); // swapBrowsersAndCloseOther: last visible tab left
         } else if (blurTo) {
           const info = select(blurTo, { deferEvent: true });
-          if (info) emit("tabs", "onActivated", { ...info, previousTabId: undefined });
+          if (info) emit("tabs", "onActivated", info);
         }
       }
       moved.push(t);
@@ -493,18 +496,18 @@ export function makeWorld({
       const t = createTab({
         windowId, url: entry.tab.url, title: entry.tab.title, pinned: entry.tab.pinned,
         index: entry.tab.index, cookieStoreId: entry.tab.cookieStoreId, active: true,
-      }, { restoredValues: entry.values });
+      }, { values: entry.values });
       return { lastModified: entry.lastModified, tab: snap(t) };
     }
-    const w = createWindow({
-      type: entry.window.type, incognito: entry.window.incognito, tabs: entry.window.tabs.map((tab) => ({
-        url: tab.url, title: tab.title, pinned: tab.pinned, cookieStoreId: tab.cookieStoreId,
-        active: tab.active,
-      })),
+    const w = createWindow({ type: entry.window.type, incognito: entry.window.incognito, tabs: [] });
+    const restored = entry.window.tabs.map((tab, k) => createTab({
+      windowId: w.id, url: tab.url, title: tab.title, pinned: tab.pinned,
+      cookieStoreId: tab.cookieStoreId, active: tab.active,
+    }, { values: entry.tabValues[k] }));
+    // SessionStore re-hides the tabs that were hidden (TabHide -> onUpdated).
+    restored.forEach((t, k) => {
+      if (entry.window.tabs[k].hidden && !t.active && !t.pinned) setHidden(t, true);
     });
-    // Firefox restores the saved values before the extension can query them.
-    tabsOf(w).forEach((t, k) => values.set(t.id, new Map(entry.tabValues[k])));
-    for (const [k, saved] of entry.window.tabs.entries()) if (saved.hidden) tabsOf(w)[k].hidden = !tabsOf(w)[k].active;
     return { lastModified: entry.lastModified, window: winSnap(w, { populate: true }) };
   }
 
@@ -725,14 +728,19 @@ export function makeWorld({
     // Deliver an arbitrary event to the backend's listeners (asynchronous,
     // filter-aware); ignores `autoEvents`.
     fire,
-    // Stop the backend's debounce timers so the test process can exit
-    // promptly (snapshot refresh waits 5 s).
+    // End of test: stop delivering events and cancel the backend's debounce
+    // timers (the snapshot refresh waits 5 s), including any that handlers
+    // still running would schedule, so the test process exits promptly.
     teardown() {
+      stopped = true;
       if (!env) return;
       const TabService = env.get("TabService");
+      TabService._scheduleSnapshotRefresh = () => {};
       for (const timer of TabService._snapshotTimers.values()) clearTimeout(timer);
       TabService._snapshotTimers.clear();
-      clearTimeout(env.get("WorkspaceService")._lastActiveTimer);
+      const WorkspaceService = env.get("WorkspaceService");
+      WorkspaceService.updateLastActiveTab = () => {};
+      clearTimeout(WorkspaceService._lastActiveTimer);
       clearTimeout(env.get("MenuService")._refreshTimer);
     },
 
