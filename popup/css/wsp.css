@@ -371,6 +371,11 @@ li.wsp-list-item.drag-over {
   box-shadow: inset 0 2px 0 color-mix(in srgb, var(--wsp-color) 55%, transparent);
 }
 
+/* Moving a row down drops it below the target: draw the line there. */
+li.wsp-list-item.drag-over.drag-over-below {
+  box-shadow: inset 0 -2px 0 color-mix(in srgb, var(--wsp-color) 55%, transparent);
+}
+
 /* ----------------------------------------------------------
    6. Action Buttons (Rename / Delete)
    ---------------------------------------------------------- */
@@ -1370,14 +1375,23 @@ li.no-wsp {
   background: var(--wsp-btn-hover);
 }
 
-.footer-diagnostic {
-  margin-left: auto;
-  opacity: 0.7;
+/* Small and muted, but always shown: it is the way to the diagnostic dump
+   when no banner is up, including in the restricted popup. */
+.footer#wsp-copy-diagnostics {
+  display: block;
+  width: auto;
+  padding: 4px 10px;
+  color: var(--wsp-text-secondary);
   font-size: 11px;
+  text-decoration: none;
+  text-align: start;
+  border-radius: var(--wsp-radius-sm);
+  cursor: default;
 }
 
-.footer-diagnostic:hover {
-  opacity: 1;
+.footer#wsp-copy-diagnostics:hover {
+  background: var(--wsp-hover);
+  color: var(--wsp-color);
 }
 
 /* "Give up" is destructive -- soft accent to set it apart from Dismiss. */

@@ -177,8 +177,20 @@ function showCustomDialog({ message, withInput = false, defaultValue = "", defau
 
     // Expand popup viewport so Firefox doesn't clip the dialog
     function syncPopupHeight() {
-      if (showFolderPicker || showCheckbox) {
+      if (showFolderPicker) {
         document.body.style.minHeight = "180px";
+        return;
+      }
+      if (showCheckbox) {
+        // Grow for a long message (the diagnostics notice) so the checkbox
+        // and the buttons stay in view.
+        let minHeight = 180;
+        if (backdrop.classList.contains("show")) {
+          const bodyEl = backdrop.querySelector(".custom-dialog-body");
+          const need = Math.ceil(msgEl.offsetHeight + bodyEl.scrollHeight + footerEl.offsetHeight);
+          if (Number.isFinite(need)) minHeight = Math.max(minHeight, need);
+        }
+        document.body.style.minHeight = `${minHeight}px`;
         return;
       }
       if (!withInput) {

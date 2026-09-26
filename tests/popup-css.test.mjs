@@ -1,7 +1,8 @@
 // tests/popup-css.test.mjs
 // Static checks on popup/css/wsp.css for rules no DOM stub can render:
-// forced colors (X-58), focus visibility of hover-only controls (X-25) and
-// the dialog message's paragraph breaks (X-57).
+// forced colors (X-58), focus visibility of hover-only controls (X-25), the
+// dialog message's paragraph breaks (X-57), the diagnostics link (X-48) and
+// the downward drop line (X-56).
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readPopupCss } from "./helpers/popup-dom.mjs";
@@ -56,4 +57,17 @@ test("X-25: row actions and closed-tab restore buttons show up on keyboard focus
 
 test("X-57: dialog messages keep their line breaks", () => {
   assert.equal(declsFor(".custom-dialog-message", null)["white-space"], "pre-line");
+});
+
+test("X-48: the Copy diagnostics footer link is displayed", () => {
+  // `.footer { display: none }` hides every footer link that no id rule
+  // shows again (the same pattern as #createNewWsp / #restoreFromBookmarks).
+  assert.equal(declsFor(".footer", null).display, "none");
+  const display = declsFor(".footer#wsp-copy-diagnostics", null).display;
+  assert.ok(display && display !== "none", `.footer#wsp-copy-diagnostics needs a display, got ${display}`);
+});
+
+test("X-56: moving a row down draws the drop line at the bottom of the target", () => {
+  const below = declsFor("li.wsp-list-item.drag-over.drag-over-below", null)["box-shadow"] || "";
+  assert.match(below, /^inset 0 -2px/);
 });

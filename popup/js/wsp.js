@@ -150,6 +150,76 @@ function _bindButtonKeys(el) {
   });
 }
 
+// Storage keys the popup watches. The literals match STORAGE_KEYS in
+// backend/storage.js (the popup does not load backend scripts).
+const PRIMARY_WINDOW_KEY = "primary-window-id";
+const LAST_RESTORE_ERROR_KEY = "ld-wsp-last-restore-error";
+
+// How long a workspace click keeps the popup open for the reply. A refusal
+// ("still starting up") comes back at once and must be shown before the
+// popup closes; a switch still running after this finishes in the
+// background page without the popup.
+const ACTIVATE_REPLY_GRACE_MS = 200;
+
+// Workspace names are capped at the limit the background enforces
+// (handler.js _sanitizeName, bookmark folder titles): 200 UTF-16 code units.
+// Cutting at the same limit here means a name is never cut again there, and
+// the cut never ends on the first half of a surrogate pair (half an emoji is
+// stored, and exported to bookmarks, as U+FFFD). Keep in sync with the
+// maxlength of #custom-dialog-input in wsp.html.
+const WSP_NAME_MAX = 200;
+function _clampWspName(name) {
+  let s = String(name).trim().slice(0, WSP_NAME_MAX);
+  if (/[\uD800-\uDBFF]$/.test(s)) s = s.slice(0, -1);
+  return s.trimEnd();
+}
+
+// The diagnostic dump is every ld-wsp-* storage key, including saved tab
+// addresses (tabSnapshot, lastActiveTabUrl) and recently closed tabs with
+// their titles and icons. The default copy keeps structure and counts but
+// cuts every web address down to its site and drops titles and icons, so a
+// dump pasted into a public bug report carries no browsing history or
+// tokens from URLs. Equal addresses get equal tags (salted per copy, so a
+// tag cannot be matched against a guessed address), which still shows
+// which saved entries point at the same page.
+const _DIAG_URL_RE = /\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>]*|\b(?:about|data|blob|javascript|view-source|mailto):[^\s"'<>]*/gi;
+function _redactDiagnostics(dump) {
+  const salt = Array.from(crypto.getRandomValues(new Uint32Array(2)), (n) => n.toString(36)).join("");
+  const tag = (s) => {
+    let h = 0x811c9dc5;
+    const t = salt + s;
+    for (let i = 0; i < t.length; i++) {
+      h = Math.imul(h ^ t.charCodeAt(i), 0x01000193) >>> 0;
+    }
+    return h.toString(16).padStart(8, "0");
+  };
+  const redactUrl = (u) => {
+    let url;
+    try { url = new URL(u); } catch { return `[url ${tag(u)}]`; }
+    if (/^(https?|wss?|ftp):$/.test(url.protocol)) {
+      const bare = url.pathname === "/" && !url.search && !url.hash && !url.username && !url.password;
+      return `${url.protocol}//${url.host}/` + (bare ? "" : `[${tag(u)}]`);
+    }
+    // about:home / about:newtab say something about the session; a query
+    // (about:reader?url=...) can hold a full address.
+    if (url.protocol === "about:") {
+      return `about:${url.pathname}` + (url.search || url.hash ? `[${tag(u)}]` : "");
+    }
+    return `${url.protocol}[${tag(u)}]`;
+  };
+  const walk = (v, key) => {
+    if (Array.isArray(v)) return v.map((x) => walk(x, key));
+    if (v && typeof v === "object") {
+      return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, walk(x, k)]));
+    }
+    if (typeof v !== "string" || v === "") return v;
+    if (key === "title") return "[title removed]";
+    if (key === "favIconUrl") return "[icon removed]";
+    return v.replace(_DIAG_URL_RE, redactUrl);
+  };
+  return walk(dump, null);
+}
+
 class WorkspaceUI {
   constructor() {
     this.workspaces = [];
@@ -157,6 +227,10 @@ class WorkspaceUI {
     this.currentWindowId = null;
     this._dragDrop = null;
     this._tooltip = null;
+    this._fullUi = false;
+    this._activating = false;
+    this._copyingDiagnostics = false;
+    this._closedTabsSeq = 0;
   }
 
   async initialize() {
@@ -208,26 +282,73 @@ class WorkspaceUI {
       }
     });
 
+    // The recovery surface (banner, diagnostics link) needs messaging only
+    // and works in every state, including the restricted view: a failed or
+    // aborted restore leaves NO primary window at all. Start it first and in
+    // parallel, so a warning written while the popup loads is not missed.
+    this._setupDiagnosticsLink();
+    const bannerReady = this._setupRestoreErrorBanner();
+
+    await this._watchPrimaryWindow();
+    await bannerReady;
+    console.log("[WorkspaceUI][initialize] done");
+  }
+
+  // Show the workspace UI when this window is the primary one, a notice
+  // otherwise. A restart restore claims the primary window last, possibly
+  // while the popup is open, so follow storage.onChanged and switch to the
+  // full UI then. The listener is registered before the first read, so a
+  // claim landing in between is not lost.
+  async _watchPrimaryWindow() {
+    let changes = 0;
+    const apply = (primaryWindowId) => {
+      if (this._fullUi) return undefined; // once shown, the list stays
+      if (primaryWindowId === this.currentWindowId) {
+        this._fullUi = true;
+        browser.storage.onChanged.removeListener(onChanged);
+        return this._showWorkspaces();
+      }
+      this._showRestricted(primaryWindowId ?? null);
+      return undefined;
+    };
+    const onChanged = (c, area) => {
+      if (area !== "local" || !(PRIMARY_WINDOW_KEY in c)) return;
+      changes++;
+      Promise.resolve(apply(c[PRIMARY_WINDOW_KEY].newValue))
+        .catch(e => console.warn("[WorkspaceUI][_watchPrimaryWindow] switch failed:", e));
+    };
+    browser.storage.onChanged.addListener(onChanged);
+
+    const seen = changes;
     const primaryWindowId = await this._callBackgroundTask("getPrimaryWindowId");
     console.log("[WorkspaceUI][initialize] primaryWindowId:", primaryWindowId,
       "currentWindowId:", this.currentWindowId,
       "isPrimary:", primaryWindowId === this.currentWindowId);
-    if (primaryWindowId !== this.currentWindowId) {
-      console.log("[WorkspaceUI][initialize] not primary window — showing restricted UI");
-      document.getElementById("createNewWsp").style.display = "none";
-      document.getElementById("restoreFromBookmarks").style.display = "none";
-      document.getElementById("wsp-search").hidden = true;
-      const noWspLi = document.createElement("li");
-      noWspLi.className = "no-wsp";
-      noWspLi.textContent = "Workspaces are only available in the primary window.";
-      document.getElementById("wsp-list").replaceChildren(noWspLi);
-      // A failed or aborted restore leaves NO primary window at all, so this
-      // branch is the only UI the user can reach in that state. The recovery
-      // banner and diagnostics link need messaging only, not workspace data.
-      this._setupDiagnosticsLink();
-      await this._setupRestoreErrorBanner();
-      return;
-    }
+    // A change event during the read already applied a newer value.
+    if (changes === seen) await apply(primaryWindowId);
+  }
+
+  _showRestricted(primaryWindowId) {
+    console.log("[WorkspaceUI][initialize] not primary window -- showing restricted UI, primary:", primaryWindowId);
+    document.getElementById("createNewWsp").style.display = "none";
+    document.getElementById("restoreFromBookmarks").style.display = "none";
+    document.getElementById("wsp-search").hidden = true;
+    const noWspLi = document.createElement("li");
+    noWspLi.className = "no-wsp";
+    // No primary window at all: a restart restore claims it last, and a
+    // failed or paused restore leaves none (the banner explains that case).
+    noWspLi.textContent = primaryWindowId == null
+      ? "Workspaces are not active yet - right after Firefox starts, they appear here once the previous session is restored."
+      : "Workspaces are only available in the primary window.";
+    document.getElementById("wsp-list").replaceChildren(noWspLi);
+  }
+
+  async _showWorkspaces() {
+    // Undo the restricted view (this window became the primary while the
+    // popup was open).
+    document.getElementById("createNewWsp").style.display = "";
+    document.getElementById("restoreFromBookmarks").style.display = "";
+    document.getElementById("wsp-search").hidden = false;
 
     this._dragDrop = new DragDropHandler(
       this._callBackgroundTask.bind(this),
@@ -241,19 +362,26 @@ class WorkspaceUI {
       this.getWorkspaces(this.currentWindowId)
     ]);
     this.containers = containers || [];
-    this.workspaces.push(...(workspaces || []));
+    const wspList = document.getElementById("wsp-list");
+    wspList.replaceChildren();
+    if (Array.isArray(workspaces)) {
+      this.workspaces.push(...workspaces);
+    } else {
+      // A failed read is not an empty list: say so instead of showing none.
+      const errLi = document.createElement("li");
+      errLi.className = "no-wsp";
+      errLi.textContent = "Could not load the workspaces - close and reopen this popup to try again.";
+      wspList.appendChild(errLi);
+    }
     console.log("[WorkspaceUI][initialize] containers:", this.containers.length,
       "workspaces:", this.workspaces.length,
       this.workspaces.map(w => `"${w.name}"(${w.tabs.length}t,active:${w.active})`));
     this.displayWorkspaces();
-    this._bindArrowNavigation(document.getElementById("wsp-list"), ".wsp-row-main");
+    this._bindArrowNavigation(wspList, ".wsp-row-main");
     this._setupCreateButton();
     this._setupRestoreButton();
-    this._setupDiagnosticsLink();
-    this._setupRestoreErrorBanner();
     this.setupSearch();
     this.showClosedTabs();
-    console.log("[WorkspaceUI][initialize] done");
   }
 
   // Render an inline banner when a restore-error payload is pending (see
@@ -273,29 +401,23 @@ class WorkspaceUI {
   // The banner stays in sync with the background via storage.onChanged.
   async _setupRestoreErrorBanner() {
     const banner = document.getElementById("wsp-error-banner");
-    if (!banner) return;
-    let info;
-    try {
-      info = await this._callBackgroundTask("getLastRestoreError");
-    } catch (e) {
-      console.debug("[WSP][_setupRestoreErrorBanner] getLastRestoreError failed:", e?.message);
-      return;
-    }
-    // Popup may have been torn down while we awaited the background reply.
-    // Re-fetch DOM nodes after the await and bail if any are missing.
     const text = document.getElementById("wsp-error-banner-text");
     const copyBtn = document.getElementById("wsp-error-copy");
     const ackBtn = document.getElementById("wsp-error-acknowledge");
     const giveUpBtn = document.getElementById("wsp-error-give-up");
-    if (!text || !copyBtn || !ackBtn || !giveUpBtn) return;
+    if (!banner || !text || !copyBtn || !ackBtn || !giveUpBtn) return;
 
     // Storage values can be edited via about:debugging; validate before
     // formatting them into user-visible text.
     const isFiniteNum = (v) => typeof v === "number" && Number.isFinite(v);
     // `when` of the payload currently rendered; echoed with dismiss/give-up.
     let displayedWhen = null;
+    // Bumped on every render. A fetched payload is rendered only if nothing
+    // rendered while it was in flight: a change event is always newer.
+    let renderSeq = 0;
 
     const render = (payload) => {
+      renderSeq++;
       if (!payload) {
         displayedWhen = null;
         banner.hidden = true;
@@ -354,12 +476,26 @@ class WorkspaceUI {
       banner.hidden = false;
     };
 
+    // Re-read the pending payload. False when the background could not be
+    // asked; the banner then keeps what it shows.
+    const refresh = async () => {
+      const seq = renderSeq;
+      let payload;
+      try {
+        payload = await this._request("getLastRestoreError");
+      } catch (e) {
+        console.debug("[WSP][_setupRestoreErrorBanner] getLastRestoreError failed:", e?.message);
+        return false;
+      }
+      if (seq === renderSeq) render(payload || null);
+      return true;
+    };
+
     // Keep the banner in sync with the background for the popup's lifetime:
     // a warning raised or replaced after open (slow session-loss export, a
-    // restore committing mid-popup) re-renders instead of going stale. The
-    // key literal matches STORAGE_KEYS.lastRestoreError in backend/storage.js
-    // (the popup does not load backend scripts).
-    const LAST_RESTORE_ERROR_KEY = "ld-wsp-last-restore-error";
+    // restore committing mid-popup) re-renders instead of going stale.
+    // Registered BEFORE the first read: a warning written between the
+    // background's read and a later registration would never reach this popup.
     browser.storage.onChanged.addListener((changes, area) => {
       if (area !== "local" || !(LAST_RESTORE_ERROR_KEY in changes)) return;
       render(changes[LAST_RESTORE_ERROR_KEY].newValue || null);
@@ -375,20 +511,25 @@ class WorkspaceUI {
       // even if the background storage write is slow. On failure or a stale
       // ack (payload changed since display) re-sync from storage so the
       // banner and the toolbar badge cannot disagree.
+      const when = displayedWhen;
       banner.hidden = true;
+      let result;
+      let error = null;
       try {
-        const result = await this._callBackgroundTask("acknowledgeLastRestoreError", { when: displayedWhen });
-        if (result && result.stale) {
-          const fresh = await this._callBackgroundTask("getLastRestoreError");
-          render(fresh);
-        }
+        result = await this._request("acknowledgeLastRestoreError", { when });
       } catch (e) {
         console.debug("[WSP][acknowledge] failed:", e?.message);
-        try { render(await this._callBackgroundTask("getLastRestoreError")); }
-        catch { banner.hidden = false; }
+        error = e;
       }
+      if (!error && !result?.stale) return;
+      if (!(await refresh())) banner.hidden = false;
+      if (error?.userFacing) await this._showFailure(error, null);
     });
     giveUpBtn.addEventListener("click", async () => {
+      // The confirm hides the banner while it is open, and the payload can
+      // change meanwhile (a restore committing, a session-loss warning):
+      // act only on the payload that was displayed when the user clicked.
+      const whenAtClick = displayedWhen;
       // showCustomDialog returns true on OK, false on Cancel for no-input dialogs.
       const ok = await showCustomDialog({
         message:
@@ -400,32 +541,49 @@ class WorkspaceUI {
           "If you have not copied the diagnostic dump yet, do that first."
       });
       if (!ok) return;
-      banner.hidden = true;
-      try {
-        const result = await this._callBackgroundTask("giveUpRestoreRetry", { when: displayedWhen });
-        if (result && result.stale) {
-          const fresh = await this._callBackgroundTask("getLastRestoreError");
-          render(fresh);
-          return;
-        }
-        if (result && result.exportedWorkspaces > 0) {
-          await showCustomDialog({
-            message: `Saved ${result.exportedWorkspaces} workspace(s) to bookmarks ` +
-              `under "Workspaces". Restore them any time via "Restore from bookmarks".`,
-            infoOnly: true
-          });
-        } else if (result && result.alreadyExported) {
-          await showCustomDialog({
-            message: `The workspace tab lists were already saved to bookmarks under ` +
-              `"Workspaces". Restore them any time via "Restore from bookmarks".`,
-            infoOnly: true
-          });
-        }
+      const showChanged = () => showCustomDialog({
+        message: "The restore status changed while this dialog was open, so nothing was given up." +
+          (banner.hidden ? "" : " The banner shows the current status."),
+        infoOnly: true
+      });
+      if (banner.hidden || displayedWhen !== whenAtClick) {
+        await showChanged();
+        return;
       }
-      catch (e) { console.debug("[WSP][giveUpRestoreRetry] failed:", e?.message); }
+      banner.hidden = true;
+      let result;
+      let error = null;
+      try {
+        result = await this._request("giveUpRestoreRetry", { when: whenAtClick });
+      } catch (e) {
+        console.debug("[WSP][giveUpRestoreRetry] failed:", e?.message);
+        error = e;
+      }
+      if (error || result?.stale) {
+        if (!(await refresh())) banner.hidden = false;
+        if (error) {
+          await this._showFailure(error, "Could not give up the restore retry. Please try again.");
+        } else {
+          await showChanged();
+        }
+        return;
+      }
+      if (result?.exportedWorkspaces > 0) {
+        await showCustomDialog({
+          message: `Saved ${result.exportedWorkspaces} workspace(s) to bookmarks ` +
+            `under "Workspaces". Restore them any time via "Restore from bookmarks".`,
+          infoOnly: true
+        });
+      } else if (result?.alreadyExported) {
+        await showCustomDialog({
+          message: `The workspace tab lists were already saved to bookmarks under ` +
+            `"Workspaces". Restore them any time via "Restore from bookmarks".`,
+          infoOnly: true
+        });
+      }
     });
 
-    render(info);
+    await refresh();
   }
 
   _setupDiagnosticsLink() {
@@ -437,27 +595,62 @@ class WorkspaceUI {
     });
   }
 
+  // Ask first, then copy: by default a redacted dump (see
+  // _redactDiagnostics), the full one only when the user ticks the box.
   async _copyDiagnostics() {
-    let dump;
+    // The banner button and the footer link share this; one dialog at a time.
+    if (this._copyingDiagnostics) return;
+    this._copyingDiagnostics = true;
     try {
-      dump = await this._callBackgroundTask("getDiagnostics");
-    } catch (e) {
-      console.warn("[WSP][_copyDiagnostics] failed:", e?.message);
-      await showCustomDialog({ message: "Failed to read diagnostics: " + (e?.message || e), infoOnly: true });
-      return;
-    }
-    const json = JSON.stringify(dump, null, 2);
-    try {
-      await navigator.clipboard.writeText(json);
-      console.log("[WSP][_copyDiagnostics] copied", json.length, "chars");
+      const choice = await showCustomDialog({
+        message:
+          "Copy a diagnostic dump to the clipboard?\n\n" +
+          "It lists your workspaces (names, icons, colors, containers, window and tab ids, " +
+          "tab counts) and the saved restore state. Web addresses are cut down to their " +
+          "site, for example https://example.com/, and tab titles and icons are left out.\n\n" +
+          "Tick the box only if you were asked for the full dump: it also holds the complete " +
+          "address of every saved and recently closed tab - including any login or session " +
+          "tokens in them - and their titles.",
+        showCheckbox: true,
+        checkboxLabel: "Include full web addresses and tab titles",
+        checkboxDefault: false
+      });
+      if (!choice) return;
+      const full = !!choice.checked;
+
+      let dump;
+      try {
+        dump = await this._request("getDiagnostics");
+      } catch (e) {
+        console.warn("[WSP][_copyDiagnostics] failed:", e?.message);
+      }
+      if (!dump || typeof dump !== "object") {
+        await showCustomDialog({
+          message: "Could not read the diagnostic data. Close and reopen this popup, then try again.",
+          infoOnly: true
+        });
+        return;
+      }
+      const json = JSON.stringify(full ? dump : _redactDiagnostics(dump), null, 2);
+      try {
+        await navigator.clipboard.writeText(json);
+      } catch (e) {
+        console.warn("[WSP][_copyDiagnostics] clipboard write failed:", e?.message);
+        await showCustomDialog({ message: "Clipboard write blocked. JSON length: " + json.length, infoOnly: true });
+        return;
+      }
+      console.log("[WSP][_copyDiagnostics] copied", json.length, "chars, full:", full);
       await showCustomDialog({
-        message: `Diagnostics copied to clipboard (${json.length} chars). ` +
-          `Includes workspace metadata + URL snapshots -- review before sharing.`,
+        message: full
+          ? `Full diagnostic dump copied to the clipboard (${json.length} characters). ` +
+            `It contains complete web addresses and tab titles - review it before sharing.`
+          : `Diagnostic dump copied to the clipboard (${json.length} characters). ` +
+            `Web addresses were cut down to their site and tab titles were left out - ` +
+            `review it before sharing.`,
         infoOnly: true
       });
-    } catch (e) {
-      console.warn("[WSP][_copyDiagnostics] clipboard write failed:", e?.message);
-      await showCustomDialog({ message: "Clipboard write blocked. JSON length: " + json.length, infoOnly: true });
+    } finally {
+      this._copyingDiagnostics = false;
     }
   }
 
@@ -484,7 +677,7 @@ class WorkspaceUI {
         const result = await showCustomDialog({
           message: "Create workspace:",
           withInput: true,
-          defaultValue: await this._callBackgroundTask("getWorkspaceName"),
+          defaultValue: (await this._callBackgroundTask("getWorkspaceName")) || "",
           showContainerPicker: this.containers.length > 0,
           containers: this.containers,
           showColorPicker: true
@@ -494,7 +687,7 @@ class WorkspaceUI {
           return;
         }
 
-        const wspName = result.name.trim().slice(0, 100);
+        const wspName = _clampWspName(result.name);
         if (wspName.length === 0) return;
         console.log("[WorkspaceUI][createNewWsp] creating workspace:", wspName,
           "icon:", result.icon || "(none)", "color:", result.color || null,
@@ -510,19 +703,30 @@ class WorkspaceUI {
           containerId: result.containerId || null
         };
 
-        const created = await this._callBackgroundTask("createWorkspaceWithTab", wsp);
-        if (!created) {
+        let created;
+        try {
+          created = await this._request("createWorkspaceWithTab", wsp);
+        } catch (err) {
           console.log("[WorkspaceUI][createNewWsp] create failed");
+          await this._showFailure(err, "Could not create the workspace. Please try again.");
+          return;
+        }
+        if (!created?.wspId) {
+          console.log("[WorkspaceUI][createNewWsp] create returned no workspace id");
           return;
         }
 
         wsp.id = created.wspId;
         wsp.tabs.push(created.tabId);
         this.workspaces.push(wsp);
-        console.log("[WorkspaceUI][createNewWsp] workspace created — wspId:", wsp.id, "tabId:", created.tabId);
+        console.log("[WorkspaceUI][createNewWsp] workspace created -- wspId:", wsp.id, "tabId:", created.tabId);
 
-        this._removePreviouslyActiveLi();
         this._addWorkspace(wsp);
+        // The new workspace is the active one now: move the flag in the
+        // model too, and show its (empty) Recently Closed list instead of
+        // the previous workspace's, whose Restore / Clear would act there.
+        this._setActiveWorkspace(wsp.id);
+        this.showClosedTabs();
       } finally {
         delete btn.dataset.busy;
       }
@@ -538,7 +742,13 @@ class WorkspaceUI {
       try {
         console.log("[WorkspaceUI][restoreFromBookmarks] clicked");
 
-        const folders = await this._callBackgroundTask("getBookmarkWorkspaces");
+        let folders;
+        try {
+          folders = await this._request("getBookmarkWorkspaces");
+        } catch (err) {
+          await this._showFailure(err, "Could not read the saved workspaces from bookmarks.");
+          return;
+        }
         if (!folders || folders.length === 0) {
           await showCustomDialog({ message: "No saved workspaces found in bookmarks.", infoOnly: true });
           return;
@@ -556,17 +766,19 @@ class WorkspaceUI {
         }
 
         console.log("[WorkspaceUI][restoreFromBookmarks] restoring folder:", result.folderId);
-        const restored = await this._callBackgroundTask("restoreWorkspaceFromBookmarks", {
-          folderId: result.folderId,
-          windowId: this.currentWindowId
-        });
-
-        if (!restored) {
+        let restored;
+        try {
+          restored = await this._request("restoreWorkspaceFromBookmarks", {
+            folderId: result.folderId,
+            windowId: this.currentWindowId
+          });
+        } catch (err) {
           console.log("[WorkspaceUI][restoreFromBookmarks] restore failed");
+          await this._showFailure(err, "Could not restore the workspace from bookmarks.");
           return;
         }
 
-        console.log("[WorkspaceUI][restoreFromBookmarks] restored:", restored.name, "tabs:", restored.tabCount);
+        console.log("[WorkspaceUI][restoreFromBookmarks] restored:", restored?.name, "tabs:", restored?.tabCount);
         window.close();
       } finally {
         delete restoreLink.dataset.busy;
@@ -601,8 +813,10 @@ class WorkspaceUI {
         query,
         windowId: this.currentWindowId
       });
-      // A newer keystroke started another search: drop this stale reply.
-      if (seq !== searchSeq) return;
+      // Drop a stale reply: a newer search started, or the box changed
+      // (for example was cleared, and its own debounced run is still
+      // pending) while this one was in flight.
+      if (seq !== searchSeq || searchInput.value.trim() !== query) return;
 
       searchResults.replaceChildren();
       wspList.hidden = true;
@@ -611,7 +825,8 @@ class WorkspaceUI {
       if (!results || results.length === 0) {
         const empty = document.createElement("div");
         empty.className = "wsp-search-empty";
-        empty.textContent = "No matching tabs found";
+        // null is a failed search, not an empty result.
+        empty.textContent = results === null ? "Search is not available right now" : "No matching tabs found";
         searchResults.replaceChildren(empty);
         searchResults.hidden = false;
         return;
@@ -637,13 +852,12 @@ class WorkspaceUI {
         item.appendChild(wspEl);
 
         item.addEventListener("click", () => {
-          // Fire-and-forget, same rationale as the workspace click.
-          this._callBackgroundTask("activateWorkspace", {
+          if (this._activating) return;
+          this._activateWorkspace({
             wspId: r.wspId,
             windowId: this.currentWindowId,
             tabId: r.tabId
-          }).catch(() => {});
-          window.close();
+          });
         });
 
         searchResults.appendChild(item);
@@ -700,15 +914,19 @@ class WorkspaceUI {
     const container = document.getElementById("wsp-closed-tabs");
     const list = document.getElementById("wsp-closed-tabs-list");
     const clearBtn = document.getElementById("wsp-closed-tabs-clear");
+    // Only the latest render may paint: an older one can still be waiting
+    // for the list of a workspace that is no longer active.
+    const seq = ++this._closedTabsSeq;
 
     const activeWsp = this.workspaces.find(w => w.active);
     if (!activeWsp) {
-      console.log("[WorkspaceUI][showClosedTabs] no active workspace — hiding section");
+      console.log("[WorkspaceUI][showClosedTabs] no active workspace -- hiding section");
       container.hidden = true;
       return;
     }
 
     const closedTabs = await this._callBackgroundTask("getClosedTabs", { wspId: activeWsp.id });
+    if (seq !== this._closedTabsSeq) return;
     console.log("[WorkspaceUI][showClosedTabs] activeWsp:", activeWsp.id, activeWsp.name,
       "closedTabs:", closedTabs?.length ?? 0);
     if (!closedTabs || closedTabs.length === 0) {
@@ -745,12 +963,18 @@ class WorkspaceUI {
         // stored array mutates while the popup is open (new closures
         // unshift), so a render-time index can restore the wrong tab.
         console.log("[WorkspaceUI][restoreClosedTab] restoring:", tab.url);
-        await this._callBackgroundTask("restoreClosedTab", {
-          wspId: activeWsp.id,
-          url: tab.url,
-          closedAt: tab.closedAt,
-          windowId: this.currentWindowId
-        });
+        try {
+          // A null reply is not a failure: the entry was already restored
+          // or cleared, and the re-render below drops it.
+          await this._request("restoreClosedTab", {
+            wspId: activeWsp.id,
+            url: tab.url,
+            closedAt: tab.closedAt,
+            windowId: this.currentWindowId
+          });
+        } catch (err) {
+          await this._showFailure(err, "Could not restore the tab. Please try again.");
+        }
         this.showClosedTabs();
       });
 
@@ -760,7 +984,12 @@ class WorkspaceUI {
 
     // Clear all handler
     clearBtn.onclick = async () => {
-      await this._callBackgroundTask("clearClosedTabs", { wspId: activeWsp.id });
+      try {
+        await this._request("clearClosedTabs", { wspId: activeWsp.id });
+      } catch (err) {
+        await this._showFailure(err, "Could not clear the recently closed tabs. Please try again.");
+        return;
+      }
       container.hidden = true;
     };
   }
@@ -784,40 +1013,85 @@ class WorkspaceUI {
     });
   }
 
-  async _callBackgroundTask(action, args) {
+  // Send `action` to the background and resolve with its reply. Rejects on
+  // a messaging failure (e.g. background not ready on a cold start) and on
+  // an `_error` reply; `err.userFacing` marks a deliberate refusal ("Cannot
+  // destroy the last workspace", "still starting up", ...) whose message is
+  // written for the user. Callers that must tell a failure from a null
+  // reply, or report the failure themselves, use this.
+  async _request(action, args) {
     const message = { action, ...args };
     if (WSP_DEBUG) {
-      console.log("[WorkspaceUI][_callBackgroundTask] ->", action,
+      console.log("[WorkspaceUI][_request] ->", action,
         args ? JSON.stringify(args) : "");
     }
     let result;
     try {
       result = await browser.runtime.sendMessage(message);
     } catch (e) {
-      // Messaging failure (e.g. background not ready on a cold start): fail
-      // soft like an _error reply instead of an unhandled rejection.
       console.error(`[Workspaces] ${action} failed:`, e?.message);
-      return null;
+      throw e instanceof Error ? e : new Error(String(e));
     }
     if (result && result._error) {
       console.error(`[Workspaces] ${action} failed:`, result.message);
-      // Deliberate, user-actionable refusals from the handler ("Cannot
-      // destroy the last workspace", "still starting up", ...) used to be
-      // flattened to null here, so the user clicked a button and nothing
-      // visibly happened. Surface them; fire-and-forget so callers that
-      // close the popup right after are not blocked.
-      if (result._userFacing && result.message) {
-        showCustomDialog({ message: result.message, infoOnly: true }).catch(() => {});
-      }
-      return null;
+      const err = new Error(result.message || "An internal error occurred");
+      err.userFacing = !!(result._userFacing && result.message);
+      throw err;
     }
     if (WSP_DEBUG) {
-      console.log("[WorkspaceUI][_callBackgroundTask] <-", action, "result:",
+      console.log("[WorkspaceUI][_request] <-", action, "result:",
         result === null ? "null" :
         Array.isArray(result) ? `[array len=${result.length}]` :
         typeof result === "object" ? `{${Object.keys(result).join(",")}}` : result);
     }
     return result;
+  }
+
+  // Fail-soft variant for reads and fire-and-forget calls: resolves with the
+  // reply, or null on any failure. A refusal meant for the user is still
+  // shown (fire-and-forget, so a caller is not blocked by the notice); a
+  // caller that gets null must not show a dialog of its own.
+  async _callBackgroundTask(action, args) {
+    try {
+      return await this._request(action, args);
+    } catch (e) {
+      if (e.userFacing) showCustomDialog({ message: e.message, infoOnly: true }).catch(() => {});
+      return null;
+    }
+  }
+
+  // Tell the user that an action failed: in the background's own words for
+  // a deliberate refusal, else `fallback` (nothing when it is null).
+  async _showFailure(err, fallback) {
+    const message = err?.userFacing ? err.message : fallback;
+    if (!message) return;
+    await showCustomDialog({ message, infoOnly: true }).catch(() => {});
+  }
+
+  // Ask the background to switch workspaces, then close the popup. The
+  // switch is not awaited in full (on large windows the hide/show cascade
+  // takes seconds, and the persistent background page finishes it without
+  // the popup), but a refusal comes back at once - the handler refuses
+  // while Firefox is still restoring the session - so wait briefly for it
+  // and keep the popup open to show it, instead of closing on a click that
+  // did nothing. `onFailed` undoes the caller's optimistic UI.
+  async _activateWorkspace(args, onFailed = null) {
+    this._activating = true;
+    const PENDING = {};
+    let timer;
+    const grace = new Promise((resolve) => { timer = setTimeout(() => resolve(PENDING), ACTIVATE_REPLY_GRACE_MS); });
+    const reply = this._request("activateWorkspace", args).then(() => null, (e) => e);
+    const early = await Promise.race([reply, grace]);
+    clearTimeout(timer);
+    if (early === PENDING || early === null) {
+      console.log("[WorkspaceUI][switchWorkspace] done -- closing popup");
+      window.close();
+      return;
+    }
+    console.log("[WorkspaceUI][switchWorkspace] refused:", early.message);
+    this._activating = false;
+    if (onFailed) onFailed();
+    await this._showFailure(early, "Could not switch workspaces. Please try again.");
   }
 
   _createWorkspaceItem(workspace) {
@@ -923,23 +1197,20 @@ class WorkspaceUI {
     // Switch workspace
     li.addEventListener("click", async () => {
       if (li.classList.contains("active")) {
-        console.log("[WorkspaceUI][switchWorkspace] already active:", workspace.id, "— no-op");
+        console.log("[WorkspaceUI][switchWorkspace] already active:", workspace.id, "-- no-op");
         return;
       }
+      // One switch at a time while the popup waits for the reply.
+      if (this._activating) return;
       console.log("[WorkspaceUI][switchWorkspace] activating:", workspace.id, workspace.name);
 
-      this._removePreviouslyActiveLi();
-      this._setRowActive(li, true);
-
-      // Fire-and-forget: the background completes the activation regardless
-      // of popup lifetime (persistent MV2 page). Awaiting the full hide/show
-      // cascade here only froze the popup on large windows.
-      this._callBackgroundTask("activateWorkspace", {
-        wspId: workspace.id,
-        windowId: workspace.windowId
-      }).catch(() => {});
-      console.log("[WorkspaceUI][switchWorkspace] done — closing popup");
-      window.close();
+      // Optimistic: mark the row now, and put the mark back if refused.
+      const previousId = this.workspaces.find(w => w.active)?.id ?? null;
+      this._setActiveWorkspace(workspace.id);
+      await this._activateWorkspace(
+        { wspId: workspace.id, windowId: workspace.windowId },
+        () => this._setActiveWorkspace(previousId)
+      );
     });
 
     // Export to bookmarks
@@ -965,13 +1236,20 @@ class WorkspaceUI {
         }
 
         // Single background call handles both export and optional destroy
-        const exportResult = await this._callBackgroundTask("exportWorkspaceToBookmarks", {
-          wspId: workspace.id,
-          windowId: this.currentWindowId,
-          destroyAfter: !!result.checked
-        });
-        if (!exportResult) {
+        let exportResult;
+        let exportError = null;
+        try {
+          exportResult = await this._request("exportWorkspaceToBookmarks", {
+            wspId: workspace.id,
+            windowId: this.currentWindowId,
+            destroyAfter: !!result.checked
+          });
+        } catch (err) {
+          exportError = err;
+        }
+        if (exportError || !exportResult) {
           console.log("[WorkspaceUI][exportBtn] export failed");
+          await this._showFailure(exportError, "Could not export the workspace to bookmarks.");
           return;
         }
         console.log("[WorkspaceUI][exportBtn] exported", exportResult.exported,
@@ -992,15 +1270,7 @@ class WorkspaceUI {
         }
 
         if (exportResult.destroyed) {
-          const wasActive = li.classList.contains("active");
-          if (li.parentNode) {
-            const liParent = li.parentElement;
-            this._removeRow(li);
-            if (wasActive && exportResult.activatedWspId) {
-              const targetLi = liParent.querySelector(`[data-wsp-id="${exportResult.activatedWspId}"]`);
-              if (targetLi) this._setRowActive(targetLi, true);
-            }
-          }
+          this._dropWorkspace(li, workspace, exportResult.activatedWspId);
         }
       } finally {
         delete exportBtn.dataset.busy;
@@ -1029,25 +1299,39 @@ class WorkspaceUI {
       });
 
       if (result !== false) {
-        const wspName = result.name.trim().slice(0, 100);
+        const originalName = li.dataset.originalText;
+        // An untouched name is kept as it is, never cut again (a name
+        // restored from a bookmark folder title can be longer than what
+        // the popup lets you type).
+        const wspName = result.name === originalName ? originalName : _clampWspName(result.name);
         if (wspName.length === 0) return;
         const wspIcon = result.icon || "";
 
         const wspColor = result.color;
-        const nameChanged = wspName !== li.dataset.originalText;
+        const nameChanged = wspName !== originalName;
         const iconChanged = wspIcon !== (li.dataset.wspIcon || "");
         const colorChanged = wspColor !== (workspace.color || null);
         const containerChanged = result.containerId !== undefined && result.containerId !== (workspace.containerId || null);
-        console.log("[WorkspaceUI][renameBtn] changes — name:", nameChanged,
+        console.log("[WorkspaceUI][renameBtn] changes -- name:", nameChanged,
           "icon:", iconChanged, "color:", colorChanged, "container:", containerChanged,
           "| new values: name:", wspName, "icon:", wspIcon, "color:", wspColor,
           "containerId:", result.containerId);
 
         if (!nameChanged && !iconChanged && !containerChanged && !colorChanged) {
-          console.log("[WorkspaceUI][renameBtn] no changes detected — skipping");
+          console.log("[WorkspaceUI][renameBtn] no changes detected -- skipping");
           return;
         }
 
+        // Show the new values only once the background stored them.
+        try {
+          await this._request("renameWorkspace", { wspId: workspace.id, wspName, wspIcon, wspColor });
+        } catch (err) {
+          await this._showFailure(err, "Could not save the workspace changes. Please try again.");
+          return;
+        }
+
+        workspace.name = wspName;
+        workspace.icon = wspIcon;
         li.dataset.originalText = wspName;
         li.dataset.wspIcon = wspIcon;
         span1.textContent = wspName;
@@ -1065,8 +1349,6 @@ class WorkspaceUI {
           iconEl = null;
         }
 
-        await this._callBackgroundTask("renameWorkspace", { wspId: workspace.id, wspName, wspIcon, wspColor });
-
         // Update color bar
         if (colorChanged) {
           workspace.color = wspColor;
@@ -1075,11 +1357,16 @@ class WorkspaceUI {
 
         // Update container if changed
         if (containerChanged) {
+          try {
+            await this._request("setWorkspaceContainer", {
+              wspId: workspace.id,
+              containerId: result.containerId
+            });
+          } catch (err) {
+            await this._showFailure(err, "Could not change the workspace's container. Please try again.");
+            return;
+          }
           workspace.containerId = result.containerId;
-          await this._callBackgroundTask("setWorkspaceContainer", {
-            wspId: workspace.id,
-            containerId: result.containerId
-          });
 
           // Update container dot (always keep element for alignment)
           const existingDot = li.querySelector(".wsp-container-dot");
@@ -1122,27 +1409,19 @@ class WorkspaceUI {
         const wasActive = li.classList.contains("active");
         console.log("[WorkspaceUI][deleteBtn] confirmed -- wasActive:", wasActive, "wspId:", workspace.id);
 
-        const destroyResult = await this._callBackgroundTask("destroyWsp", {
-          wspId: workspace.id,
-          windowId: this.currentWindowId,
-        });
-        if (!destroyResult) {
+        let destroyResult;
+        try {
+          destroyResult = await this._request("destroyWsp", {
+            wspId: workspace.id,
+            windowId: this.currentWindowId,
+          });
+        } catch (err) {
           console.log("[WorkspaceUI][deleteBtn] destroy failed");
+          await this._showFailure(err, "Could not delete the workspace. Please try again.");
           return;
         }
 
-        if (li.parentNode) {
-          const liParent = li.parentElement;
-          this._removeRow(li);
-
-          if (wasActive && destroyResult.activatedWspId) {
-            const targetLi = liParent.querySelector(`[data-wsp-id="${destroyResult.activatedWspId}"]`);
-            if (targetLi) {
-              console.log("[WorkspaceUI][deleteBtn] marking activated:", destroyResult.activatedWspId);
-              this._setRowActive(targetLi, true);
-            }
-          }
-        }
+        this._dropWorkspace(li, workspace, destroyResult?.activatedWspId);
         console.log("[WorkspaceUI][deleteBtn] done");
       } finally {
         delete deleteBtn.dataset.busy;
@@ -1165,15 +1444,36 @@ class WorkspaceUI {
   _addWorkspace(workspace) {
     const wspList = document.getElementById("wsp-list");
     const li = this._createWorkspaceItem(workspace);
+    // A "could not load" notice is stale once a row exists.
+    wspList.querySelector("li.no-wsp")?.remove();
     wspList.appendChild(li);
     // No sorting — order is now controlled by drag-and-drop / backend order
     return li;
   }
 
-  _removePreviouslyActiveLi() {
-    const lis = document.querySelectorAll(".wsp-list-item.active");
-    for (const li of lis) {
-      this._setRowActive(li, false);
+  // Make `wspId` the active workspace in the popup's model and rows (null:
+  // none). Recently Closed and its Restore / Clear follow the model, so every
+  // popup action that changes the active workspace goes through here.
+  _setActiveWorkspace(wspId) {
+    for (const w of this.workspaces) w.active = w.id === wspId;
+    for (const row of document.querySelectorAll("#wsp-list li.wsp-list-item")) {
+      this._setRowActive(row, row.dataset.wspId === wspId);
+    }
+  }
+
+  // A workspace was destroyed (delete, or export + close): drop its row and
+  // its model entry. When it was the active one, the background activated
+  // `activatedWspId`, so move the active mark there and show that
+  // workspace's Recently Closed list.
+  _dropWorkspace(li, workspace, activatedWspId) {
+    const wasActive = workspace.active || li.classList.contains("active");
+    if (li.parentNode) this._removeRow(li);
+    const i = this.workspaces.indexOf(workspace);
+    if (i !== -1) this.workspaces.splice(i, 1);
+    if (wasActive) {
+      console.log("[WorkspaceUI][_dropWorkspace] marking activated:", activatedWspId ?? null);
+      this._setActiveWorkspace(activatedWspId ?? null);
+      this.showClosedTabs();
     }
   }
 

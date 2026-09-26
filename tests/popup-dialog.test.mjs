@@ -248,3 +248,20 @@ test("X-57: a long confirm grows the popup to fit its message and buttons", asyn
   show(DELETE);
   assert.equal(document.body.style.minHeight, "140px");
 });
+
+test("X-49: a long confirm with a checkbox (diagnostics) grows the popup to fit", async () => {
+  const { get, $, press, document } = dialogOnly();
+  const show = get("showCustomDialog");
+  $("custom-dialog-message").offsetHeight = 230;
+  document.querySelector(".custom-dialog-body").scrollHeight = 60;
+  document.querySelector(".custom-dialog-footer").offsetHeight = 50;
+  const p = show({ message: "Copy a diagnostic dump?\n\n...", showCheckbox: true, checkboxLabel: "Full" });
+  assert.equal(document.body.style.minHeight, "340px");
+  press($("custom-dialog-cancel"), "Enter");
+  await outcome(p);
+
+  // The short export confirm keeps the old floor.
+  $("custom-dialog-message").offsetHeight = 40;
+  show({ message: 'Export "Work" to bookmarks?', showCheckbox: true, checkboxLabel: "Close" });
+  assert.equal(document.body.style.minHeight, "180px");
+});

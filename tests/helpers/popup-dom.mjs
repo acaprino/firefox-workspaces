@@ -154,6 +154,10 @@ class Text {
   remove() { this.parentNode?.removeChild(this); }
 }
 
+function asNode(n, doc) {
+  return n instanceof Element || n instanceof Text ? n : new Text(String(n), doc);
+}
+
 class ClassList {
   constructor(el) { this._el = el; }
   _get() { return (this._el.getAttribute("class") || "").split(/\s+/).filter(Boolean); }
@@ -343,7 +347,9 @@ export class Element {
     this.childNodes.push(n);
     return n;
   }
-  append(...nodes) { for (const n of nodes) this.appendChild(n); }
+  // ChildNode/ParentNode methods take (Node or DOMString): anything that is
+  // not a node becomes text, so `li.after(null)` inserts "null".
+  append(...nodes) { for (const n of nodes) this.appendChild(asNode(n, this.ownerDocument)); }
   insertBefore(node, ref) {
     if (ref == null) return this.appendChild(node);
     if (ref.parentNode !== this) throw new Error("NotFoundError: reference node is not a child");
@@ -370,12 +376,12 @@ export class Element {
   remove() { this.parentNode?.removeChild(this); }
   before(...nodes) {
     const p = this.parentNode;
-    for (const n of nodes) p.insertBefore(n, this);
+    for (const n of nodes) p.insertBefore(asNode(n, this.ownerDocument), this);
   }
   after(...nodes) {
     const p = this.parentNode;
     let ref = this;
-    for (const n of nodes) {
+    for (const n of nodes.map(x => asNode(x, this.ownerDocument))) {
       const next = p.childNodes[p.childNodes.indexOf(ref) + 1] ?? null;
       p.insertBefore(n, next);
       ref = n;
@@ -526,6 +532,9 @@ function dispatch(target, ev) {
       l.fn.call(node, ev);
       if (ev._stopNow) break;
     }
+    // Event handler properties (el.onclick = ...), run after the listeners.
+    const handler = ev._stopNow ? null : node["on" + ev.type];
+    if (typeof handler === "function") handler.call(node, ev);
     if (ev._stop) break;
   }
   return !ev.defaultPrevented;
@@ -747,6 +756,7 @@ export function loadPopup({ scripts = null, replies = {}, reducedMotion = true }
     browser,
     console: { log() {}, debug() {}, info() {}, warn() {}, error() {} },
     setTimeout, clearTimeout, setInterval, clearInterval,
+    URL, crypto: globalThis.crypto,
     requestAnimationFrame: (fn) => setTimeout(() => fn(Date.now()), 0),
     cancelAnimationFrame: (id) => clearTimeout(id),
     matchMedia: (q) => ({
@@ -787,5 +797,12 @@ export function loadPopup({ scripts = null, replies = {}, reducedMotion = true }
     type,
     fire: (target, type, init) => fire(target, type, init),
     settle: (ms = 10) => new Promise((r) => setTimeout(r, ms)),
+    // Deliver a storage.onChanged event, as browser.storage.local.set/remove
+    // in the background does: { key: newValue } (undefined = removed).
+    storageChange: (values, area = "local") => {
+      const changes = {};
+      for (const [k, v] of Object.entries(values)) changes[k] = v === undefined ? {} : { newValue: structuredClone(v) };
+      for (const fn of [...browser.storage.onChanged._listeners]) fn(changes, area);
+    },
   };
 }

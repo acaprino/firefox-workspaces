@@ -43,10 +43,11 @@ test("X-25: every workspace row has a focusable, named switch target", async () 
 
 test("X-25: Enter and Space on a row switch to that workspace", async () => {
   for (const key of ["Enter", " "]) {
-    const { main, press, actions, state, row } = await openPopup();
+    const { main, press, actions, state, row, settle } = await openPopup();
     main(B).focus();
     press(main(B), key);
     assert.deepEqual(actions("activateWorkspace").map((m) => m.wspId), [B], `key ${JSON.stringify(key)}`);
+    await settle(); // the popup closes on the reply (X-47)
     assert.equal(state.closed, true);
     assert.equal(row(B).classList.contains("active"), true);
     assert.equal(main(B).getAttribute("aria-current"), "true");
@@ -214,6 +215,7 @@ test("X-25: search results are focusable buttons reachable with Down, opened wit
   assertSame(document.activeElement, items[1]);
   press(items[1], "Enter");
   assert.deepEqual(actions("activateWorkspace").map((m) => [m.wspId, m.tabId]), [[C, 4]]);
+  await settle(); // the popup closes on the reply (X-47)
   assert.equal(state.closed, true);
 });
 
