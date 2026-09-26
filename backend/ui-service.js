@@ -286,6 +286,22 @@ class UIService {
     return UIService._cachedBadgeColor;
   }
 
+  // Trailing per-window debounce for the per-tab hot paths (tab filed, tab
+  // closed): a bulk close or open of N tabs used to repaint the toolbar N
+  // times, each pass a storage read plus four browserAction calls.
+  static _toolbarTimers = new Map(); // windowId -> timeout
+  static _TOOLBAR_DEBOUNCE_MS = 50;
+
+  static scheduleToolbarUpdate(windowId) {
+    if (typeof windowId !== "number") return;
+    clearTimeout(UIService._toolbarTimers.get(windowId));
+    UIService._toolbarTimers.set(windowId, setTimeout(() => {
+      UIService._toolbarTimers.delete(windowId);
+      UIService.updateToolbarButton(windowId).catch(e =>
+        console.debug("[UIService][scheduleToolbarUpdate] update failed:", e?.message));
+    }, UIService._TOOLBAR_DEBOUNCE_MS));
+  }
+
   static async updateToolbarButton(windowId, themeColors) {
     console.log("[UIService][updateToolbarButton] called for windowId:", windowId);
     // Fast path: this runs on every tab create/remove/focus change; the

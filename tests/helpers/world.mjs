@@ -19,6 +19,8 @@
 //     tabs.move ignores a move across the pinned boundary.
 //   - A tab moved to another window keeps its id and its session values,
 //     arrives visible and unselected, and fires onDetached + onAttached.
+//   - A tab group emptied by closing or ungrouping its tabs is removed:
+//     tabGroups.onRemoved after the tabs' own events.
 //   - Session tab values follow the tab: across windows, into the recently
 //     closed list, and back onto the NEW tab id on undo close / restore.
 //   - API calls fire the same events as user actions. onCreated carries the
@@ -366,7 +368,7 @@ export function makeWorld({
       focusedId = nextFocus;
       emit("windows", "onFocusChanged", nextFocus ?? WINDOW_ID_NONE);
     }
-    gcGroups();
+    gcGroups({ isWindowClosing: true });
   }
 
   function createWindow({ type = "normal", incognito = false, state = "normal", focused = true,
@@ -479,9 +481,13 @@ export function makeWorld({
     emit("tabs", "onUpdated", t.id, { pinned }, snap(t));
   }
 
-  function gcGroups() {
-    for (const gid of groups.keys()) {
-      if (![...tabs.values()].some((t) => t.groupId === gid)) groups.delete(gid);
+  // An emptied group is removed (tabGroups.onRemoved, after the tabs'
+  // own events); `isWindowClosing` when its window closed with it.
+  function gcGroups({ isWindowClosing = false } = {}) {
+    for (const [gid, g] of groups) {
+      if ([...tabs.values()].some((t) => t.groupId === gid)) continue;
+      groups.delete(gid);
+      emit("tabGroups", "onRemoved", clone(g), { isWindowClosing });
     }
   }
 
@@ -742,6 +748,12 @@ export function makeWorld({
       WorkspaceService.updateLastActiveTab = () => {};
       clearTimeout(WorkspaceService._lastActiveTimer);
       clearTimeout(env.get("MenuService")._refreshTimer);
+      const UIService = env.get("UIService");
+      UIService.scheduleToolbarUpdate = () => {};
+      for (const timer of UIService._toolbarTimers.values()) clearTimeout(timer);
+      UIService._toolbarTimers.clear();
+      for (const pending of TabService._pendingGroupClosures.values()) clearTimeout(pending.timer);
+      TabService._pendingGroupClosures.clear();
     },
 
     // ── User actions (synchronous state change, asynchronous events) ──

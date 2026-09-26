@@ -5,9 +5,10 @@
 // WorkspaceService calls TabService for tab operations (setTabSessionValue,
 // addTabToWorkspace). Both are singletons loaded in the same MV2 scope.
 class TabService {
-  // Lightweight in-memory cache of tab info (url, title, favIconUrl) for closed-tab tracking.
-  // Populated by onCreated/onUpdated, consumed by saveClosedTabInfo (which fires AFTER the
-  // tab is removed, so browser.tabs.get() no longer works).
+  // Lightweight in-memory cache of tab info (url, title, favIconUrl, groupId) for
+  // closed-tab tracking. Populated by onCreated/onUpdated, taken by onRemoved
+  // (takeTabInfo) for saveClosedTabInfo -- the tab is already gone by then, so
+  // browser.tabs.get() no longer works.
   static _tabInfoCache = new Map();
 
   // Per-tab guard: IDs of tabs created by _reopenInContainer that should NOT be
@@ -183,10 +184,56 @@ class TabService {
     }
   }
 
-  static async addTabToWorkspace(tab, { skipForceContainer = false } = {}) {
+  // Drop a tab's workspace tag. For tabs that leave workspace tracking while
+  // staying open (pinned, moved to another window): a tag left behind would
+  // later file the tab back into that workspace -- and hide it there.
+  static async clearTabSessionValue(tabId) {
+    try {
+      await browser.sessions.removeTabValue(tabId, "wspId");
+      console.log("[TabService][clearTabSessionValue] tabId:", tabId);
+    } catch (e) {
+      console.debug("[Workspaces] clearTabSessionValue failed (tab may be closed):", tabId);
+    }
+  }
+
+  // ── Removed-tab ledger (short-lived tabs) ──
+  // Ids of tabs Firefox reported closed, noted synchronously at the top of
+  // onRemoved. An add still awaiting its reads when its tab closed checks
+  // this under the workspace lock: the close found nothing to remove yet, so
+  // the add used to leave a dead id in the workspace (badge, previews). Tab
+  // ids are never reused within a session, so a bounded FIFO is enough.
+  static _removedTabIds = new Set();
+  static _REMOVED_IDS_MAX = 500;
+
+  static noteTabRemoved(tabId) {
+    const ids = TabService._removedTabIds;
+    ids.add(tabId);
+    if (ids.size > TabService._REMOVED_IDS_MAX) ids.delete(ids.values().next().value);
+  }
+
+  static wasRemoved(tabId) {
+    return TabService._removedTabIds.has(tabId);
+  }
+
+  // Extension-initiated ungroup. A group emptied this way fires
+  // tabGroups.onRemoved exactly like a group the user saved and closed, so
+  // the time is remembered (see onTabGroupRemoved).
+  static _ownUngroupAt = 0;
+  static _OWN_UNGROUP_GRACE_MS = 1000;
+
+  static async ungroup(tabIds) {
+    TabService._ownUngroupAt = Date.now();
+    return browser.tabs.ungroup(tabIds);
+  }
+
+  // `ignoreSessionTag`: file into the active workspace even when the tab
+  // carries another workspace's tag. For tabs the user just put in front of
+  // them (unpinned, dragged in from another window): their tag predates
+  // that and would hide them into a workspace they are not looking at.
+  static async addTabToWorkspace(tab, { skipForceContainer = false, ignoreSessionTag = false } = {}) {
     console.log("[TabService][addTabToWorkspace] tabId:", tab.id,
       "windowId:", tab.windowId, "cookieStoreId:", tab.cookieStoreId,
-      "skipForceContainer:", skipForceContainer,
+      "skipForceContainer:", skipForceContainer, "ignoreSessionTag:", ignoreSessionTag,
       "_reopeningCount:", TabService._reopeningCount,
       "inForceReopenIds:", TabService._forceReopenIds.has(tab.id));
 
@@ -210,6 +257,12 @@ class TabService {
       TabService._forceReopenIds.clear();
     }
 
+    return TabService._fileTab(tab, { skipForceContainer, ignoreSessionTag });
+  }
+
+  // The filing part of addTabToWorkspace, after its reopen guards.
+  // `afterHandoff`: internal, set on the re-run after a handoff settled.
+  static async _fileTab(tab, { skipForceContainer = false, ignoreSessionTag = false, afterHandoff = false } = {}) {
     const workspaces = await WSPStorageManager.getWorkspaces(tab.windowId);
     const activeWsp = workspaces.find(wsp => wsp.active);
     console.log("[TabService][addTabToWorkspace] activeWsp:", activeWsp?.id, activeWsp?.name,
@@ -225,31 +278,16 @@ class TabService {
         // (e.g., late session-restore tab arriving after extension restore completed).
         // Honour the session tag instead of blindly adding to the active workspace.
         let sessionWspId;
-        try { sessionWspId = await browser.sessions.getTabValue(tab.id, "wspId"); }
-        catch (e) { console.debug("[TabService][addTabToWorkspace] session lookup failed:", e.message); }
-        if (sessionWspId && UUID_RE.test(sessionWspId) && sessionWspId !== activeWsp.id) {
-          const targetWsp = workspaces.find(wsp => wsp.id === sessionWspId);
-          if (targetWsp) {
-            console.log("[TabService][addTabToWorkspace] session value points to workspace:",
-              sessionWspId, "- honouring instead of active workspace");
-            const freshTarget = await WSPStorageManager.mutateWorkspace(sessionWspId, (fresh) => {
-              if (fresh.tabs.includes(tab.id)) return false;
-              fresh.tabs.push(tab.id);
-            });
-            if (freshTarget) {
-              if (freshTarget.active) {
-                WorkspaceService.addTabToActiveCache(tab.id, sessionWspId);
-              } else {
-                try { await browser.tabs.hide(tab.id); }
-                catch (e) { console.debug("[TabService][addTabToWorkspace] tabs.hide failed for tab", tab.id, ":", e.message); }
-              }
-              await TabService.setTabSessionValue(tab.id, sessionWspId);
-              await MenuService.refreshTabMenu();
-              await UIService.updateToolbarButton(tab.windowId);
-              return false;
-            }
-            // Destroyed since the read above: file under the active workspace.
-          }
+        if (!ignoreSessionTag) {
+          try { sessionWspId = await browser.sessions.getTabValue(tab.id, "wspId"); }
+          catch (e) { console.debug("[TabService][addTabToWorkspace] session lookup failed:", e.message); }
+        }
+        if (sessionWspId && UUID_RE.test(sessionWspId) && sessionWspId !== activeWsp.id
+            && workspaces.some(wsp => wsp.id === sessionWspId)) {
+          console.log("[TabService][addTabToWorkspace] session value points to workspace:",
+            sessionWspId, "- honouring instead of active workspace");
+          if (await TabService._fileUnderTaggedWorkspace(tab, sessionWspId)) return false;
+          // Destroyed since the read above: file under the active workspace.
         }
 
         // Force-container: if the workspace has a container, any new tab must match it.
@@ -296,6 +334,7 @@ class TabService {
         // overwrite each other; a workspace destroyed meanwhile is not
         // resurrected as a zombie record.
         let added = false;
+        let gone = false;
         const filed = await WSPStorageManager.mutateWorkspace(activeWsp.id, (freshWsp) => {
           // Compare-and-clear: a concurrent setWorkspaceContainer to a
           // working container must survive.
@@ -303,6 +342,12 @@ class TabService {
           if (clear) {
             console.log("[TabService][addTabToWorkspace] clearing stale containerId on workspace:", freshWsp.id);
             freshWsp.containerId = null;
+          }
+          // Closed while this add awaited its reads: its onRemoved already
+          // ran against a list without it, so pushing now leaves a dead id.
+          if (TabService.wasRemoved(tab.id)) {
+            gone = true;
+            return clear;
           }
           if (freshWsp.tabs.includes(tab.id)) {
             console.log("[TabService][addTabToWorkspace] tab", tab.id, "already in fresh workspace -- no-op");
@@ -317,12 +362,16 @@ class TabService {
           console.log("[TabService][addTabToWorkspace] workspace", activeWsp.id, "destroyed meanwhile -- tab not filed");
           return false;
         }
+        if (gone) {
+          console.log("[TabService][addTabToWorkspace] tab", tab.id, "closed before it was filed -- skipped");
+          return false;
+        }
         // Keep active-workspace cache consistent so onTabActivated fast-path stays accurate
         if (added) WorkspaceService.addTabToActiveCache(tab.id, activeWsp.id);
         await TabService.setTabSessionValue(tab.id, activeWsp.id);
         TabService._scheduleSnapshotRefresh(tab.windowId, activeWsp.id);
         await MenuService.refreshTabMenu();
-        await UIService.updateToolbarButton(tab.windowId);
+        UIService.scheduleToolbarUpdate(tab.windowId);
         return true;
       } else {
         console.log("[TabService][addTabToWorkspace] tab", tab.id,
@@ -332,7 +381,17 @@ class TabService {
       // If workspaces exist but none is active (e.g. after destroying the active
       // workspace), activate the first one instead of creating a phantom workspace.
       if (workspaces.length > 0) {
-        const targetWsp = workspaces[0];
+        // Usually a handoff in flight (createWorkspace, destroying the active
+        // workspace) or an activation: wait for it and file into whichever
+        // workspace took over, instead of activating workspaces[0] -- which
+        // may be the one being destroyed (its destroy then closed this tab).
+        if (!afterHandoff) {
+          await WorkspaceService.whenHandoffsSettled(tab.windowId);
+          await WorkspaceService.whenActivationsSettled();
+          return TabService._fileTab(tab, { skipForceContainer, ignoreSessionTag, afterHandoff: true });
+        }
+        const targetWsp = workspaces.find(wsp => !WorkspaceService._pendingDestroys.has(wsp.id))
+          ?? workspaces[0];
         console.log("[TabService][addTabToWorkspace] no active workspace but", workspaces.length,
           "exist - activating first:", targetWsp.id, targetWsp.name);
         // Container mismatch: reopen first (the reopen onCreated re-enters
@@ -363,12 +422,18 @@ class TabService {
         // sees a cache miss until the post-activation patch below can run —
         // the old flow did this patch via _activeCache?.tabIds.add which was
         // a band-aid duplicating what activateWsp had already done internally.
+        let gone = false;
         const filed = await WSPStorageManager.mutateWorkspace(targetWsp.id, (freshActive) => {
+          if (TabService.wasRemoved(tab.id)) { gone = true; return false; }
           if (freshActive.tabs.includes(tab.id)) return false;
           freshActive.tabs.push(tab.id);
         });
         if (!filed) {
           console.log("[TabService][addTabToWorkspace] fallback target", targetWsp.id, "destroyed meanwhile -- tab not filed");
+          return false;
+        }
+        if (gone) {
+          console.log("[TabService][addTabToWorkspace] tab", tab.id, "closed before it was filed -- skipped");
           return false;
         }
         await TabService.setTabSessionValue(tab.id, targetWsp.id);
@@ -383,6 +448,67 @@ class TabService {
       }
     }
     return false;
+  }
+
+  // File a tab whose session tag names another workspace of this window: a
+  // closed tab brought back (Undo Close Tab, Recently Closed, Restore
+  // Previous Session into a running window) carries its old tag. Returns
+  // false when that workspace no longer exists (the caller then files the
+  // tab under the active workspace).
+  //  - Locked fresh read-modify-write: tagged tabs restored together used to
+  //    overwrite each other's push and end up hidden in no workspace.
+  //  - Hides only after the save landed, and only once no activation runs
+  //    (one that shows the target would otherwise race this hide).
+  //  - Firefox silently refuses to hide the selected tab (tabs.hide leaves
+  //    it out of its result). Undo Close Tab selects the restored tab, which
+  //    therefore stayed on screen in the current workspace while filed under
+  //    a hidden one. Switch to its workspace instead, as selecting any tab
+  //    of another workspace does.
+  static async _fileUnderTaggedWorkspace(tab, wspId) {
+    let gone = false;
+    const filed = await WSPStorageManager.mutateWorkspace(wspId, (fresh) => {
+      if (TabService.wasRemoved(tab.id)) { gone = true; return false; }
+      if (fresh.tabs.includes(tab.id)) return false;
+      fresh.tabs.push(tab.id);
+    });
+    if (!filed) return false;
+    if (gone) {
+      console.log("[TabService][_fileUnderTaggedWorkspace] tab", tab.id, "closed before it was filed -- skipped");
+      return true;
+    }
+    await TabService.setTabSessionValue(tab.id, wspId);
+    TabService._scheduleSnapshotRefresh(tab.windowId, wspId);
+
+    await WorkspaceService.whenActivationsSettled();
+    let target = await WSPStorageManager.getWorkspace(wspId);
+    if (target.windowId != null && !target.active) {
+      let hidden = [];
+      try { hidden = await browser.tabs.hide(tab.id) ?? []; }
+      catch (e) { console.debug("[TabService][_fileUnderTaggedWorkspace] tabs.hide failed for tab", tab.id, ":", e.message); }
+      if (!hidden.includes(tab.id)) {
+        let live = null;
+        try { live = await browser.tabs.get(tab.id); }
+        catch { /* closed meanwhile: onRemoved drops it */ }
+        if (live && !live.hidden && live.active) {
+          // Unless an activation queued meanwhile (onActivated) already did
+          await WorkspaceService.whenActivationsSettled();
+          target = await WSPStorageManager.getWorkspace(wspId);
+          if (target.windowId != null && !target.active) {
+            console.log("[TabService][_fileUnderTaggedWorkspace] tab", tab.id,
+              "is selected and cannot be hidden -- switching to its workspace", wspId);
+            await WorkspaceService.activateWsp(wspId, tab.windowId, tab.id);
+          }
+        } else if (live && !live.hidden) {
+          console.warn("[TabService][_fileUnderTaggedWorkspace] Firefox refused to hide tab", tab.id,
+            "-- it stays visible until the next workspace switch hides it");
+        }
+      }
+    } else if (target.active) {
+      WorkspaceService.addTabToActiveCache(tab.id, wspId);
+    }
+    await MenuService.refreshTabMenu();
+    UIService.scheduleToolbarUpdate(tab.windowId);
+    return true;
   }
 
   // Navigation-time container enforcement.
@@ -468,10 +594,12 @@ class TabService {
     }
   }
 
-  // Search ALL workspaces for the tab, not just the active one
-  static async removeTabFromWorkspace(windowId, tabId) {
+  // Search ALL workspaces for the tab, not just the active one.
+  // `workspaces`: optional list the caller already read for this window
+  // (onRemoved shares one read with saveClosedTabInfo).
+  static async removeTabFromWorkspace(windowId, tabId, workspaces = null) {
     console.log("[TabService][removeTabFromWorkspace] tabId:", tabId, "windowId:", windowId);
-    const workspaces = await WSPStorageManager.getWorkspaces(windowId);
+    workspaces ??= await WSPStorageManager.getWorkspaces(windowId);
 
     for (const wsp of workspaces) {
       if (wsp.tabs.includes(tabId)) {
@@ -592,7 +720,7 @@ class TabService {
         }
       }
 
-      try { await browser.tabs.ungroup(effectiveTabId); }
+      try { await TabService.ungroup(effectiveTabId); }
       catch (e) { console.debug("[TabService][moveTabToWsp] tabs.ungroup failed for tab", effectiveTabId, ":", e.message); }
     }
 
@@ -603,22 +731,45 @@ class TabService {
 
   // ── Tab info cache helpers ──
 
-  static _TAB_INFO_CACHE_MAX = 500;
+  // Only a memory bound: entries are dropped as soon as their tab closes
+  // (takeTabInfo at the top of onRemoved, every window), so the cache holds
+  // live tabs only. The old 500-entry FIFO filled up with dead entries and
+  // evicted the oldest LIVE tabs first -- the long-lived ones, whose closes
+  // then recorded nothing.
+  static _TAB_INFO_CACHE_MAX = 2000;
 
   static cacheTabInfo(tab) {
     if (tab.url && tab.url !== "about:blank" && tab.url !== "about:newtab") {
-      // Evict oldest entry (FIFO via Map insertion order) to prevent unbounded growth
-      if (TabService._tabInfoCache.size >= TabService._TAB_INFO_CACHE_MAX
-          && !TabService._tabInfoCache.has(tab.id)) {
+      // Least-recently-updated first: re-insert so an update refreshes the
+      // entry's position (Map.set on an existing key does not).
+      TabService._tabInfoCache.delete(tab.id);
+      if (TabService._tabInfoCache.size >= TabService._TAB_INFO_CACHE_MAX) {
         const firstKey = TabService._tabInfoCache.keys().next().value;
         TabService._tabInfoCache.delete(firstKey);
       }
       TabService._tabInfoCache.set(tab.id, {
         url: tab.url,
         title: tab.title || tab.url,
-        favIconUrl: tab.favIconUrl || ""
+        favIconUrl: tab.favIconUrl || "",
+        // Group membership, for "Save and close group" (see saveClosedTabInfo)
+        groupId: tab.groupId ?? -1
       });
     }
+  }
+
+  // Group change of a cached tab (tabs.onUpdated groupId).
+  static updateCachedGroup(tabId, groupId) {
+    const cached = TabService._tabInfoCache.get(tabId);
+    if (cached) cached.groupId = groupId ?? -1;
+  }
+
+  // Remove and return a closed tab's cached info. Called at the top of
+  // onRemoved, before any guard, so no dead entry survives a close that the
+  // listener then ignores (other window, window closing, not ready).
+  static takeTabInfo(tabId) {
+    const cached = TabService._tabInfoCache.get(tabId) ?? null;
+    TabService._tabInfoCache.delete(tabId);
+    return cached;
   }
 
   // Pre-populate cache for all tabs in a window (called once at startup)
@@ -630,33 +781,103 @@ class TabService {
 
   // ── Closed Tab helpers (Tier 2) ──
 
-  static async saveClosedTabInfo(windowId, tabId) {
-    // Use cached info — browser.tabs.get() fails in onRemoved because the tab is already gone
+  // `info`: the entry takeTabInfo removed at the top of onRemoved (null:
+  // nothing cached). `owner`: the workspace whose tabs[] held the tab, from
+  // the caller's single read; null skips (a destroy or a container reopen
+  // takes its tabs out of storage first so their closes record nothing).
+  static async saveClosedTabInfo(windowId, tabId, info, owner) {
     console.log("[TabService][saveClosedTabInfo] tabId:", tabId, "windowId:", windowId,
-      "inCache:", TabService._tabInfoCache.has(tabId));
-    const cached = TabService._tabInfoCache.get(tabId);
-    TabService._tabInfoCache.delete(tabId);
-
-    if (!cached || !cached.url) {
+      "cached:", !!info, "owner:", owner?.id ?? null);
+    if (!info || !info.url) {
       console.log("[TabService][saveClosedTabInfo] no cached info for tabId:", tabId, "— skipping");
       return;
     }
-
-    const workspaces = await WSPStorageManager.getWorkspaces(windowId);
-    const ownerWsp = workspaces.find(wsp => wsp.tabs.includes(tabId));
-    if (!ownerWsp) {
+    if (!owner) {
       console.log("[TabService][saveClosedTabInfo] tab", tabId, "not found in any workspace — skipping");
       return;
     }
-
-    console.log("[TabService][saveClosedTabInfo] saving closed tab:", cached.url,
-      "to workspace:", ownerWsp.id, ownerWsp.name);
-    await WSPStorageManager.saveClosedTab(ownerWsp.id, {
-      url: cached.url,
-      title: cached.title || cached.url,
-      favIconUrl: cached.favIconUrl || "",
+    const entry = {
+      url: info.url,
+      title: info.title || info.url,
+      favIconUrl: info.favIconUrl || "",
       closedAt: Date.now()
-    });
+    };
+    // Tabs of an inactive workspace are hidden: the user cannot close them
+    // from the tab strip, so something else did -- typically Firefox's
+    // "Close Duplicate Tabs", which includes hidden tabs, or another
+    // extension. Flagged so the popup can point it out.
+    if (!owner.active) entry.closedWhileHidden = true;
+
+    const groupId = info.groupId ?? -1;
+    if (groupId !== -1) {
+      TabService._deferGroupedClosure(groupId, owner.id, entry);
+      return;
+    }
+    console.log("[TabService][saveClosedTabInfo] saving closed tab:", info.url,
+      "to workspace:", owner.id, owner.name);
+    await WSPStorageManager.saveClosedTab(owner.id, entry);
+  }
+
+  // ── Closed tab groups ("Save and close group", "Delete group") ──
+  // Firefox records a whole closed group itself (skipSessionStore per tab)
+  // and fires one tabs.onRemoved per tab, then tabGroups.onRemoved once the
+  // group is gone. Recording each tab flooded the workspace's 25-entry list
+  // (evicting real closures), and restoring those entries duplicated the
+  // group Firefox keeps. Entries of grouped tabs therefore wait briefly:
+  // dropped if their group is removed, saved once the wait expires (a tab
+  // closed out of a group that lives on).
+  static _pendingGroupClosures = new Map(); // groupId -> { timer, entries: [{ wspId, entry }] }
+  static _removedGroupIds = new Set();      // groups already reported removed
+  static _GROUP_CLOSE_WAIT_MS = 2000;
+
+  static _deferGroupedClosure(groupId, wspId, entry) {
+    if (TabService._removedGroupIds.has(groupId)) {
+      // The group's removal was handled before this close finished its reads
+      console.log("[TabService][_deferGroupedClosure] group", groupId, "already closed as a whole -- entry dropped");
+      return;
+    }
+    let pending = TabService._pendingGroupClosures.get(groupId);
+    if (!pending) {
+      pending = { timer: null, entries: [] };
+      TabService._pendingGroupClosures.set(groupId, pending);
+    }
+    pending.entries.push({ wspId, entry });
+    clearTimeout(pending.timer);
+    pending.timer = setTimeout(() => {
+      TabService._flushGroupedClosures(groupId).catch(e =>
+        console.debug("[TabService][_deferGroupedClosure] flush failed:", e.message));
+    }, TabService._GROUP_CLOSE_WAIT_MS);
+  }
+
+  static async _flushGroupedClosures(groupId) {
+    const pending = TabService._pendingGroupClosures.get(groupId);
+    if (!pending) return;
+    TabService._pendingGroupClosures.delete(groupId);
+    clearTimeout(pending.timer);
+    for (const { wspId, entry } of pending.entries) {
+      await WSPStorageManager.saveClosedTab(wspId, entry);
+    }
+  }
+
+  // tabGroups.onRemoved (not window closing). An emptied group removed by
+  // the extension's own ungroup (workspace switch) is not a user closing
+  // it: its pending entries are saved, not dropped.
+  static async onTabGroupRemoved(groupId) {
+    if (Date.now() - TabService._ownUngroupAt < TabService._OWN_UNGROUP_GRACE_MS) {
+      console.log("[TabService][onTabGroupRemoved] group", groupId, "emptied by our own ungroup -- entries kept");
+      await TabService._flushGroupedClosures(groupId);
+      return;
+    }
+    TabService._removedGroupIds.add(groupId);
+    if (TabService._removedGroupIds.size > 100) {
+      TabService._removedGroupIds.delete(TabService._removedGroupIds.values().next().value);
+    }
+    const pending = TabService._pendingGroupClosures.get(groupId);
+    if (!pending) return;
+    TabService._pendingGroupClosures.delete(groupId);
+    clearTimeout(pending.timer);
+    console.log("[TabService][onTabGroupRemoved] group", groupId, "closed as a whole --",
+      pending.entries.length, "per-tab closed entries dropped (Firefox keeps the group)");
   }
 
   static async getClosedTabs(wspId) {

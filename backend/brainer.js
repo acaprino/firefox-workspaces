@@ -232,14 +232,7 @@ class Brainer {
       if (!activeWsp) {
         console.log("[Brainer][_ensureDefaultWorkspace] no active workspace — creating default");
         const allTabs = await browser.tabs.query({windowId: currentWindow.id, pinned: false});
-        const currentTabs = allTabs.filter(tab => !tab.url?.startsWith("about:firefoxview"));
-        console.log("[Brainer][_ensureDefaultWorkspace] unpinned tabs to absorb:", currentTabs.length,
-          currentTabs.map(t => t.id));
-        const wsp = WorkspaceService._buildDefaultWspData(
-          currentWindow.id,
-          currentTabs.map(tab => tab.id)
-        );
-        await WorkspaceService.createWorkspace(wsp);
+        const candidates = allTabs.filter(tab => !tab.url?.startsWith("about:firefoxview"));
         // Preserve session tags that reference a workspace still present in
         // storage: they are the last-line recovery data after an undetected
         // restart. The tabs are still absorbed into the default workspace so
@@ -247,10 +240,12 @@ class Brainer {
         // repair/restore machinery. Tags referencing wiped workspaces (or no
         // tag at all) are (re)written to the new default as before.
         const keepTag = new Set();
-        await Promise.all(currentTabs.map(async (tab) => {
+        const tagged = new Set();
+        await Promise.all(candidates.map(async (tab) => {
           try {
             const sv = await browser.sessions.getTabValue(tab.id, "wspId");
             if (sv && UUID_RE.test(sv)) {
+              tagged.add(tab.id);
               // windowId is the existence marker: a zombie record (written
               // back after its workspace was destroyed) has none and must not
               // keep a tag alive.
@@ -262,6 +257,23 @@ class Brainer {
               tab.id, ":", e.message);
           }
         }));
+        // A hidden tab without our tag was hidden by another tab-hiding
+        // extension (Simple Tab Groups, Sidebery, Panorama, ...): every tab
+        // this extension hides is tagged first. Absorbing those tabs made
+        // the next activation show them all -- every group of the other
+        // extension dumped into one strip.
+        const currentTabs = candidates.filter(tab => !tab.hidden || tagged.has(tab.id));
+        if (currentTabs.length !== candidates.length) {
+          console.log("[Brainer][_ensureDefaultWorkspace] left", candidates.length - currentTabs.length,
+            "untagged hidden tab(s) to the extension that hid them");
+        }
+        console.log("[Brainer][_ensureDefaultWorkspace] unpinned tabs to absorb:", currentTabs.length,
+          currentTabs.map(t => t.id));
+        const wsp = WorkspaceService._buildDefaultWspData(
+          currentWindow.id,
+          currentTabs.map(tab => tab.id)
+        );
+        await WorkspaceService.createWorkspace(wsp);
         for (const tab of currentTabs) {
           if (keepTag.has(tab.id)) continue;
           await TabService.setTabSessionValue(tab.id, wsp.id);
@@ -1441,6 +1453,11 @@ class Brainer {
       if (target) {
         if (!byWsp.has(wspId)) byWsp.set(wspId, []);
         byWsp.get(wspId).push(tab);
+      } else if (tab.hidden && !wspId) {
+        // Hidden and never tagged by us: another tab-hiding extension's tab
+        // (see _ensureDefaultWorkspace). Adopting it made our activations
+        // show it.
+        console.log("[Brainer][_reconcileLateTabs] tab", tab.id, "hidden by another extension -- left alone");
       } else {
         noSession.push(tab);
       }
@@ -1486,7 +1503,7 @@ class Brainer {
     if (toHide.length > 0) {
       try { await browser.tabs.hide(toHide); }
       catch (e) { console.debug("[Brainer][_reconcileLateTabs] tabs.hide failed:", e.message); }
-      try { await browser.tabs.ungroup(toHide); }
+      try { await TabService.ungroup(toHide); }
       catch (e) { console.debug("[Brainer][_reconcileLateTabs] tabs.ungroup failed:", e.message); }
       console.log("[Brainer][_reconcileLateTabs] hidden", toHide.length, "inactive-workspace tabs");
     }
@@ -1505,8 +1522,15 @@ class Brainer {
           return;
         }
         if (WorkspaceService.isActivating()) {
-          console.log("[Brainer][onTabCreated] skipped — workspace activating");
-          return;
+          // File it once the switch is done (it used to be dropped: a tab
+          // opened right after a switch stayed unfiled, untagged and outside
+          // the workspace's container). Re-read: it may have moved, been
+          // pinned or closed meanwhile.
+          console.log("[Brainer][onTabCreated] workspace activating -- filing tab", tab.id, "after it settles");
+          await WorkspaceService.whenActivationsSettled();
+          if (Brainer._state !== 'ready') return;
+          try { tab = await browser.tabs.get(tab.id); }
+          catch { console.log("[Brainer][onTabCreated] tab", tab.id, "closed during the activation"); return; }
         }
         const primaryId = await Brainer.getCachedPrimaryWindowId();
         if (primaryId !== tab.windowId) {
@@ -1523,6 +1547,12 @@ class Brainer {
 
     browser.tabs.onRemoved.addListener(async (tabId, removeInfo) => {
       try {
+        // Before any guard and any await: the cache entry must go even when
+        // the close is ignored below (else dead entries evict live ones),
+        // and an add of this tab still in flight must see the removal.
+        const info = TabService.takeTabInfo(tabId);
+        TabService.noteTabRemoved(tabId);
+        WorkspaceService.removeTabFromActiveCache(tabId);
         console.log("[Brainer][onTabRemoved] tabId:", tabId, "windowId:", removeInfo.windowId,
           "isWindowClosing:", removeInfo.isWindowClosing, "state:", Brainer._state);
         if (Brainer._state !== 'ready') {
@@ -1538,10 +1568,65 @@ class Brainer {
           console.log("[Brainer][onTabRemoved] skipped — window closing");
           return;
         }
-        await TabService.saveClosedTabInfo(removeInfo.windowId, tabId);
-        await TabService.removeTabFromWorkspace(removeInfo.windowId, tabId);
-        await UIService.updateToolbarButton(removeInfo.windowId);
+        // One read serves both helpers (they used to scan every workspace
+        // record twice per closed tab).
+        const workspaces = await WSPStorageManager.getWorkspaces(removeInfo.windowId);
+        const owner = workspaces.find(wsp => wsp.tabs.includes(tabId));
+        if (!owner) {
+          // A destroy or a container reopen takes its tabs out of storage
+          // before closing them: nothing to record, nothing to repaint.
+          console.log("[Brainer][onTabRemoved] tab", tabId, "not in any workspace -- nothing to do");
+          return;
+        }
+        await TabService.saveClosedTabInfo(removeInfo.windowId, tabId, info, owner);
+        await TabService.removeTabFromWorkspace(removeInfo.windowId, tabId, workspaces);
+        // The badge counts the active workspace's tabs only
+        if (owner.active) UIService.scheduleToolbarUpdate(removeInfo.windowId);
       } catch (e) { console.error("[Workspaces] onTabRemoved error:", e); }
+    });
+
+    // A tab moved between windows keeps its id and its session values. Torn
+    // out of the primary window it used to stay in its workspace (badge,
+    // previews); dragged back in, its old tag routed it to its old workspace
+    // and hid it there, although the user had just placed it on screen.
+    browser.tabs.onDetached.addListener(async (tabId, detachInfo) => {
+      try {
+        console.log("[Brainer][onTabDetached] tabId:", tabId, "oldWindowId:", detachInfo.oldWindowId,
+          "state:", Brainer._state);
+        if (Brainer._state !== 'ready') return;
+        const primaryId = await Brainer.getCachedPrimaryWindowId();
+        if (primaryId !== detachInfo.oldWindowId) return;
+        const workspaces = await WSPStorageManager.getWorkspaces(detachInfo.oldWindowId);
+        const owner = workspaces.find(wsp => wsp.tabs.includes(tabId));
+        await TabService.clearTabSessionValue(tabId);
+        if (!owner) return;
+        console.log("[Brainer][onTabDetached] tab", tabId, "left the primary window -- removing from", owner.id);
+        await TabService.removeTabFromWorkspace(detachInfo.oldWindowId, tabId, workspaces);
+        if (owner.active) UIService.scheduleToolbarUpdate(detachInfo.oldWindowId);
+      } catch (e) { console.error("[Workspaces] onTabDetached error:", e); }
+    });
+
+    browser.tabs.onAttached.addListener(async (tabId, attachInfo) => {
+      try {
+        console.log("[Brainer][onTabAttached] tabId:", tabId, "newWindowId:", attachInfo.newWindowId,
+          "state:", Brainer._state);
+        if (Brainer._state !== 'ready') return;
+        if (WorkspaceService.isActivating()) {
+          await WorkspaceService.whenActivationsSettled();
+          if (Brainer._state !== 'ready') return;
+        }
+        const primaryId = await Brainer.getCachedPrimaryWindowId();
+        if (primaryId !== attachInfo.newWindowId) return;
+        let tab;
+        try { tab = await browser.tabs.get(tabId); }
+        catch { return; } // closed meanwhile
+        if (tab.windowId !== primaryId || tab.pinned) return;
+        // Drop membership left from an earlier stay (a detach this listener
+        // did not see), then file it where the user put it: the workspace on
+        // screen, overwriting the old tag.
+        await TabService.removeTabFromWorkspace(primaryId, tabId);
+        await TabService.addTabToWorkspace(tab, { ignoreSessionTag: true });
+      } catch (e) { console.error("[Workspaces] onTabAttached error:", e); }
     });
 
     browser.tabs.onActivated.addListener(async (activeInfo) => {
@@ -1618,7 +1703,13 @@ class Brainer {
     browser.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
       try {
         if (Brainer._state !== 'ready') return;
-        if (WorkspaceService.isActivating()) return;
+        if (WorkspaceService.isActivating()) {
+          // Enforce against the workspace the switch lands on (was skipped)
+          await WorkspaceService.whenActivationsSettled();
+          if (Brainer._state !== 'ready') return;
+          try { tab = await browser.tabs.get(tabId); }
+          catch { return; }
+        }
         await TabService.forceTabIntoActiveContainer(tab, changeInfo.url);
       } catch (e) { console.error("[Workspaces] onUpdated(container-force) error:", e); }
     }, {properties: ["url"]});
@@ -1635,13 +1726,14 @@ class Brainer {
           console.log("[Brainer][onTabUpdated/pinned] skipped — state not ready");
           return;
         }
-        // An unpin mid-activation would run a locked addTabToWorkspace whose
-        // result the activation's deactivation save then overwrites (lost
-        // update). Skip like the other tab listeners; the catch-all in
-        // _hideInactiveFromList picks the tab up right after activation.
+        // A pin/unpin mid-activation is applied once the switch is done
+        // (dropping it left a pinned tab in tabs[]).
         if (WorkspaceService.isActivating()) {
-          console.log("[Brainer][onTabUpdated/pinned] skipped — workspace activating");
-          return;
+          console.log("[Brainer][onTabUpdated/pinned] workspace activating -- applying after it settles");
+          await WorkspaceService.whenActivationsSettled();
+          if (Brainer._state !== 'ready') return;
+          try { tab = await browser.tabs.get(tabId); }
+          catch { return; }
         }
         const primaryId = await Brainer.getCachedPrimaryWindowId();
         if (primaryId !== tab.windowId) {
@@ -1651,15 +1743,23 @@ class Brainer {
         if (tab.pinned) {
           console.log("[Brainer][onTabUpdated/pinned] tab pinned — removing from workspace");
           await TabService.removeTabFromWorkspace(tab.windowId, tabId);
+          // Pinned tabs are shared by every workspace: the tag of the one it
+          // was pinned in must not decide where it goes when unpinned.
+          await TabService.clearTabSessionValue(tabId);
         } else {
+          // Unpinned in front of the user: file into the workspace on
+          // screen. A tag from before the pin (or from an older version,
+          // which kept it) used to hide the tab into that workspace.
           console.log("[Brainer][onTabUpdated/pinned] tab unpinned — adding to workspace");
-          await TabService.addTabToWorkspace(tab);
+          await TabService.addTabToWorkspace(tab, { ignoreSessionTag: true });
         }
       } catch (e) { console.error("[Workspaces] onUpdated(pinned) error:", e); }
     }, {properties: ["pinned"]});
 
     browser.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
       try {
+        // Unconditional, like the url/title cache listener above
+        TabService.updateCachedGroup(tabId, changeInfo.groupId);
         if (Brainer._state !== 'ready') return;
         const primaryId = await Brainer.getCachedPrimaryWindowId();
         if (primaryId !== tab.windowId) return;
@@ -1670,6 +1770,15 @@ class Brainer {
         }
       } catch (e) { console.error("[Workspaces] onUpdated(groupId) error:", e); }
     }, {properties: ["groupId"]});
+
+    // "Save and close group" / "Delete group": Firefox records the group
+    // itself, so its tabs' pending closed-tab entries are dropped.
+    browser.tabGroups.onRemoved?.addListener(async (group, removeInfo) => {
+      try {
+        if (removeInfo?.isWindowClosing) return;
+        await TabService.onTabGroupRemoved(group.id);
+      } catch (e) { console.error("[Workspaces] onTabGroupsRemoved error:", e); }
+    });
 
     browser.tabGroups.onUpdated.addListener(async (group) => {
       try {

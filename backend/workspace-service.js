@@ -16,6 +16,55 @@ class WorkspaceService {
     return this._activationInProgress;
   }
 
+  // Resolves once no activation is running or queued. Tab events that
+  // arrive mid-activation wait here and then run, instead of being dropped
+  // (a tab opened right after a switch used to stay unfiled, untagged and
+  // outside the workspace's container). Loops until the chain tail it
+  // awaited is still the tail, so activations queued meanwhile are covered.
+  // NEVER await this from inside an activation: the chain would wait on
+  // itself.
+  static async whenActivationsSettled() {
+    let tail;
+    do {
+      tail = WorkspaceService._activationChain;
+      await tail.catch(() => {});
+    } while (tail !== WorkspaceService._activationChain);
+  }
+
+  // Active-workspace handoffs: createWorkspace stands the current workspace
+  // down before the new record exists, and destroying the active workspace
+  // pre-deactivates it before the replacement activation. For those awaits
+  // the window has no active workspace, and addTabToWorkspace's no-active
+  // fallback used to file a tab opened meanwhile into (and activate)
+  // workspaces[0] -- possibly the workspace being destroyed, which then
+  // closed the tab. The fallback waits for the handoff instead.
+  static _handoffs = new Map(); // windowId -> Set<Promise>
+  // Workspaces whose destroy is in progress: never a fallback target.
+  static _pendingDestroys = new Set();
+
+  static async _withHandoff(windowId, fn) {
+    let pending = WorkspaceService._handoffs.get(windowId);
+    if (!pending) WorkspaceService._handoffs.set(windowId, pending = new Set());
+    const run = (async () => fn())();
+    const tracked = run.catch(() => {});
+    pending.add(tracked);
+    try {
+      return await run;
+    } finally {
+      pending.delete(tracked);
+      if (pending.size === 0 && WorkspaceService._handoffs.get(windowId) === pending) {
+        WorkspaceService._handoffs.delete(windowId);
+      }
+    }
+  }
+
+  static async whenHandoffsSettled(windowId) {
+    let pending;
+    while ((pending = WorkspaceService._handoffs.get(windowId)) && pending.size > 0) {
+      await Promise.all([...pending]);
+    }
+  }
+
   // Returns true/false if the tab's membership is known, or null if cache is cold/mismatched window.
   static isTabInActiveWsp(windowId, tabId) {
     const c = WorkspaceService._activeCache;
@@ -176,29 +225,34 @@ class WorkspaceService {
     console.log("[WorkspaceService][createWorkspace] name:", wsp.name,
       "windowId:", wsp.windowId, "tabs:", wsp.tabs?.length ?? 0,
       "containerId:", wsp.containerId || null, "color:", wsp.color || null);
-    await WorkspaceService.deactivateCurrentWsp(wsp.windowId);
+    // Handoff: between the deactivation and the new record no workspace is
+    // active in this window (see _withHandoff).
+    const w = await WorkspaceService._withHandoff(wsp.windowId, async () => {
+      await WorkspaceService.deactivateCurrentWsp(wsp.windowId);
 
-    const w = await Workspace.create(wsp.id, wsp);
-    // Propagate generated UUID back so callers (createWorkspaceWithTab, order,
-    // hideInactiveWspTabs) use the real ID instead of undefined.
-    wsp.id = w.id;
+      const created = await Workspace.create(wsp.id, wsp);
+      // Propagate generated UUID back so callers (createWorkspaceWithTab, order,
+      // hideInactiveWspTabs) use the real ID instead of undefined.
+      wsp.id = created.id;
+
+      // Re-point the active cache: deactivateCurrentWsp above stood the previous
+      // workspace down, so leaving its entry in place makes the cache lie about
+      // which workspace (and container) is active. That stale containerId made
+      // TabService.forceTabIntoActiveContainer reopen the new workspace's tabs in
+      // the PREVIOUS workspace's container on first navigation, and file them
+      // under the previous workspace. activateWsp is the only other writer, and
+      // it is not on the create path.
+      if (created.active) {
+        WorkspaceService._updateActiveCache(wsp.windowId, created.tabs, created.id, created.containerId);
+      } else {
+        // Nothing is active in this window any more -- an entry for the workspace
+        // we just deactivated would be just as wrong.
+        WorkspaceService._activeCache = null;
+        console.log("[WorkspaceService][createWorkspace] created inactive workspace -- active cache cleared");
+      }
+      return created;
+    });
     await w.updateTabGroups();
-
-    // Re-point the active cache: deactivateCurrentWsp above stood the previous
-    // workspace down, so leaving its entry in place makes the cache lie about
-    // which workspace (and container) is active. That stale containerId made
-    // TabService.forceTabIntoActiveContainer reopen the new workspace's tabs in
-    // the PREVIOUS workspace's container on first navigation, and file them
-    // under the previous workspace. activateWsp is the only other writer, and
-    // it is not on the create path.
-    if (w.active) {
-      WorkspaceService._updateActiveCache(wsp.windowId, w.tabs, w.id, w.containerId);
-    } else {
-      // Nothing is active in this window any more -- an entry for the workspace
-      // we just deactivated would be just as wrong.
-      WorkspaceService._activeCache = null;
-      console.log("[WorkspaceService][createWorkspace] created inactive workspace -- active cache cleared");
-    }
 
     // Append to workspace order (own mutex: a concurrent destroy splices the
     // same array; an interleaved read-modify-write can drop an id)
@@ -305,48 +359,58 @@ class WorkspaceService {
       // the doomed workspace between the blocks are picked up by the fresh
       // re-read in the final block and closed with the rest.
       let activatedWspId = null;
-      if (target.active) {
-        const other = windowWorkspaces.find(w => w.id !== wspId);
-        if (other) {
-          await WSPStorageManager.mutateWorkspace(wspId, (fresh) => {
-            // Mark inactive before activateWsp so the activation flow doesn't
-            // waste work deactivating a workspace about to be deleted.
-            fresh.active = false;
-          });
-          console.log("[WorkspaceService][destroyWsp] pre-deactivated, activating:", other.id, other.name);
-          await WorkspaceService.activateWsp(other.id, windowId);
-          activatedWspId = other.id;
-        }
-      }
-
-      await WSPStorageManager.withWorkspaceLock(wspId, async () => {
-        // Re-read under the lock: freshest tab list wins (any addTab that
-        // landed since the batch read above is included in the close).
-        const wsp = await WSPStorageManager.getWorkspace(wspId);
-        if (wsp.windowId == null) {
-          console.log("[WorkspaceService][destroyWsp] wspId vanished before destroy");
-          return;
-        }
-
-        // Remove from workspace order (own mutex: createWorkspace appends
-        // concurrently and the interleaved read-modify-write can drop an id)
-        await WSPStorageManager.withOrderLock(windowId, async () => {
-          const order = await WSPStorageManager.getWorkspaceOrder(windowId);
-          if (order) {
-            const idx = order.indexOf(wspId);
-            if (idx >= 0) {
-              order.splice(idx, 1);
-              await WSPStorageManager.saveWorkspaceOrder(windowId, order);
-              console.log("[WorkspaceService][destroyWsp] removed from order at idx:", idx,
-                "new order length:", order.length);
-            } else {
-              console.log("[WorkspaceService][destroyWsp] wspId not found in order array");
-            }
+      // Never a fallback filing target while it is being destroyed.
+      WorkspaceService._pendingDestroys.add(wspId);
+      try {
+        if (target.active) {
+          const other = windowWorkspaces.find(w => w.id !== wspId);
+          if (other) {
+            // Handoff: after the pre-deactivation and until `other` is active
+            // the window has no active workspace (see _withHandoff).
+            await WorkspaceService._withHandoff(windowId, async () => {
+              await WSPStorageManager.mutateWorkspace(wspId, (fresh) => {
+                // Mark inactive before activateWsp so the activation flow doesn't
+                // waste work deactivating a workspace about to be deleted.
+                fresh.active = false;
+              });
+              console.log("[WorkspaceService][destroyWsp] pre-deactivated, activating:", other.id, other.name);
+              await WorkspaceService.activateWsp(other.id, windowId);
+            });
+            activatedWspId = other.id;
           }
-        });
+        }
 
-        await wsp.destroy();
-      });
+        await WSPStorageManager.withWorkspaceLock(wspId, async () => {
+          // Re-read under the lock: freshest tab list wins (any addTab that
+          // landed since the batch read above is included in the close).
+          const wsp = await WSPStorageManager.getWorkspace(wspId);
+          if (wsp.windowId == null) {
+            console.log("[WorkspaceService][destroyWsp] wspId vanished before destroy");
+            return;
+          }
+
+          // Remove from workspace order (own mutex: createWorkspace appends
+          // concurrently and the interleaved read-modify-write can drop an id)
+          await WSPStorageManager.withOrderLock(windowId, async () => {
+            const order = await WSPStorageManager.getWorkspaceOrder(windowId);
+            if (order) {
+              const idx = order.indexOf(wspId);
+              if (idx >= 0) {
+                order.splice(idx, 1);
+                await WSPStorageManager.saveWorkspaceOrder(windowId, order);
+                console.log("[WorkspaceService][destroyWsp] removed from order at idx:", idx,
+                  "new order length:", order.length);
+              } else {
+                console.log("[WorkspaceService][destroyWsp] wspId not found in order array");
+              }
+            }
+          });
+
+          await wsp.destroy();
+        });
+      } finally {
+        WorkspaceService._pendingDestroys.delete(wspId);
+      }
       await MenuService.refreshTabMenu();
       console.log("[WorkspaceService][destroyWsp] done — wspId:", wspId,
         "activatedWspId:", activatedWspId);
@@ -599,7 +663,7 @@ class WorkspaceService {
     if (allTabsToHide.length > 0) {
       try { await browser.tabs.hide(allTabsToHide); }
       catch (e) { console.debug("[WorkspaceService][_hideInactiveFromList] tabs.hide failed:", e.message); }
-      try { await browser.tabs.ungroup(allTabsToHide); }
+      try { await TabService.ungroup(allTabsToHide); }
       catch (e) { console.debug("[WorkspaceService][_hideInactiveFromList] tabs.ungroup failed:", e.message); }
     }
 
@@ -680,6 +744,10 @@ class WorkspaceService {
           }
         });
         await Promise.all(toAssign.map(tab => TabService.setTabSessionValue(tab.id, activeWspId)));
+        // The activation built the active cache before this sweep: without
+        // these ids forceTabIntoActiveContainer ignores the tabs, so a tab
+        // opened mid-switch escaped the workspace's container.
+        for (const tab of toAssign) WorkspaceService.addTabToActiveCache(tab.id, activeWspId);
         // Keep tabSnapshot fresh for restart resilience (IC3).
         TabService._scheduleSnapshotRefresh(windowId, activeWspId);
       }

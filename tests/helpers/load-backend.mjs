@@ -121,11 +121,12 @@ export function makeBrowserStub({ storageData = {}, overrides = {}, storageLaten
     tabGroups: {
       query: async () => [],
       update: async () => ({}),
-      onUpdated: makeEvent(),
+      onUpdated: makeEvent(), onRemoved: makeEvent(),
     },
     sessions: {
       getTabValue: async () => undefined,
       setTabValue: async () => {},
+      removeTabValue: async () => {},
       getRecentlyClosed: async () => [],
     },
     browserAction: {
