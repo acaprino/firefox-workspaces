@@ -758,6 +758,11 @@ export function makeWorld({
       UIService._toolbarTimers.clear();
       for (const pending of TabService._pendingGroupClosures.values()) clearTimeout(pending.timer);
       TabService._pendingGroupClosures.clear();
+      // A failed initialize() pass schedules a retry (up to 10 s out)
+      const Brainer = env.get("Brainer");
+      Brainer._scheduleInitRetry = () => {};
+      clearTimeout(Brainer._initRetryTimer);
+      Brainer._initRetryTimer = null;
     },
 
     // ── User actions (synchronous state change, asynchronous events) ──

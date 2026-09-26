@@ -84,6 +84,10 @@ class WorkspaceService {
   static _handoffs = new Map(); // windowId -> Set<Promise>
   // Workspaces whose destroy is in progress: never a fallback target.
   static _pendingDestroys = new Set();
+  // Container migrations in progress (_migrateTabsToContainer): they take
+  // the tab ids out of storage before the reopened tabs are filed and
+  // tagged, so an update reload waits for them (Brainer._reloadWhenIdle).
+  static _migrationsInFlight = 0;
 
   static async _withHandoff(windowId, fn) {
     let pending = WorkspaceService._handoffs.get(windowId);
@@ -959,7 +963,12 @@ class WorkspaceService {
 
     // Reopen existing tabs in the new container (skip if removing container)
     if (containerId && containerId !== oldContainerId) {
-      await WorkspaceService._migrateTabsToContainer(wspId, containerId);
+      WorkspaceService._migrationsInFlight++;
+      try {
+        await WorkspaceService._migrateTabsToContainer(wspId, containerId);
+      } finally {
+        WorkspaceService._migrationsInFlight--;
+      }
     }
 
     // Keep the active-workspace cache's containerId in sync so navigation-time

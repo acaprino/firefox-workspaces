@@ -76,6 +76,9 @@ const LIMITS = {
   MAX_EXPORT_FINGERPRINTS: 8,
   // Destroy tombstones kept (see STORAGE_KEYS.pendingDestroys).
   MAX_PENDING_DESTROYS: 20,
+  // Automatic retries of a failed Brainer.initialize() pass, one delay per
+  // retry. Past the last one, Dismiss on the banner retries.
+  INIT_RETRY_DELAYS_MS: [1000, 10000],
 };
 
 class WSPStorageManager {
