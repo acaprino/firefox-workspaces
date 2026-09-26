@@ -90,146 +90,17 @@ class Brainer {
     // _ensureDefaultWorkspace and create duplicate default workspaces.
     Brainer._state = 'initializing';
     try {
-      console.log("[Brainer][initialize] starting — current state:", Brainer._state);
+      console.log("[Brainer][initialize] starting -- current state:", Brainer._state);
       // Register listeners BEFORE the schema-version await so any buffered
       // events fire against handlers that guard on _state. The handlers
       // themselves no-op while _state is 'initializing' or 'restoring'.
-      this._registerWindowListeners();
-      this._registerTabListeners();
-      this._registerCommandListeners();
-      MenuService.registerOmniboxListeners();
-      await WSPStorageManager.ensureSchemaVersion();
-
-      // Crash-proof restart evidence via storage.session (in-memory, cleared
-      // when the browser session ends; Firefox 115+, available in MV2): if
-      // the sentinel written at the end of every init is gone, the browser
-      // (or the extension) restarted -- no matter how the previous session
-      // ended. This complements the onWindowRemoved-based lastId signal,
-      // which unclean shutdowns (crash, kill, power loss) bypass entirely.
-      // Arms `restartLikely` for the repair pass AND the session-loss
-      // detector. A false positive on a plain extension reload is harmless
-      // only while session tags stay readable: the repair is a no-op when
-      // stored arrays agree with session values, and _isSessionLost bails on
-      // any tagged tab and treats thrown session lookups as indeterminate
-      // rather than as evidence of loss.
-      let sessionRestartEvidence = false;
-      try {
-        const sentinel = await browser.storage.session.get("wsp-session-alive");
-        sessionRestartEvidence = !sentinel["wsp-session-alive"];
-        await browser.storage.session.set({ "wsp-session-alive": true });
-      } catch (e) {
-        console.debug("[Brainer][initialize] storage.session unavailable:", e?.message);
-      }
-
-      // Detect restart vs first-ever startup BEFORE _ensureDefaultWorkspace
-      // to eliminate the race with onStartup event.
-      let existingPrimary = await WSPStorageManager.getPrimaryWindowId();
-      let lastId = await WSPStorageManager.getPrimaryWindowLastId();
-      console.log("[Brainer][initialize] existingPrimary:", existingPrimary, "| lastId:", lastId);
-
-      // Validate stored primaryWindowId still exists AND is the same physical
-      // window. After a non-clean shutdown (crash, kill, power loss)
-      // onWindowRemoved never fired, so primaryWindowLastId was never armed and
-      // the stored primaryWindowId belongs to the PREVIOUS session. Firefox
-      // reassigns window IDs from low numbers each session, so that stale ID
-      // may be gone entirely, or -- worse -- may now name a different physical
-      // window. Either case used to fall through to _ensureDefaultWorkspace /
-      // _repairTabAssignments against the wrong window, which destroyed
-      // recoverable workspace state. Convert both into the detected-restart
-      // signal so the guarded restore path below handles them.
-      // NOTE: TOCTOU limitation -- the window could close between this check and
-      // subsequent use. This is a sub-millisecond race; onWindowRemoved provides
-      // eventual consistency if it occurs.
-      if (existingPrimary != null) {
-        let staleReason = null;
-        try {
-          await browser.windows.get(existingPrimary);
-        } catch {
-          staleReason = "no longer exists";
-        }
-        if (staleReason == null) {
-          try {
-            if (!(await Brainer._primaryWindowHoldsItsWorkspaces(existingPrimary))) {
-              staleReason = "names a different physical window (its workspace tabs live elsewhere)";
-            }
-          } catch (e) {
-            // Identity check is best-effort: on failure trust the stored ID
-            // (the pre-guard behavior) rather than triggering a restore.
-            console.warn("[Brainer][initialize] primary-window identity check failed -- trusting stored ID:", e?.message);
-          }
-        }
-        if (staleReason != null) {
-          console.warn("[Brainer][initialize] stored primaryWindowId", existingPrimary,
-            staleReason, "-- treating as undetected restart");
-          await WSPStorageManager.removePrimaryWindowId();
-          Brainer._primaryWindowId = null;
-          // Arm the restart-retry signal so the guarded restore path runs,
-          // instead of _ensureDefaultWorkspace absorbing every tab into a
-          // fresh default workspace and overwriting their session values.
-          // Only when there is actually workspace state to restore.
-          if (lastId == null &&
-              (await WSPStorageManager.getWorkspaces(existingPrimary)).length > 0) {
-            await WSPStorageManager.setPrimaryWindowLastId(existingPrimary);
-            lastId = existingPrimary;
-          }
-          existingPrimary = null;
-        }
-      }
-
-      if (existingPrimary == null && lastId != null) {
-        // Restart: restore workspaces directly (don't rely on onStartup event).
-        // Set state first to block any onWindowCreated races during window lookup.
-        console.log("[Brainer][initialize] restart detected — entering restore path");
-        Brainer._state = 'restoring';
-        try {
-          const currentWindow = await Brainer._findRestoreWindow(lastId);
-          console.log("[Brainer][initialize] restore window chosen:", currentWindow.id);
-          await Brainer._restoreWorkspaces(currentWindow);
-          Brainer._state = 'ready';
-          console.log("[Brainer][initialize] restore complete — state: ready");
-          // Reconcile tabs that Firefox session-restored during the 'restoring' window.
-          // Their onTabCreated was blocked, so they need explicit assignment.
-          await new Promise(r => setTimeout(r, LIMITS.RESTORE_DELAY_MS));
-          await Brainer._reconcileLateTabs(currentWindow.id);
-        } catch (e) {
-          Brainer._state = 'uninitialized';
-          console.error("[Brainer][initialize] restore failed — state reset to uninitialized:", e);
-          throw e;
-        }
-      } else {
-        console.log("[Brainer][initialize] first-start or already-running path");
-        await this._ensureDefaultWorkspace();
-        // Repair tab->workspace assignments. After a non-clean shutdown (crash,
-        // kill, power loss) the restart is not detected because onWindowRemoved
-        // never fired, so we are on this path even though the browser actually
-        // restarted. Firefox reuses tab IDs from low numbers across sessions, so
-        // stored arrays now point to DIFFERENT restored tabs. _repairTabAssignments
-        // re-files every open tab by its session value (and, when a restart is
-        // confirmed, by URL snapshot). No-op on a genuine already-running reload.
-        const pid = await WSPStorageManager.getPrimaryWindowId();
-        if (pid) {
-          await Brainer._repairTabAssignments(pid,
-            Brainer._browserStarted || sessionRestartEvidence);
-        }
-        // Ensure state is 'ready' even if onInstalled fired before its listener
-        // was registered (during the ensureSchemaVersion() await above).
-        if (Brainer._state !== 'ready') {
-          console.log("[Brainer][initialize] state was", Brainer._state, "— forcing to ready");
-          Brainer._state = 'ready';
-        }
-      }
-
-      // Warm tab info cache so closed-tab tracking works from the start
-      const primaryWindowId = await WSPStorageManager.getPrimaryWindowId();
-      Brainer._primaryWindowId = primaryWindowId;
-      console.log("[Brainer][initialize] primaryWindowId after init:", primaryWindowId);
-      if (primaryWindowId) await TabService.warmTabInfoCache(primaryWindowId);
-
-      await MenuService.refreshTabMenu();
-      if (primaryWindowId) await UIService.updateToolbarButton(primaryWindowId);
-      console.log("[Brainer][initialize] done — final state:", Brainer._state);
+      Brainer._registerListeners();
+      await Brainer._initializePass();
+      console.log("[Brainer][initialize] done -- final state:", Brainer._state);
       // C-19 sweep, fire-and-forget: must not delay or fail startup.
       Brainer._recoverOrphanWorkspaces().catch(() => {});
+    } catch (e) {
+      await Brainer._onInitializeFailed(e);
     } finally {
       // Always clear _initStarted, even on throw. Without this, any failure in
       // initialize() permanently blocks _onWindowCreated (which guards on
@@ -239,26 +110,323 @@ class Brainer {
     }
   }
 
+  static _registerListeners() {
+    if (Brainer._listenersRegistered) return;
+    Brainer._listenersRegistered = true;
+    Brainer._registerWindowListeners();
+    Brainer._registerTabListeners();
+    Brainer._registerCommandListeners();
+    MenuService.registerOmniboxListeners();
+  }
+
+  // One initialize() pass: restart detection, then the restore path or the
+  // first-start / already-running path. Throws on failure; initialize()
+  // decides what the failure means (_onInitializeFailed).
+  static async _initializePass() {
+    await WSPStorageManager.ensureSchemaVersion();
+
+    // Crash-proof restart evidence via storage.session (in-memory, cleared
+    // when the browser session ends; Firefox 115+, available in MV2): if
+    // the sentinel written at the end of every init is gone, the browser
+    // (or the extension) restarted -- no matter how the previous session
+    // ended. This complements the onWindowRemoved-based lastId signal,
+    // which unclean shutdowns (crash, kill, power loss) bypass entirely.
+    // Arms `restartLikely` for the repair pass AND the session-loss
+    // detector. A false positive on a plain extension reload is harmless
+    // only while session tags stay readable: the repair is a no-op when
+    // stored arrays agree with session values, and _isSessionLost bails on
+    // any tagged tab and treats thrown session lookups as indeterminate
+    // rather than as evidence of loss.
+    // Read once per background page: a retried pass would find the sentinel
+    // the first pass wrote.
+    if (Brainer._sessionRestartEvidence == null) {
+      Brainer._sessionRestartEvidence = false;
+      try {
+        const sentinel = await browser.storage.session.get("wsp-session-alive");
+        Brainer._sessionRestartEvidence = !sentinel["wsp-session-alive"];
+        await browser.storage.session.set({ "wsp-session-alive": true });
+      } catch (e) {
+        console.debug("[Brainer][initialize] storage.session unavailable:", e?.message);
+      }
+    }
+    const sessionRestartEvidence = Brainer._sessionRestartEvidence;
+
+    // Detect restart vs first-ever startup BEFORE _ensureDefaultWorkspace
+    // to eliminate the race with onStartup event.
+    let existingPrimary = await WSPStorageManager.getPrimaryWindowId();
+    let lastId = await WSPStorageManager.getPrimaryWindowLastId();
+    console.log("[Brainer][initialize] existingPrimary:", existingPrimary, "| lastId:", lastId);
+
+    // Validate stored primaryWindowId still exists AND is the same physical
+    // window. After a non-clean shutdown (crash, kill, power loss)
+    // onWindowRemoved never fired, so primaryWindowLastId was never armed and
+    // the stored primaryWindowId belongs to the PREVIOUS session. Firefox
+    // reassigns window IDs from low numbers each session, so that stale ID
+    // may be gone entirely, or -- worse -- may now name a different physical
+    // window. Either case used to fall through to _ensureDefaultWorkspace /
+    // _repairTabAssignments against the wrong window, which destroyed
+    // recoverable workspace state. Convert both into the detected-restart
+    // signal so the guarded restore path below handles them. A stored
+    // primary that is not a normal window (an older version could claim a
+    // popup, X-118) is treated the same way.
+    // NOTE: TOCTOU limitation -- the window could close between this check and
+    // subsequent use. This is a sub-millisecond race; onWindowRemoved provides
+    // eventual consistency if it occurs.
+    if (existingPrimary != null) {
+      let staleReason = null;
+      try {
+        const win = await browser.windows.get(existingPrimary);
+        if (win?.type != null && win.type !== "normal") staleReason = `is a ${win.type} window, not a normal one`;
+      } catch {
+        staleReason = "no longer exists";
+      }
+      if (staleReason == null) {
+        try {
+          if (!(await Brainer._primaryWindowHoldsItsWorkspaces(existingPrimary))) {
+            staleReason = "names a different physical window (its workspace tabs live elsewhere)";
+          }
+        } catch (e) {
+          // Identity check is best-effort: on failure trust the stored ID
+          // (the pre-guard behavior) rather than triggering a restore.
+          console.warn("[Brainer][initialize] primary-window identity check failed -- trusting stored ID:", e?.message);
+        }
+      }
+      if (staleReason != null) {
+        console.warn("[Brainer][initialize] stored primaryWindowId", existingPrimary,
+          staleReason, "-- treating as undetected restart");
+        // Arm the restart-retry signal so the guarded restore path runs,
+        // instead of _ensureDefaultWorkspace absorbing every tab into a
+        // fresh default workspace and overwriting their session values.
+        // Only when there is actually workspace state to restore. Armed
+        // BEFORE the primary claim is dropped, the order onWindowRemoved
+        // uses (X-67): a crash or a failed write between the two leaves both
+        // keys set, which this same check handles on the next start, instead
+        // of neither, which read as a first-ever start and stranded every
+        // workspace under the dead window id (C-19).
+        if (lastId == null &&
+            (await WSPStorageManager.getWorkspaces(existingPrimary)).length > 0) {
+          await WSPStorageManager.setPrimaryWindowLastId(existingPrimary);
+          lastId = existingPrimary;
+        }
+        await WSPStorageManager.removePrimaryWindowId();
+        Brainer._primaryWindowId = null;
+        existingPrimary = null;
+      }
+    }
+
+    if (existingPrimary == null && lastId != null) {
+      // Restart: restore workspaces directly (don't rely on onStartup event).
+      // Set state first to block any onWindowCreated races during window lookup.
+      console.log("[Brainer][initialize] restart detected -- entering restore path");
+      Brainer._state = 'restoring';
+      let target;
+      try {
+        // The primary window closed while the browser kept running and the
+        // banner still offers it back (X-100; an extension update or a
+        // restart came since): only a window holding the workspaces' tabs
+        // is theirs (X-11).
+        const waiting = await Brainer._awaitsClosedPrimary();
+        target = await Brainer._findRestoreWindow(lastId, { requireTags: waiting });
+        if (!target) {
+          // No normal window at all (macOS: Firefox running without one), or
+          // none holding the tabs the banner waits for. The workspaces wait
+          // for a window that takes them over (_windowTakeOverMode).
+          Brainer._state = 'uninitialized';
+          if (!Brainer._closedPrimary) Brainer._closedPrimary = { windowId: lastId, noted: waiting };
+          console.log("[Brainer][initialize] no window to restore into yet -- the workspaces wait (waiting for the closed window:",
+            waiting, ")");
+          await Brainer._clearInitFailure();
+          return;
+        }
+        console.log("[Brainer][initialize] restore window chosen:", target.id);
+        await Brainer._restoreWorkspaces(target, { midSession: waiting });
+      } catch (e) {
+        Brainer._state = 'uninitialized';
+        console.error("[Brainer][initialize] restore failed -- state reset to uninitialized:", e);
+        throw e;
+      }
+      Brainer._state = 'ready';
+      console.log("[Brainer][initialize] restore complete -- state: ready");
+      // Reconcile tabs that Firefox session-restored during the 'restoring'
+      // window (their onTabCreated was blocked). Past this point the restore
+      // is committed: a failure is logged and the state stays 'ready' (X-06).
+      await Brainer._settleReady(target.id, { lateTabs: true });
+      return;
+    }
+
+    console.log("[Brainer][initialize] first-start or already-running path");
+    await Brainer._ensureDefaultWorkspace();
+    // Repair tab->workspace assignments. After a non-clean shutdown (crash,
+    // kill, power loss) the restart is not detected because onWindowRemoved
+    // never fired, so we are on this path even though the browser actually
+    // restarted. Firefox reuses tab IDs from low numbers across sessions, so
+    // stored arrays now point to DIFFERENT restored tabs. _repairTabAssignments
+    // re-files every open tab by its session value (and, when a restart is
+    // confirmed, by URL snapshot). No-op on a genuine already-running reload.
+    const pid = await WSPStorageManager.getPrimaryWindowId();
+    if (pid) {
+      await Brainer._repairTabAssignments(pid,
+        Brainer._browserStarted || sessionRestartEvidence);
+    }
+    // 'ready' even when onInstalled fired before its listener was registered
+    // (during the ensureSchemaVersion() await above), and even without a
+    // primary window: with no normal window open yet, the first one opened
+    // is claimed by _onWindowCreated.
+    Brainer._state = 'ready';
+    await Brainer._settleReady(pid ?? null);
+  }
+
+  // A failed initialize() pass (X-06). A refused restore (refuse-to-wipe,
+  // Phase 4 failure) wrote its own banner and waits for the user or a
+  // restart. Any other failure (a tabs or storage error in the repair, a
+  // window gone mid-restore) used to leave _state at 'initializing' for the
+  // rest of the session -- every re-entry point refuses that state, so tabs
+  // went untracked and every action said "still starting up", with no
+  // banner. Now: 'uninitialized', an "init-failure" banner and a retry.
+  static async _onInitializeFailed(e) {
+    if (Brainer._state === 'ready') {
+      console.error("[Brainer][initialize] failed after the state was ready -- kept ready:", e);
+      return;
+    }
+    Brainer._state = 'uninitialized';
+    if (Brainer._refuseToWipeActive) {
+      console.warn("[Brainer][initialize] restore refused -- waiting for the user or a restart:", e?.message);
+      return;
+    }
+    console.error("[Brainer][initialize] failed -- state: uninitialized, retry scheduled:", e);
+    Brainer._initFailure = e ?? new Error("initialize failed");
+    await Brainer._surfaceInitFailure(e);
+    Brainer._scheduleInitRetry();
+  }
+
+  // Surface a failed start through the restore-error banner and the "!"
+  // badge (gotcha 8: only via setLastRestoreError). A pending warning keeps
+  // the single slot: an unread refuse-to-wipe or session-loss warning, or an
+  // earlier pass of this failure, whose `when` a banner on screen echoes.
+  static async _surfaceInitFailure(e) {
+    try {
+      if (await WSPStorageManager.getLastRestoreError()) return;
+      await WSPStorageManager.setLastRestoreError({
+        when: Date.now(),
+        reason: Brainer.INIT_FAILURE_REASON,
+        error: String(e?.message ?? e),
+      });
+    } catch (err) {
+      console.error("[Brainer][_surfaceInitFailure] failed to store the warning:", err?.message);
+      UIService.forceWarnBadge();
+    }
+    await UIService.refreshWarnBadge();
+  }
+
+  static _scheduleInitRetry() {
+    clearTimeout(Brainer._initRetryTimer);
+    Brainer._initRetryTimer = null;
+    const delays = LIMITS.INIT_RETRY_DELAYS_MS;
+    if (Brainer._initRetryCount >= delays.length) {
+      console.warn("[Brainer][initialize] no automatic retry left -- Dismiss on the banner retries");
+      return;
+    }
+    const delay = delays[Brainer._initRetryCount++];
+    console.log("[Brainer][initialize] retrying in", delay, "ms");
+    Brainer._initRetryTimer = setTimeout(() => {
+      Brainer._initRetryTimer = null;
+      Brainer.retryInitialize("timer").catch(() => {});
+    }, delay);
+  }
+
+  // Another initialize() pass after a failed one: on the retry timer, on
+  // Dismiss, or when a window opens or onStartup/onInstalled fires. No-op
+  // unless a failure is pending and nothing else is in flight. Resolves to
+  // whether the extension is ready afterwards; never throws.
+  static async retryInitialize(trigger) {
+    if (Brainer._initFailure == null || Brainer._state !== 'uninitialized'
+        || Brainer._initStarted || Brainer._restoreInFlight) return false;
+    console.log("[Brainer][retryInitialize] trigger:", trigger, "| last failure:",
+      String(Brainer._initFailure?.message ?? Brainer._initFailure));
+    await Brainer.initialize();
+    return Brainer._state === 'ready';
+  }
+
+  // A pass got through (ready, or knowingly waiting for a window): drop the
+  // pending failure, its retry and its banner.
+  static async _clearInitFailure() {
+    Brainer._initFailure = null;
+    Brainer._initRetryCount = 0;
+    clearTimeout(Brainer._initRetryTimer);
+    Brainer._initRetryTimer = null;
+    try {
+      if ((await WSPStorageManager.getLastRestoreError())?.reason === Brainer.INIT_FAILURE_REASON) {
+        await WSPStorageManager.clearLastRestoreError();
+        await UIService.refreshWarnBadge();
+      }
+    } catch (e) {
+      console.debug("[Brainer][_clearInitFailure] could not clear the init-failure banner:", e?.message);
+    }
+  }
+
+  // Common tail of every path that leaves the state 'ready' with a window
+  // primary: initialize() on both paths, a window taking the workspaces over
+  // (_onWindowCreated, Dismiss), the banner's reopen and the fresh start
+  // after Give up (X-35). Files the tabs Firefox added while 'restoring'
+  // held tab events back (`lateTabs`), warms the closed-tab cache and
+  // repaints the menu and toolbar: a focus event mid-restore painted the
+  // pre-restore state ("Workspaces", no badge, no Move Tab menu). The state
+  // stays 'ready': a failure here is logged, never turned into an inert
+  // extension (X-06). `windowId` null: ready without a primary window yet.
+  // `settleMs`: how long Firefox gets to add the late tabs first.
+  static async _settleReady(windowId, { lateTabs = false, settleMs = LIMITS.RESTORE_DELAY_MS } = {}) {
+    Brainer._closedPrimary = null;
+    if (windowId != null) Brainer._primaryWindowId = windowId;
+    const step = async (name, fn) => {
+      try { await fn(); }
+      catch (e) { console.warn("[Brainer][_settleReady]", name, "failed for window", windowId, ":", e?.message); }
+    };
+    await step("clearInitFailure", () => Brainer._clearInitFailure());
+    if (windowId != null && lateTabs) {
+      await step("reconcileLateTabs", async () => {
+        if (settleMs > 0) await new Promise(r => setTimeout(r, settleMs));
+        // The window may have closed meanwhile (onWindowRemoved took over)
+        if (Brainer._state !== 'ready' || (await WSPStorageManager.getPrimaryWindowId()) !== windowId) return;
+        await Brainer._reconcileLateTabs(windowId);
+      });
+    }
+    // Warm tab info cache so closed-tab tracking works from the start
+    if (windowId != null) await step("warmTabInfoCache", () => TabService.warmTabInfoCache(windowId));
+    await step("refreshTabMenu", () => MenuService.refreshTabMenu());
+    if (windowId != null) await step("updateToolbarButton", () => UIService.updateToolbarButton(windowId));
+  }
+
   // Shared initialization: ensure primary window and default workspace exist.
   // Callable from initialize() (legit, runs while _state === 'initializing')
   // and from event handlers (onInstalled, onStartup); the event-handler entry
   // points guard themselves on _initStarted / _state before calling.
+  // Returns the id of the window it claimed as primary, else null.
   static async _ensureDefaultWorkspace() {
     console.log("[Brainer][_ensureDefaultWorkspace] state:", Brainer._state);
     if (Brainer._state === 'restoring') {
-      console.log("[Brainer][_ensureDefaultWorkspace] skipped — state is 'restoring'");
-      return;
+      console.log("[Brainer][_ensureDefaultWorkspace] skipped -- state is 'restoring'");
+      return null;
     }
-    // If primaryWindowLastId exists, this is a restart — let restore handle it
+    // If primaryWindowLastId exists, this is a restart -- let restore handle it
     const lastId = await WSPStorageManager.getPrimaryWindowLastId();
     if (lastId != null) {
-      console.log("[Brainer][_ensureDefaultWorkspace] skipped — lastId present:", lastId, "(restart path)");
-      return;
+      console.log("[Brainer][_ensureDefaultWorkspace] skipped -- lastId present:", lastId, "(restart path)");
+      return null;
     }
     const existing = await WSPStorageManager.getPrimaryWindowId();
     if (existing == null) {
-      const currentWindow = await browser.windows.getCurrent();
-      console.log("[Brainer][_ensureDefaultWorkspace] no primary window — setting to:", currentWindow.id);
+      // A normal window only (X-118): getCurrent() is the last focused window
+      // of any type -- a window.open popup or another extension's pop-out.
+      // With none open (macOS: Firefox running without windows) there is
+      // nothing to claim yet, not an error: the first normal window opened
+      // is claimed by _onWindowCreated. getCurrent() used to throw here and
+      // leave the state at 'initializing' (X-06).
+      const currentWindow = await Brainer._pickNormalWindow();
+      if (!currentWindow) {
+        console.log("[Brainer][_ensureDefaultWorkspace] no normal window open -- the first one opened becomes primary");
+        return null;
+      }
+      console.log("[Brainer][_ensureDefaultWorkspace] no primary window -- setting to:", currentWindow.id);
       await WSPStorageManager.setPrimaryWindowId(currentWindow.id);
       Brainer._primaryWindowId = currentWindow.id;
 
@@ -320,9 +488,33 @@ class Brainer {
       } else {
         console.log("[Brainer][_ensureDefaultWorkspace] active workspace already exists:", activeWsp.id, activeWsp.name);
       }
-    } else {
-      console.log("[Brainer][_ensureDefaultWorkspace] primary window already set:", existing);
+      return currentWindow.id;
     }
+    console.log("[Brainer][_ensureDefaultWorkspace] primary window already set:", existing);
+    return null;
+  }
+
+  // Normal browser windows: the only candidates for the primary window and
+  // for a restore target (X-118). windows.getAll's default also lists popups
+  // and panels (a window.open OAuth or payment popup, another extension's
+  // pop-out): no tab strip, and gone again in seconds. Private windows are
+  // left out while a non-private one exists: private browsing data is never
+  // adopted (D2).
+  static async _normalWindows() {
+    const wins = await browser.windows.getAll({ windowTypes: ["normal"] });
+    const normal = wins.filter(w => w.type == null || w.type === "normal");
+    const regular = normal.filter(w => !w.incognito);
+    return regular.length > 0 ? regular : normal;
+  }
+
+  // The normal window to claim as primary: the focused one, else the last
+  // one focused, else the first. null when none is open.
+  static async _pickNormalWindow() {
+    const wins = await Brainer._normalWindows();
+    return wins.find(w => w.focused)
+      ?? wins.find(w => w.id === Brainer._lastFocusedWindowId)
+      ?? wins[0]
+      ?? null;
   }
 
   // ── Window & Lifecycle Listeners ──
@@ -330,7 +522,7 @@ class Brainer {
   static _registerWindowListeners() {
     browser.runtime.onInstalled.addListener(async () => {
       try {
-        console.log("[Brainer][onInstalled] fired — state:", Brainer._state);
+        console.log("[Brainer][onInstalled] fired -- state:", Brainer._state);
         // Skip while initialize() is still in flight (either the schema-check
         // await or the restart-detect window). initialize() will run
         // _ensureDefaultWorkspace itself once it reaches the right path.
@@ -338,9 +530,21 @@ class Brainer {
           console.log("[Brainer][onInstalled] skipped -- state:", Brainer._state, "initStarted:", Brainer._initStarted);
           return;
         }
-        await Brainer._ensureDefaultWorkspace();
-        Brainer._state = 'ready';
-        console.log("[Brainer][onInstalled] done — state: ready");
+        // Not ready: a failed start (retried now), a refused restore or
+        // workspaces waiting for their window. None of them is an install
+        // event's to resolve: forcing 'ready' here opened the handler's gate
+        // with no primary window while a refused restore was pending, and
+        // hid the pending restore from reopenClosedPrimaryWindow (X-68).
+        if (Brainer._state !== 'ready') {
+          if (!(await Brainer.retryInitialize("onInstalled"))) {
+            console.log("[Brainer][onInstalled] state stays", Brainer._state);
+          }
+          return;
+        }
+        // Ready without a primary window (none was open at init): claim one.
+        const claimed = await Brainer._ensureDefaultWorkspace();
+        if (claimed != null) await Brainer._settleReady(claimed);
+        console.log("[Brainer][onInstalled] done -- state:", Brainer._state);
       } catch (e) { console.error("[Workspaces] onInstalled error:", e); }
     });
 
@@ -352,7 +556,7 @@ class Brainer {
     browser.windows.onCreated.addListener(async (window) => {
       try {
         console.log("[Brainer][onWindowCreated] windowId:", window.id, "state:", Brainer._state);
-        await Brainer._onWindowCreated(window);
+        await Brainer._queueWindowCreated(window);
       } catch (e) { console.error("[Workspaces] onCreated error:", e); }
     });
 
@@ -393,17 +597,25 @@ class Brainer {
               await WorkspaceService._activationChain.catch(() => {});
               await Brainer._repairTabAssignments(pid, true);
             } finally {
-              Brainer._state = 'ready';
+              // Unless the primary window closed meanwhile (onWindowRemoved
+              // set 'uninitialized'): ready with no primary opened the gates.
+              if (Brainer._state === 'restoring') Brainer._state = 'ready';
             }
           }
           return;
         }
 
-        // state is 'uninitialized': original fallback for the restore path.
-        const windowsOnLoad = await browser.windows.getAll();
-        console.log("[Brainer][onStartup] windows on load:", windowsOnLoad.length);
+        // state is 'uninitialized': a failed start is retried; otherwise a
+        // normal window that session restore finished filling since init may
+        // now hold the workspaces' tabs (_windowTakeOverMode decides).
+        if (Brainer._initFailure) {
+          await Brainer.retryInitialize("onStartup");
+          return;
+        }
+        const windowsOnLoad = await Brainer._normalWindows();
+        console.log("[Brainer][onStartup] normal windows on load:", windowsOnLoad.length);
         if (windowsOnLoad.length === 1) {
-          await Brainer._onWindowCreated(windowsOnLoad[0]);
+          await Brainer._queueWindowCreated(windowsOnLoad[0]);
         }
       } catch (e) { console.error("[Workspaces] onStartup error:", e); }
     });
@@ -427,10 +639,15 @@ class Brainer {
           await WSPStorageManager.removePrimaryWindowId();
           Brainer._primaryWindowId = null;
           Brainer._state = 'uninitialized';
+          // Not a browser restart unless the browser is quitting (then this
+          // process ends anyway): a window opened next takes the workspaces
+          // over only on evidence (X-11, _windowTakeOverMode).
+          const closed = { windowId, noted: false };
+          Brainer._closedPrimary = closed;
           console.log("[Brainer][onWindowRemoved] state reset to uninitialized");
-          await Brainer._noteClosedPrimaryWindow(windowId);
+          closed.noted = await Brainer._noteClosedPrimaryWindow(windowId);
         } else {
-          console.log("[Brainer][onWindowRemoved] non-primary window (primary was:", primaryId, ") — no action");
+          console.log("[Brainer][onWindowRemoved] non-primary window (primary was:", primaryId, ") -- no action");
         }
       } catch (e) { console.error("[Workspaces] onRemoved error:", e); }
     });
@@ -490,7 +707,27 @@ class Brainer {
     }
   }
 
+  // windows.onCreated is handled one window at a time: deciding whether a
+  // window takes the workspaces over can wait for Firefox to fill it
+  // (_findTaggedWindow), and a second window created meanwhile -- a
+  // multi-window session restore -- used to be dropped as "restore already
+  // in flight", possibly the one holding the workspaces' tabs.
+  static _queueWindowCreated(window) {
+    const run = Brainer._windowCreatedChain.catch(() => {}).then(() => Brainer._onWindowCreated(window));
+    Brainer._windowCreatedChain = run;
+    return run;
+  }
+
   static async _onWindowCreated(window) {
+    // Only a normal browser window can hold the workspaces (X-118): a
+    // window.open popup (OAuth, payment) or another extension's pop-out has
+    // no tab strip and closes again in seconds -- claiming one rebound every
+    // workspace to it, filed its tab into the active workspace and let the
+    // snapshot refresh overwrite that workspace's tabSnapshot.
+    if (window.type != null && window.type !== "normal") {
+      console.log("[Brainer][_onWindowCreated] windowId:", window.id, "skipped -- a", window.type, "window");
+      return;
+    }
     // Fast-exit guards BEFORE the expensive stringified log (minor perf win
     // on non-primary window creation, more importantly avoids misleading
     // "looks like we processed it" log entries for skipped paths).
@@ -502,27 +739,24 @@ class Brainer {
     // defer to it. Without this guard, both _onWindowCreated and initialize()
     // can race to restore workspaces, potentially creating duplicate entries.
     if (Brainer._initStarted && Brainer._state !== 'ready') {
-      console.log("[Brainer][_onWindowCreated] windowId:", window.id, "skipped — initialize() still running");
+      console.log("[Brainer][_onWindowCreated] windowId:", window.id, "skipped -- initialize() still running");
       return;
     }
-    // Refuse-to-wipe is active: don't retry the restore against a brand-new
-    // (likely empty) window. The user must dismiss the banner or restart
-    // Firefox. Without this guard, every new window would re-trigger the
-    // failed restore against a target with no real content.
-    if (Brainer._refuseToWipeActive) {
-      console.log("[Brainer][_onWindowCreated] windowId:", window.id, "skipped -- refuse-to-wipe active");
+    // A failed start: a new window is a good moment to retry it (X-06).
+    if (Brainer._initFailure) {
+      await Brainer.retryInitialize("window created");
       return;
     }
-    // Check-then-act guard: the state checks above happen before the storage
-    // reads below, so two near-simultaneous onCreated events (multi-window
-    // session restore, or onCreated racing the onStartup fallback) could both
-    // pass them and run _restoreWorkspaces concurrently against different
-    // windows. The flag is set synchronously before the first await.
+    // Check-then-act guard against the restores that do not run through
+    // _queueWindowCreated (the banner's reopen, Dismiss and Give up): the
+    // state checks above happen before the storage reads below. The flag is
+    // set synchronously before the first await.
     if (Brainer._restoreInFlight) {
       console.log("[Brainer][_onWindowCreated] windowId:", window.id, "skipped -- restore already in flight");
       return;
     }
     Brainer._restoreInFlight = true;
+    let claimed = null;
     try {
       console.log("[Brainer][_onWindowCreated] windowId:", window.id, "state:", Brainer._state,
         "initStarted:", Brainer._initStarted);
@@ -537,49 +771,106 @@ class Brainer {
         console.log("[Brainer][_onWindowCreated] windowId:", window.id, "skipped post-read -- state is", Brainer._state);
         return;
       }
+      if (primaryId != null) {
+        console.log("[Brainer][_onWindowCreated] additional window opened (primary already:", primaryId, ") -- no action");
+        return;
+      }
+      // Never a private window while a non-private one is open (D2)
+      if (window.incognito && (await Brainer._normalWindows()).some(w => !w.incognito)) {
+        console.log("[Brainer][_onWindowCreated] windowId:", window.id, "skipped -- private window");
+        return;
+      }
 
-      // First-ever startup (no primary window recorded)
-      if (primaryId == null && lastId == null) {
-        console.log("[Brainer][_onWindowCreated] first-ever startup — setting primary to:", window.id);
+      // First-ever startup (no primary window recorded), or a start that
+      // found no normal window open
+      if (lastId == null) {
+        console.log("[Brainer][_onWindowCreated] first-ever startup -- setting primary to:", window.id);
         await WSPStorageManager.setPrimaryWindowId(window.id);
 
         const wsp = WorkspaceService._buildDefaultWspData(window.id);
         await WorkspaceService.createWorkspace(wsp);
         Brainer._state = 'ready';
+        claimed = window.id;
         console.log("[Brainer][_onWindowCreated] default workspace created, state: ready");
         return;
       }
 
-      // Browser restart — restore workspaces using Sessions API
-      if (primaryId == null) {
-        // The primary window closed while another stayed open, and the
-        // banner offers to reopen it (X-100). A window opened meanwhile is
-        // not that window coming back unless it holds its tagged tabs (a
-        // History > Recently Closed Windows restore does): restoring into a
-        // blank window replaced the banner with a refuse-to-wipe.
-        if ((await WSPStorageManager.getLastRestoreError())?.reason === Brainer.PRIMARY_CLOSED_REASON
-            && !(await Brainer._windowHoldsTaggedTabs(window.id, lastId))) {
-          console.log("[Brainer][_onWindowCreated] windowId:", window.id,
-            "holds none of the closed primary window's tabs -- not restoring into it");
-          return;
-        }
-        if (Brainer._state === 'restoring' || Brainer._state === 'initializing') return;
-        console.log("[Brainer][_onWindowCreated] restart path — lastId:", lastId, "entering restore");
-        Brainer._state = 'restoring';
-        try {
-          await Brainer._restoreWorkspaces(window);
-          Brainer._state = 'ready';
-          console.log("[Brainer][_onWindowCreated] restore complete — state: ready");
-        } catch (e) {
-          Brainer._state = 'uninitialized';
-          console.error("[Brainer][_onWindowCreated] restore failed:", e);
-          throw e;
-        }
-      } else {
-        console.log("[Brainer][_onWindowCreated] additional window opened (primary already:", primaryId, ") — no action");
-      }
+      // The workspaces wait for their window (primary closed, restore
+      // refused or failed): does this one take them over?
+      const mode = await Brainer._windowTakeOverMode(window, lastId);
+      if (!mode) return;
+      if (Brainer._state !== 'uninitialized') return;
+      console.log("[Brainer][_onWindowCreated] windowId:", window.id, "takes the workspaces of window", lastId,
+        "over -- mode:", mode);
+      await Brainer._takeOverWindow(window, mode);
+      claimed = window.id;
+      console.log("[Brainer][_onWindowCreated] take-over complete -- state: ready");
     } finally {
       Brainer._restoreInFlight = false;
+      // Outside the claim: the tail waits for late tabs (X-35)
+      if (claimed != null) await Brainer._settleReady(claimed, { lateTabs: true });
+    }
+  }
+
+  // Whether a normal window opened while the workspaces wait for theirs
+  // (primary window closed, restore refused or failed) takes them over.
+  // Opening a window is not a browser restart (X-11): restoring into any new
+  // window emptied every workspace into it and raised a false "not fully
+  // restored" warning with a bookmark export (a window with a real first
+  // tab), or tripped a false refuse-to-wipe (a blank one) -- and the closed
+  // window, reopened from History, then came back unmanaged, its inactive
+  // tabs hidden for good.
+  //  - "restore": the window holds tabs tagged for the workspaces (the closed
+  //    window reopened from History, or tabs Firefox restored late).
+  //  - "adopt": the primary window closed while the browser kept running and
+  //    nothing waits in it (no inactive workspace had tabs): the workspaces
+  //    move to the new window, as its first tab joins the active one.
+  //  - null: they keep waiting (for their window, a restart, or the banner).
+  //    A closed primary window whose inactive tabs wait is reported once
+  //    (the primary-window-closed banner offers it back).
+  static async _windowTakeOverMode(window, lastId) {
+    if (await Brainer._windowHoldsTaggedTabs(window.id, lastId)) return "restore";
+    if (Brainer._refuseToWipeActive || !(await Brainer._awaitsClosedPrimary())) {
+      console.log("[Brainer][_onWindowCreated] windowId:", window.id,
+        "holds none of the waiting workspaces' tabs -- not taking them over");
+      return null;
+    }
+    const workspaces = await WSPStorageManager.getWorkspaces(lastId);
+    if (workspaces.every(w => w.active || w.tabs.length === 0)) return "adopt";
+    console.log("[Brainer][_onWindowCreated] windowId:", window.id,
+      "holds none of the closed primary window's tabs, whose inactive workspaces wait -- not taking them over");
+    const closed = Brainer._closedPrimary;
+    if (closed && !closed.noted) {
+      closed.noted = true;
+      if (!(await WSPStorageManager.getLastRestoreError())) await Brainer._noteClosedPrimaryWindow(lastId);
+    }
+    return null;
+  }
+
+  // Hand the waiting workspaces to `window`: "restore" (it holds their
+  // tabs) or "adopt" (see _windowTakeOverMode). The caller holds
+  // _restoreInFlight and runs _settleReady afterwards.
+  static async _takeOverWindow(window, mode) {
+    Brainer._state = 'restoring';
+    try {
+      await Brainer._restoreWorkspaces(window, { adopt: mode === "adopt", midSession: true });
+    } catch (e) {
+      Brainer._state = 'uninitialized';
+      console.error("[Brainer][_takeOverWindow] failed:", e);
+      throw e;
+    }
+    Brainer._state = 'ready';
+  }
+
+  // The workspaces wait for a primary window that closed while the browser
+  // kept running: known in memory, or from the primary-window-closed banner
+  // (it persists across an extension update or a restart).
+  static async _awaitsClosedPrimary() {
+    if (Brainer._closedPrimary) return true;
+    try {
+      return (await WSPStorageManager.getLastRestoreError())?.reason === Brainer.PRIMARY_CLOSED_REASON;
+    } catch {
+      return false;
     }
   }
 
@@ -595,14 +886,15 @@ class Brainer {
   // Recently Closed Windows; nothing is reopened automatically (gotcha 7).
   static PRIMARY_CLOSED_REASON = "primary-window-closed";
 
+  // Returns whether the banner was raised.
   static async _noteClosedPrimaryWindow(windowId) {
     try {
       const others = (await browser.windows.getAll()).filter(w => w.id !== windowId);
-      if (others.length === 0) return; // browser quitting: the next start restores
+      if (others.length === 0) return false; // browser quitting: the next start restores
       const workspaces = await WSPStorageManager.getWorkspaces(windowId);
       const inactive = workspaces.filter(w => !w.active && w.tabs.length > 0);
       const hiddenTabCount = inactive.reduce((n, w) => n + w.tabs.length, 0);
-      if (hiddenTabCount === 0) return;
+      if (hiddenTabCount === 0) return false;
       const payload = {
         when: Date.now(),
         reason: Brainer.PRIMARY_CLOSED_REASON,
@@ -615,27 +907,38 @@ class Brainer {
         hiddenTabCount, "tab(s) of", inactive.length, "inactive workspace(s) -- payload:", JSON.stringify(payload));
       await WSPStorageManager.setLastRestoreError(payload);
       await UIService.refreshWarnBadge();
+      return true;
     } catch (e) {
       console.warn("[Brainer][_noteClosedPrimaryWindow] failed:", e?.message);
+      return false;
     }
   }
 
-  // Whether `windowId` holds a tab tagged for a workspace stored under
-  // `oldWindowId`. A window restored by Firefox gets its tabs after
-  // windows.onCreated, so an empty first look is retried once.
-  static async _windowHoldsTaggedTabs(windowId, oldWindowId) {
+  // The first of `windows` holding a tab tagged for a workspace stored
+  // under `oldWindowId` -- the one Firefox preserves across a close and a
+  // reopen, so it identifies the workspaces' window. A window restored by
+  // Firefox gets its tabs after windows.onCreated, so an empty first look
+  // is retried once.
+  static async _findTaggedWindow(windows, oldWindowId) {
+    if (windows.length === 0) return null;
     const wspIds = new Set((await WSPStorageManager.getWorkspaces(oldWindowId)).map(w => w.id));
-    if (wspIds.size === 0) return false;
+    if (wspIds.size === 0) return null;
     for (let attempt = 0; attempt < 2; attempt++) {
-      const tabs = await browser.tabs.query({ windowId }).catch(() => []);
-      for (const t of tabs) {
-        try {
-          if (wspIds.has(await browser.sessions.getTabValue(t.id, "wspId"))) return true;
-        } catch { /* closed meanwhile */ }
+      for (const win of windows) {
+        const tabs = await browser.tabs.query({ windowId: win.id }).catch(() => []);
+        for (const t of tabs) {
+          try {
+            if (wspIds.has(await browser.sessions.getTabValue(t.id, "wspId"))) return win;
+          } catch { /* closed meanwhile */ }
+        }
       }
       if (attempt === 0) await new Promise(r => setTimeout(r, LIMITS.RESTORE_WINDOW_DELAY_MS));
     }
-    return false;
+    return null;
+  }
+
+  static async _windowHoldsTaggedTabs(windowId, oldWindowId) {
+    return (await Brainer._findTaggedWindow([{ id: windowId }], oldWindowId)) != null;
   }
 
   // The Recently Closed Windows entry of the closed primary window: the one
@@ -672,27 +975,26 @@ class Brainer {
     }
     Brainer._restoreInFlight = true;
     Brainer._state = 'restoring';
+    let windowId;
     try {
       console.log("[Brainer][reopenClosedPrimaryWindow] restoring closed window, sessionId:", entry.sessionId);
       const restored = await browser.sessions.restore(entry.sessionId);
-      const windowId = restored?.window?.id;
+      windowId = restored?.window?.id;
       if (windowId == null) throw new Error("sessions.restore returned no window");
       // Same settle as the startup restore: Firefox adds the tabs after the window
       await new Promise(r => setTimeout(r, LIMITS.RESTORE_DELAY_MS));
-      await Brainer._restoreWorkspaces(await browser.windows.get(windowId));
+      await Brainer._restoreWorkspaces(await browser.windows.get(windowId), { midSession: true });
       Brainer._state = 'ready';
-      await Brainer._reconcileLateTabs(windowId);
-      await TabService.warmTabInfoCache(windowId);
-      await MenuService.refreshTabMenu();
-      await UIService.updateToolbarButton(windowId);
-      console.log("[Brainer][reopenClosedPrimaryWindow] done -- windowId:", windowId);
-      return { windowId };
     } catch (e) {
       if (Brainer._state === 'restoring') Brainer._state = 'uninitialized';
       throw e;
     } finally {
       Brainer._restoreInFlight = false;
     }
+    // Committed: the tail's failures no longer fail the request (X-06)
+    await Brainer._settleReady(windowId, { lateTabs: true, settleMs: 0 });
+    console.log("[Brainer][reopenClosedPrimaryWindow] done -- windowId:", windowId);
+    return { windowId };
   }
 
   // User-facing refusals of reopenClosedPrimaryWindow (handler.js passes
@@ -701,17 +1003,123 @@ class Brainer {
   static NOT_IN_RECENTLY_CLOSED_MESSAGE =
     "The closed window is no longer in Firefox's Recently Closed Windows list (History menu).";
 
+  // ── Banner actions: Dismiss and Give up (X-34) ──
+
+  // After Dismiss (handler acknowledgeLastRestoreError). Dismissing used to
+  // leave the extension inert until a restart when the start had failed or
+  // the restore was refused. Now a failed start is retried at once, and
+  // workspaces waiting for their window are restored into a normal window
+  // that already holds their tabs (Firefox may have finished restoring them
+  // since the banner went up). Nothing else: a refused restore is not run
+  // again against a window without them, so the banner the user just
+  // dismissed does not come straight back. Resolves to whether the
+  // extension is ready afterwards; never throws.
+  static async resumeAfterDismiss() {
+    try {
+      if (Brainer._state !== 'uninitialized' || Brainer._initStarted || Brainer._restoreInFlight) return false;
+      if (Brainer._initFailure) return await Brainer.retryInitialize("dismiss");
+      const [primaryId, lastId] = await Promise.all([
+        WSPStorageManager.getPrimaryWindowId(),
+        WSPStorageManager.getPrimaryWindowLastId(),
+      ]);
+      if (primaryId != null || lastId == null) return false;
+      if (Brainer._restoreInFlight || Brainer._state !== 'uninitialized') return false;
+      Brainer._restoreInFlight = true;
+      let target = null;
+      try {
+        target = await Brainer._findTaggedWindow(await Brainer._normalWindows(), lastId);
+        if (!target || Brainer._state !== 'uninitialized') return false;
+        console.log("[Brainer][resumeAfterDismiss] window", target.id, "holds the waiting workspaces' tabs -- restoring");
+        await Brainer._takeOverWindow(target, "restore");
+      } finally {
+        Brainer._restoreInFlight = false;
+      }
+      await Brainer._settleReady(target.id, { lateTabs: true });
+      return true;
+    } catch (e) {
+      console.error("[Brainer][resumeAfterDismiss] failed:", e);
+      return false;
+    }
+  }
+
+  static RESTORE_BUSY_MESSAGE = "Workspaces is restoring the previous session - please try again in a moment.";
+
+  // Give up (handler giveUpRestoreRetry): drop the restore-retry signal for
+  // good and start over in the current window.
+  //  - Refused while a start or a restore runs (X-72): the restore commits
+  //    anyway, and the give-up's clear wiped the warning it wrote.
+  //  - The waiting workspaces' snapshots are exported to bookmarks first,
+  //    then the old window's index is detached (X-71): Firefox numbers
+  //    windows from low ids each session, and a later first window with
+  //    the same id adopted the given-up workspaces instead of the promised
+  //    fresh default. The index stays when the export failed, so nothing is
+  //    stranded without a copy (the orphan sweep retries it).
+  //  - The banner is cleared compare-and-clear again after the slow export:
+  //    a warning written meanwhile is not the one the user gave up on.
+  //  - Then the first-start path runs against the focused normal window
+  //    (X-34): the extension used to stay inert until the next Firefox start.
+  // `when`: the payload the popup displayed (null: old popup, no check).
+  // Resolves to { stale } or { exported }.
+  static async giveUpRestore(when = null) {
+    if (Brainer._initStarted || Brainer._restoreInFlight
+        || Brainer._state === 'initializing' || Brainer._state === 'restoring') {
+      throw new Error(Brainer.RESTORE_BUSY_MESSAGE);
+    }
+    const isStale = (pending) => when != null && pending != null
+      && Number.isFinite(pending.when) && pending.when !== when;
+    if (isStale(await WSPStorageManager.getLastRestoreError())) return { stale: true };
+    Brainer._restoreInFlight = true;
+    let exported = { folders: 0, urls: 0, deduped: false };
+    try {
+      const lastId = await WSPStorageManager.getPrimaryWindowLastId();
+      if (lastId != null) {
+        const orphans = await WSPStorageManager.getWorkspaces(lastId);
+        exported = await Brainer._exportSnapshotsSafe(orphans);
+        const exportable = orphans.some(w => (w.tabSnapshot || []).length > 0);
+        if (exported.folders > 0 || exported.deduped || !exportable) {
+          await WSPStorageManager.detachWindow(lastId);
+        } else {
+          console.warn("[Brainer][giveUpRestore] bookmark export failed -- keeping window", lastId,
+            "index for the orphan sweep to retry");
+        }
+      }
+      if (!isStale(await WSPStorageManager.getLastRestoreError())) {
+        await WSPStorageManager.clearLastRestoreError();
+      }
+      await WSPStorageManager.removePrimaryWindowLastId();
+      Brainer._refuseToWipeActive = false;
+      Brainer._closedPrimary = null;
+    } finally {
+      Brainer._restoreInFlight = false;
+    }
+    await UIService.refreshWarnBadge();
+    // Start over now. With a primary still set (a restore committed before
+    // the give-up), there is nothing to start.
+    if (Brainer._state === 'uninitialized' && !Brainer._initStarted
+        && (await WSPStorageManager.getPrimaryWindowId()) == null) {
+      console.log("[Brainer][giveUpRestore] starting over in the current window");
+      await Brainer.initialize();
+    }
+    return { exported };
+  }
+
   // AMO updates restart the background at once unless something listens to
   // runtime.onUpdateAvailable. Applied only when no activation, create,
-  // destroy or restore runs, so an update cannot cut a workspace handoff in
-  // half (X-95). If that never happens, Firefox applies it at the next start.
+  // destroy, restore, container migration or tab reopen runs, so an update
+  // cannot cut a multi-step operation in half (X-95, X-99): a container
+  // migration takes the tab ids out of storage before the reopened tabs are
+  // filed and tagged. If that never happens, Firefox applies it at the next
+  // start.
   static async _reloadWhenIdle() {
+    if (Brainer._reloadPending) return;
+    Brainer._reloadPending = true;
     for (;;) {
       await WorkspaceService.whenActivationsSettled();
       const busy = Brainer._initStarted || Brainer._restoreInFlight
         || Brainer._state === 'initializing' || Brainer._state === 'restoring'
         || WorkspaceService._pendingDestroys.size > 0 || WorkspaceService._handoffs.size > 0
-        || WorkspaceService.isActivating();
+        || WorkspaceService.isActivating() || WorkspaceService._migrationsInFlight > 0
+        || TabService._reopeningCount > 0;
       if (!busy) break;
       await new Promise(r => setTimeout(r, 500));
     }
@@ -734,7 +1142,7 @@ class Brainer {
   static async _primaryWindowHoldsItsWorkspaces(windowId) {
     const workspaces = await WSPStorageManager.getWorkspaces(windowId);
     if (workspaces.length === 0) return true; // nothing to protect
-    const allWindows = await browser.windows.getAll();
+    const allWindows = await Brainer._normalWindows();
     if (allWindows.length <= 1) return true;  // no other window to confuse it with
     const wspIds = new Set(workspaces.map(w => w.id));
 
@@ -766,9 +1174,15 @@ class Brainer {
   // return a fresh blank window instead of the session-restored one.
   // We score each window by how many of its tab URLs appear in the saved
   // workspace snapshots, with one retry to tolerate session-restore lag.
-  static async _findRestoreWindow(oldWindowId) {
-    const allWindows = await browser.windows.getAll();
-    console.log("[Brainer][_findRestoreWindow] oldWindowId:", oldWindowId, "allWindows:", allWindows.map(w => w.id));
+  // Normal windows only (X-118); null when none is open. `requireTags`:
+  // only a window holding the workspaces' tagged tabs qualifies (they wait
+  // for a primary window that closed while the browser kept running, X-11).
+  static async _findRestoreWindow(oldWindowId, { requireTags = false } = {}) {
+    const allWindows = await Brainer._normalWindows();
+    console.log("[Brainer][_findRestoreWindow] oldWindowId:", oldWindowId, "normal windows:", allWindows.map(w => w.id),
+      "requireTags:", requireTags);
+    if (requireTags) return Brainer._findTaggedWindow(allWindows, oldWindowId);
+    if (allWindows.length === 0) return null;
     if (allWindows.length === 1) {
       console.log("[Brainer][_findRestoreWindow] single window — no scoring needed, returning:", allWindows[0].id);
       return allWindows[0];
@@ -815,8 +1229,19 @@ class Brainer {
     return best;
   }
 
-  static async _restoreWorkspaces(window) {
-    console.log("[Brainer][_restoreWorkspaces] windowId:", window.id);
+  // Rebind the workspaces waiting under primaryWindowLastId to `window`.
+  // Startup restore by default. `midSession`: the window takes them over
+  // while the browser keeps running (_windowTakeOverMode, the banner's
+  // reopen); a commit then clears only the primary-window-closed banner,
+  // not an unrelated warning the user has not read. `adopt` (implies
+  // midSession): the window holds none of their tabs and nothing waits for
+  // the closed one (X-11): its tabs join the active workspace without the
+  // URL-snapshot matching, and the startup checks (refuse-to-wipe,
+  // incomplete-restore export and warning) are skipped -- the tabs are
+  // gone because the user closed their window, not because a restart lost
+  // them.
+  static async _restoreWorkspaces(window, { adopt = false, midSession = adopt } = {}) {
+    console.log("[Brainer][_restoreWorkspaces] windowId:", window.id, "adopt:", adopt, "midSession:", midSession);
     // All tab IDs are invalidated across restart; clear stale force-reopen entries
     TabService._forceReopenIds.clear();
 
@@ -916,7 +1341,9 @@ class Brainer {
 
     // URL-based fallback for untagged tabs (session API can drop values across restart).
     const unmatchedTabs = [];
-    if (untaggedTabs.length > 0) {
+    if (adopt) {
+      unmatchedTabs.push(...untaggedTabs);
+    } else if (untaggedTabs.length > 0) {
       console.warn(`[Workspaces] Restore: ${untaggedTabs.length} untagged tab(s) — trying URL snapshot fallback`);
       const snapshotByWsp = new Map();
       for (const wsp of wspData) {
@@ -974,7 +1401,7 @@ class Brainer {
     // bypasses the guard.
     const liveContentTabs = newTabs.filter(t => !t.pinned && t.url && !Brainer._PLACEHOLDER_URL_RE.test(t.url)
       && !destroyLeftovers.includes(t.id));
-    if (wspData.length > 0 && totalAssigned === 0 && liveContentTabs.length === 0 && hadRecoverableData) {
+    if (!adopt && wspData.length > 0 && totalAssigned === 0 && liveContentTabs.length === 0 && hadRecoverableData) {
       const errorPayload = {
         when: Date.now(),
         reason: "refuse-to-wipe",
@@ -1010,7 +1437,7 @@ class Brainer {
     // to reopen tabs; recovery from the bookmark backup is user-initiated.
     // Fingerprint dedup avoids repeated exports and warnings for the same
     // snapshot content. Placeholder-only starts still use refuse-to-wipe.
-    const sessionLost = Brainer._isSessionLost({
+    const sessionLost = !adopt && Brainer._isSessionLost({
       snapshotUrlCount,
       taggedCount: [...sessionMap.values()].filter(v => wspIdSet.has(v)).length,
       survivingUrlCount: totalAssigned,
@@ -1118,7 +1545,9 @@ class Brainer {
       await WSPStorageManager.setPrimaryWindowId(window.id);
       Brainer._primaryWindowId = window.id;
       await WSPStorageManager.removePrimaryWindowLastId();
-      await WSPStorageManager.clearLastRestoreError();
+      if (!midSession || (await WSPStorageManager.getLastRestoreError())?.reason === Brainer.PRIMARY_CLOSED_REASON) {
+        await WSPStorageManager.clearLastRestoreError();
+      }
       Brainer._refuseToWipeActive = false;
       if (sessionLost) {
         if (sessionLossExport?.deduped) {
