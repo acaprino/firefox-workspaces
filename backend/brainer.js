@@ -310,6 +310,11 @@ class Brainer {
       } catch (e) { console.error("[Workspaces] onInstalled error:", e); }
     });
 
+    browser.runtime.onUpdateAvailable?.addListener(() => {
+      console.log("[Brainer][onUpdateAvailable] update pending -- applying once idle");
+      Brainer._reloadWhenIdle().catch(e => console.error("[Workspaces] onUpdateAvailable error:", e));
+    });
+
     browser.windows.onCreated.addListener(async (window) => {
       try {
         console.log("[Brainer][onWindowCreated] windowId:", window.id, "state:", Brainer._state);
@@ -389,6 +394,7 @@ class Brainer {
           Brainer._primaryWindowId = null;
           Brainer._state = 'uninitialized';
           console.log("[Brainer][onWindowRemoved] state reset to uninitialized");
+          await Brainer._noteClosedPrimaryWindow(windowId);
         } else {
           console.log("[Brainer][onWindowRemoved] non-primary window (primary was:", primaryId, ") — no action");
         }
@@ -512,6 +518,18 @@ class Brainer {
 
       // Browser restart — restore workspaces using Sessions API
       if (primaryId == null) {
+        // The primary window closed while another stayed open, and the
+        // banner offers to reopen it (X-100). A window opened meanwhile is
+        // not that window coming back unless it holds its tagged tabs (a
+        // History > Recently Closed Windows restore does): restoring into a
+        // blank window replaced the banner with a refuse-to-wipe.
+        if ((await WSPStorageManager.getLastRestoreError())?.reason === Brainer.PRIMARY_CLOSED_REASON
+            && !(await Brainer._windowHoldsTaggedTabs(window.id, lastId))) {
+          console.log("[Brainer][_onWindowCreated] windowId:", window.id,
+            "holds none of the closed primary window's tabs -- not restoring into it");
+          return;
+        }
+        if (Brainer._state === 'restoring' || Brainer._state === 'initializing') return;
         console.log("[Brainer][_onWindowCreated] restart path — lastId:", lastId, "entering restore");
         Brainer._state = 'restoring';
         try {
@@ -529,6 +547,142 @@ class Brainer {
     } finally {
       Brainer._restoreInFlight = false;
     }
+  }
+
+  // ── Primary window closed mid-session (X-100) ──
+  // Firefox closes a window when its last VISIBLE tab closes
+  // (browser.tabs.closeWindowWithLastTab, true by default): hidden tabs do
+  // not count, so closing the only tab of the workspace on screen closed
+  // every other workspace's tabs with the window, and nothing said so. The
+  // close cannot be intercepted. When another window stays open (not a
+  // browser quit) and the closed window held tabs of inactive workspaces,
+  // the restore-error banner reports it and offers a way back that the user
+  // triggers (reopenClosedPrimaryWindow). Firefox keeps the window in
+  // Recently Closed Windows; nothing is reopened automatically (gotcha 7).
+  static PRIMARY_CLOSED_REASON = "primary-window-closed";
+
+  static async _noteClosedPrimaryWindow(windowId) {
+    try {
+      const others = (await browser.windows.getAll()).filter(w => w.id !== windowId);
+      if (others.length === 0) return; // browser quitting: the next start restores
+      const workspaces = await WSPStorageManager.getWorkspaces(windowId);
+      const inactive = workspaces.filter(w => !w.active && w.tabs.length > 0);
+      const hiddenTabCount = inactive.reduce((n, w) => n + w.tabs.length, 0);
+      if (hiddenTabCount === 0) return;
+      const payload = {
+        when: Date.now(),
+        reason: Brainer.PRIMARY_CLOSED_REASON,
+        windowId,
+        wspCount: workspaces.length,
+        hiddenWspCount: inactive.length,
+        hiddenTabCount,
+      };
+      console.warn("[Brainer][_noteClosedPrimaryWindow] primary window closed with",
+        hiddenTabCount, "tab(s) of", inactive.length, "inactive workspace(s) -- payload:", JSON.stringify(payload));
+      await WSPStorageManager.setLastRestoreError(payload);
+      await UIService.refreshWarnBadge();
+    } catch (e) {
+      console.warn("[Brainer][_noteClosedPrimaryWindow] failed:", e?.message);
+    }
+  }
+
+  // Whether `windowId` holds a tab tagged for a workspace stored under
+  // `oldWindowId`. A window restored by Firefox gets its tabs after
+  // windows.onCreated, so an empty first look is retried once.
+  static async _windowHoldsTaggedTabs(windowId, oldWindowId) {
+    const wspIds = new Set((await WSPStorageManager.getWorkspaces(oldWindowId)).map(w => w.id));
+    if (wspIds.size === 0) return false;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const tabs = await browser.tabs.query({ windowId }).catch(() => []);
+      for (const t of tabs) {
+        try {
+          if (wspIds.has(await browser.sessions.getTabValue(t.id, "wspId"))) return true;
+        } catch { /* closed meanwhile */ }
+      }
+      if (attempt === 0) await new Promise(r => setTimeout(r, LIMITS.RESTORE_WINDOW_DELAY_MS));
+    }
+    return false;
+  }
+
+  // The Recently Closed Windows entry of the closed primary window: the one
+  // whose tabs match the most URLs recorded in its workspaces' snapshots.
+  static async _findClosedPrimaryWindow(oldWindowId) {
+    const workspaces = await WSPStorageManager.getWorkspaces(oldWindowId);
+    const urls = new Set(workspaces.flatMap(w => [...(w.tabSnapshot || []), w.lastActiveTabUrl].filter(Boolean)));
+    if (urls.size === 0) return null;
+    let best = null;
+    let bestScore = 0;
+    for (const session of await browser.sessions.getRecentlyClosed()) {
+      const win = session.window;
+      if (!win?.sessionId) continue;
+      const score = (win.tabs || []).filter(t => urls.has(t.url)).length;
+      if (score > bestScore) { best = win; bestScore = score; }
+    }
+    return best;
+  }
+
+  // User-triggered (popup banner, handler reopenClosedPrimaryWindow): reopen
+  // the closed primary window from Recently Closed Windows and restore the
+  // workspaces into it, as the startup restore path does.
+  static async reopenClosedPrimaryWindow() {
+    const lastId = await WSPStorageManager.getPrimaryWindowLastId();
+    if (Brainer._state !== 'uninitialized' || Brainer._restoreInFlight || Brainer._initStarted
+        || lastId == null || (await WSPStorageManager.getPrimaryWindowId()) != null) {
+      throw new Error(Brainer.NOTHING_TO_REOPEN_MESSAGE);
+    }
+    const entry = await Brainer._findClosedPrimaryWindow(lastId);
+    if (!entry) throw new Error(Brainer.NOT_IN_RECENTLY_CLOSED_MESSAGE);
+    // Synchronous claim: _onWindowCreated skips while a restore runs
+    if (Brainer._restoreInFlight || Brainer._state !== 'uninitialized') {
+      throw new Error(Brainer.NOTHING_TO_REOPEN_MESSAGE);
+    }
+    Brainer._restoreInFlight = true;
+    Brainer._state = 'restoring';
+    try {
+      console.log("[Brainer][reopenClosedPrimaryWindow] restoring closed window, sessionId:", entry.sessionId);
+      const restored = await browser.sessions.restore(entry.sessionId);
+      const windowId = restored?.window?.id;
+      if (windowId == null) throw new Error("sessions.restore returned no window");
+      // Same settle as the startup restore: Firefox adds the tabs after the window
+      await new Promise(r => setTimeout(r, LIMITS.RESTORE_DELAY_MS));
+      await Brainer._restoreWorkspaces(await browser.windows.get(windowId));
+      Brainer._state = 'ready';
+      await Brainer._reconcileLateTabs(windowId);
+      await TabService.warmTabInfoCache(windowId);
+      await MenuService.refreshTabMenu();
+      await UIService.updateToolbarButton(windowId);
+      console.log("[Brainer][reopenClosedPrimaryWindow] done -- windowId:", windowId);
+      return { windowId };
+    } catch (e) {
+      if (Brainer._state === 'restoring') Brainer._state = 'uninitialized';
+      throw e;
+    } finally {
+      Brainer._restoreInFlight = false;
+    }
+  }
+
+  // User-facing refusals of reopenClosedPrimaryWindow (handler.js passes
+  // them through).
+  static NOTHING_TO_REOPEN_MESSAGE = "Nothing to reopen - the workspaces are not waiting for a closed window.";
+  static NOT_IN_RECENTLY_CLOSED_MESSAGE =
+    "The closed window is no longer in Firefox's Recently Closed Windows list (History menu).";
+
+  // AMO updates restart the background at once unless something listens to
+  // runtime.onUpdateAvailable. Applied only when no activation, create,
+  // destroy or restore runs, so an update cannot cut a workspace handoff in
+  // half (X-95). If that never happens, Firefox applies it at the next start.
+  static async _reloadWhenIdle() {
+    for (;;) {
+      await WorkspaceService.whenActivationsSettled();
+      const busy = Brainer._initStarted || Brainer._restoreInFlight
+        || Brainer._state === 'initializing' || Brainer._state === 'restoring'
+        || WorkspaceService._pendingDestroys.size > 0 || WorkspaceService._handoffs.size > 0
+        || WorkspaceService.isActivating();
+      if (!busy) break;
+      await new Promise(r => setTimeout(r, 500));
+    }
+    console.log("[Brainer][_reloadWhenIdle] idle -- applying the update");
+    browser.runtime.reload();
   }
 
   // Identity check for the stored primaryWindowId (undetected-restart guard).
@@ -704,10 +858,19 @@ class Brainer {
     const wspIdSet = new Set(wspData.map(w => w.id));
     const assigned = new Map();          // wspId -> tabId[]
     const untaggedTabs = [];
+    // Hidden tabs of a workspace whose destroy was cut short: closed in
+    // Phase 4 instead of being filed and shown (X-96).
+    const pendingDestroys = await WSPStorageManager.getPendingDestroys();
+    const destroyLeftovers = [];
 
     for (const tab of newTabs) {
       if (tab.pinned) continue;
       const wspId = sessionMap.get(tab.id);
+      if (tab.hidden && wspId && !wspIdSet.has(wspId)
+          && await Brainer._isDestroyLeftover(wspId, pendingDestroys)) {
+        destroyLeftovers.push(tab.id);
+        continue;
+      }
       if (wspId && wspIdSet.has(wspId)) {
         if (!assigned.has(wspId)) assigned.set(wspId, []);
         assigned.get(wspId).push(tab.id);
@@ -740,6 +903,25 @@ class Brainer {
       }
     }
 
+    // Exactly one active workspace (X-95). An activation, create or destroy
+    // cut short by the background's death can leave none -- every tab but
+    // the selected one was then hidden below -- or two. Keep the one that
+    // owns the selected tab, else the first flagged one, else the first in
+    // the saved order.
+    const flagged = wspData.filter(w => w.active);
+    if (wspData.length > 0 && flagged.length !== 1) {
+      const selected = newTabs.find(t => t.active);
+      const ownerId = selected ? [...assigned].find(([, ids]) => ids.includes(selected.id))?.[0] : null;
+      const owner = wspData.find(w => w.id === ownerId);
+      const keep = (owner && (flagged.length === 0 || owner.active) ? owner : null)
+        ?? flagged[0]
+        ?? wspData.find(w => w.id === oldOrder?.find(id => wspIdSet.has(id)))
+        ?? wspData[0];
+      console.warn("[Brainer][_restoreWorkspaces]", flagged.length, "workspaces flagged active -- keeping",
+        keep.id, keep.name);
+      for (const w of wspData) w.active = w === keep;
+    }
+
     const totalAssigned = [...assigned.values()].reduce((n, a) => n + a.length, 0);
     const hadRecoverableData = wspData.some(w => w.tabSnapshot.length > 0);
     const snapshotUrlCount = wspData.reduce((n, w) => n + w.tabSnapshot.length, 0);
@@ -756,7 +938,8 @@ class Brainer {
     // are live in the window. Placeholder tabs (about:newtab etc.) do NOT
     // count as live content -- otherwise FMA2 (placeholder-only restart)
     // bypasses the guard.
-    const liveContentTabs = newTabs.filter(t => !t.pinned && t.url && !Brainer._PLACEHOLDER_URL_RE.test(t.url));
+    const liveContentTabs = newTabs.filter(t => !t.pinned && t.url && !Brainer._PLACEHOLDER_URL_RE.test(t.url)
+      && !destroyLeftovers.includes(t.id));
     if (wspData.length > 0 && totalAssigned === 0 && liveContentTabs.length === 0 && hadRecoverableData) {
       const errorPayload = {
         when: Date.now(),
@@ -840,11 +1023,13 @@ class Brainer {
         await WSPStorageManager.detachWindow(oldWindowId);
       }
 
+      await Brainer._closeDestroyLeftovers(destroyLeftovers);
+
       // Truly unmatched tabs go to the active workspace via the normal entry point.
       for (const tab of unmatchedTabs) {
         console.log("[Brainer][_restoreWorkspaces] no URL match, adding to active workspace:", tab.url);
         if (await TabService.addTabToWorkspace(tab, { skipForceContainer: true })) {
-          await browser.tabs.show(tab.id);
+          await TabService.showTabs(tab.id);
         }
       }
 
@@ -1392,9 +1577,10 @@ class Brainer {
 
   // Full repair sequence for the already-running init path (and the
   // onStartup-fired-after-ready safety net): drop stale IDs, re-file open tabs
-  // by session value (and URL snapshot when a restart is likely), assign any
-  // leftovers, then re-apply visibility if anything moved. Idempotent: a no-op
-  // when assignments already match session values.
+  // by session value (and URL snapshot when a restart is likely), re-apply
+  // the one-active invariant and visibility, then assign any leftovers.
+  // Idempotent: writes nothing when assignments already match session values
+  // and one workspace is active.
   static async _repairTabAssignments(windowId, restartLikely = false) {
     // Hold back pending snapshot refreshes (scheduled before an onStartup
     // that fired after init): they would land between the repair's writes
@@ -1408,25 +1594,68 @@ class Brainer {
       if (restartLikely) await Brainer._detectSessionLoss(windowId);
       await Brainer._cleanStaleTabIds(windowId);
       const corrected = await Brainer._reconcileFromSessionValues(windowId, restartLikely);
+      // Every time, not only after a correction: see _enforceActiveWorkspace.
+      await Brainer._enforceActiveWorkspace(windowId, { reactivate: corrected });
       await Brainer._reconcileLateTabs(windowId);
-      if (corrected) {
-        const active = await WorkspaceService.getActiveWsp(windowId);
-        if (active) {
-          const activeObj = await WSPStorageManager.getWorkspace(active.id);
-          if (await activeObj.activate()) {
-            WorkspaceService._updateActiveCache(windowId, activeObj.tabs, activeObj.id, activeObj.containerId);
-          }
-        }
-        await WorkspaceService.hideInactiveWspTabs(windowId, active ? active.id : null);
-      }
       return corrected;
     } finally {
       for (const wspId of deferred) TabService._scheduleSnapshotRefresh(windowId, wspId);
     }
   }
 
+  // One active workspace, the right tabs on screen and a primed active cache
+  // on the already-running path, whatever the reconcile found:
+  //  - Firefox shows every tab this extension hid when it is disabled, and
+  //    re-enabling it (also the "Run in Private Windows" toggle, which
+  //    reloads it) left every workspace's tabs mixed in the strip: the
+  //    session tags still agree with the stored lists, so nothing re-hid
+  //    them (X-94).
+  //  - An activation, create or destroy cut short by the background's death
+  //    can leave no workspace active, or two (X-95).
+  //  - Nothing primed the active cache on this path, which kept navigation-
+  //    time container enforcement and the URL snapshot refresh off until
+  //    the first switch (X-10).
+  // The workspace that owns the selected tab wins (the user is looking at
+  // it), else the flagged one, else the first in the saved order. A full
+  // activation runs only when that workspace is not the one flagged active
+  // or `reactivate` is set (the reconcile moved tabs); otherwise its hidden
+  // tabs are shown and every other workspace's tabs hidden.
+  static async _enforceActiveWorkspace(windowId, { reactivate = false } = {}) {
+    const workspaces = await WorkspaceService.getOrderedWorkspaces(windowId);
+    if (workspaces.length === 0) return;
+    const [selected] = await browser.tabs.query({ windowId, active: true });
+    const owner = selected ? workspaces.find(w => w.tabs.includes(selected.id)) : null;
+    const flagged = workspaces.filter(w => w.active);
+    const target = owner ?? flagged[0] ?? workspaces[0];
+    if (reactivate || !target.active) {
+      console.warn("[Brainer][_enforceActiveWorkspace] activating", target.id, target.name,
+        "| flagged active:", flagged.map(w => w.id), "| reactivate:", reactivate);
+      // Stands every other flagged workspace down and primes the cache
+      await WorkspaceService.activateWsp(target.id, windowId, owner === target ? selected.id : null);
+      return;
+    }
+    for (const w of flagged) {
+      if (w.id === target.id) continue;
+      console.warn("[Brainer][_enforceActiveWorkspace] workspace", w.id, "was also flagged active -- standing it down");
+      await WSPStorageManager.mutateWorkspace(w.id, (fresh) => {
+        if (!fresh.active) return false;
+        fresh.active = false;
+      });
+    }
+    const hiddenOwn = (await browser.tabs.query({ windowId, hidden: true }))
+      .filter(t => target.tabs.includes(t.id)).map(t => t.id);
+    if (hiddenOwn.length > 0) await TabService.showTabs(hiddenOwn);
+    await WorkspaceService.hideInactiveWspTabs(windowId, target.id);
+    const fresh = await WSPStorageManager.getWorkspace(target.id);
+    if (fresh.windowId != null) {
+      WorkspaceService._updateActiveCache(windowId, fresh.tabs, fresh.id, fresh.containerId);
+    }
+  }
+
   // Catch tabs that Firefox session-restored during the 'restoring' phase.
   // Their onTabCreated events were blocked, so they need explicit assignment.
+  // Tabs filed into the active workspace are shown: a hidden one used to
+  // become an invisible member of the workspace on screen (X-96).
   static async _reconcileLateTabs(windowId) {
     const allTabs = await browser.tabs.query({ windowId, pinned: false });
     const workspaces = await WSPStorageManager.getWorkspaces(windowId);
@@ -1444,6 +1673,8 @@ class Brainer {
     const activeWsp = workspaces.find(w => w.active);
     const byWsp = new Map();
     const noSession = [];
+    const leftovers = [];
+    const pendingDestroys = await WSPStorageManager.getPendingDestroys();
 
     for (const tab of untracked) {
       let wspId;
@@ -1458,14 +1689,21 @@ class Brainer {
         // (see _ensureDefaultWorkspace). Adopting it made our activations
         // show it.
         console.log("[Brainer][_reconcileLateTabs] tab", tab.id, "hidden by another extension -- left alone");
+      } else if (tab.hidden && await Brainer._isDestroyLeftover(wspId, pendingDestroys)) {
+        // A visible one is on screen: kept and filed below instead.
+        leftovers.push(tab.id);
       } else {
         noSession.push(tab);
       }
     }
 
+    // Tabs of a workspace whose destroy was cut short: finish closing them.
+    await Brainer._closeDestroyLeftovers(leftovers);
+
     // Assign session-tagged tabs to their correct workspaces (locked
     // read-modify-write, same discipline as add/remove)
     const toHide = [];
+    const toShow = [];
     for (const [wspId, tabs] of byWsp) {
       let wspActive = false;
       await WSPStorageManager.mutateWorkspace(wspId, (wsp) => {
@@ -1483,6 +1721,7 @@ class Brainer {
         toHide.push(...tabs.map(t => t.id));
       } else {
         for (const tab of tabs) WorkspaceService.addTabToActiveCache(tab.id, wspId);
+        toShow.push(...tabs.filter(t => t.hidden).map(t => t.id));
       }
     }
 
@@ -1495,18 +1734,40 @@ class Brainer {
       });
       await Promise.all(noSession.map(tab => TabService.setTabSessionValue(tab.id, activeWsp.id)));
       for (const tab of noSession) WorkspaceService.addTabToActiveCache(tab.id, activeWsp.id);
+      toShow.push(...noSession.filter(t => t.hidden).map(t => t.id));
       // Keep tabSnapshot fresh for restart resilience (IC3).
       TabService._scheduleSnapshotRefresh(windowId, activeWsp.id);
       console.log("[Brainer][_reconcileLateTabs] assigned", noSession.length, "untagged tabs to active workspace");
     }
 
+    if (toShow.length > 0) {
+      await TabService.showTabs(toShow);
+      console.log("[Brainer][_reconcileLateTabs] shown", toShow.length, "hidden tab(s) filed into the active workspace");
+    }
+
     if (toHide.length > 0) {
-      try { await browser.tabs.hide(toHide); }
-      catch (e) { console.debug("[Brainer][_reconcileLateTabs] tabs.hide failed:", e.message); }
-      try { await TabService.ungroup(toHide); }
-      catch (e) { console.debug("[Brainer][_reconcileLateTabs] tabs.ungroup failed:", e.message); }
+      await TabService.hideTabs(toHide);
+      const grouped = untracked.filter(t => t.groupId !== -1 && toHide.includes(t.id)).map(t => t.id);
+      if (grouped.length > 0) await TabService.ungroup(grouped);
       console.log("[Brainer][_reconcileLateTabs] hidden", toHide.length, "inactive-workspace tabs");
     }
+  }
+
+  // A tab whose session tag names a workspace whose destroy was cut short
+  // (tombstone written, record gone): the user deleted that workspace, so
+  // its tab is closed rather than adopted into whatever is active (X-96).
+  // Without the tombstone a tag naming a missing workspace proves nothing
+  // (wiped storage, a detached dead window), and the tab is kept.
+  static async _isDestroyLeftover(wspId, pendingDestroys) {
+    if (!wspId || !pendingDestroys.includes(wspId)) return false;
+    return (await WSPStorageManager.getWspState(wspId)).windowId == null;
+  }
+
+  static async _closeDestroyLeftovers(tabIds) {
+    if (tabIds.length === 0) return;
+    console.warn("[Brainer][_closeDestroyLeftovers] closing", tabIds.length,
+      "tab(s) of a workspace whose destroy was interrupted:", tabIds);
+    await TabService._eachTab("remove", tabIds);
   }
 
   // ── Tab Listeners ──
@@ -1654,6 +1915,7 @@ class Brainer {
           return;
         }
 
+        const seq = WorkspaceService.activationSeq();
         const workspaces = await WSPStorageManager.getWorkspaces(activeInfo.windowId);
         const activeWsp = workspaces.find(wsp => wsp.active);
         console.log("[Brainer][onTabActivated] activeWsp:", activeWsp?.id, activeWsp?.name,
@@ -1661,6 +1923,9 @@ class Brainer {
 
         if (!activeWsp || activeWsp.tabs.includes(activeInfo.tabId)) {
           if (activeWsp) {
+            // Cold or stale cache: fill it from this read, so the next click
+            // takes the fast path (X-10).
+            WorkspaceService.primeActiveCache(activeInfo.windowId, activeWsp, seq);
             WorkspaceService.updateLastActiveTab(activeInfo.windowId, activeInfo.tabId);
           }
           console.log("[Brainer][onTabActivated] tab already in active workspace or no active wsp - no action");
@@ -1713,6 +1978,35 @@ class Brainer {
         await TabService.forceTabIntoActiveContainer(tab, changeInfo.url);
       } catch (e) { console.error("[Workspaces] onUpdated(container-force) error:", e); }
     }, {properties: ["url"]});
+
+    // Firefox refuses to hide a tab that shares camera, microphone or screen
+    // (tabs.hide leaves it out of its result), so a workspace switch leaves
+    // such a tab of the previous workspace on screen. Nothing hid it once
+    // the sharing stopped: it lingered in the active workspace's strip until
+    // the next switch, and clicking it switched workspaces (X-103).
+    browser.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
+      try {
+        if (Brainer._state !== 'ready') return;
+        const sharing = tab.sharingState;
+        if (sharing && (sharing.camera || sharing.microphone || sharing.screen)) return;
+        if (tab.hidden || tab.active || tab.pinned) return;
+        if (WorkspaceService.isActivating()) {
+          await WorkspaceService.whenActivationsSettled();
+          if (Brainer._state !== 'ready') return;
+          try { tab = await browser.tabs.get(tabId); }
+          catch { return; }
+          if (tab.hidden || tab.active || tab.pinned) return;
+        }
+        const primaryId = await Brainer.getCachedPrimaryWindowId();
+        if (primaryId !== tab.windowId) return;
+        const workspaces = await WSPStorageManager.getWorkspaces(tab.windowId);
+        const owner = workspaces.find(wsp => wsp.tabs.includes(tabId));
+        if (!owner || owner.active) return;
+        console.log("[Brainer][onTabUpdated/sharingState] tab", tabId, "of inactive workspace", owner.id,
+          "stopped sharing -- hiding it");
+        await TabService.hideTabs(tabId);
+      } catch (e) { console.error("[Workspaces] onUpdated(sharingState) error:", e); }
+    }, {properties: ["sharingState"]});
 
     // Two separate onUpdated listeners exist because they use different filter
     // properties ("pinned" vs "groupId"). Firefox requires separate registrations
@@ -1812,12 +2106,18 @@ class Brainer {
           return;
         }
 
-        const activeIdx = workspaces.findIndex(w => w.active);
+        // Step from the workspace an activation still in flight is bringing
+        // up: storage names the one being left until it is done, and a
+        // second quick press repeated the first switch or was dropped (X-37).
+        // Read after the storage read above, so a press queued meanwhile is seen.
+        const pendingId = WorkspaceService.pendingActivation(windowId);
+        let activeIdx = pendingId ? workspaces.findIndex(w => w.id === pendingId) : -1;
+        if (activeIdx === -1) activeIdx = workspaces.findIndex(w => w.active);
         console.log("[Brainer][onCommand] activeIdx:", activeIdx,
-          "active:", workspaces[activeIdx]?.name);
+          "active:", workspaces[activeIdx]?.name, "pending:", pendingId);
         if (activeIdx === -1) {
-          console.log("[Brainer][onCommand] skipped — no active workspace");
-          return;
+          // None active: next starts at the first workspace, previous at the last
+          activeIdx = command === "workspace-prev" ? 0 : workspaces.length - 1;
         }
 
         if (command === "workspace-next") {

@@ -218,12 +218,17 @@ class BookmarkService {
     wspData.name = BookmarkService._sanitizeFolderTitle(folder.title);
     wspData.active = true;
 
-    // [M4 + Firefox reviewer] Hold the reopen guard across createWorkspace
-    // to prevent the entire workspace creation + tab creation sequence from
-    // being intercepted by addTabToWorkspace.
-    return TabService.withReopenGuard(async () => {
+    // One step of the activation chain (X-23): the restore switches the
+    // active workspace and then opens its tabs one by one. A click on an old,
+    // still visible tab meanwhile used to start an activation in parallel,
+    // leaving storage (old workspace active), the cache (restored workspace)
+    // and the screen (one tab) disagreeing. Tab events now wait for the step.
+    // [M4 + Firefox reviewer] The reopen guard stays held across the create
+    // and tab creation so addTabToWorkspace never files these tabs itself.
+    const outcome = await WorkspaceService._onActivationChain(() => TabService.withReopenGuard(async () => {
+      const previous = await WorkspaceService.getActiveWsp(windowId);
       // Create the workspace (internally calls deactivateCurrentWsp)
-      await WorkspaceService.createWorkspace(wspData);
+      await WorkspaceService._createWorkspaceOnChain(wspData);
       const wspId = wspData.id;
 
       // Create tabs for each bookmark
@@ -243,14 +248,9 @@ class BookmarkService {
         }
       }
 
-      // [H3] Rollback if no tabs were created
-      if (tabIds.length === 0) {
-        console.warn("[BookmarkService][restoreWorkspace] all tab creations failed -- rolling back");
-        await WorkspaceService.destroyWsp(wspId, windowId).catch(e =>
-          console.warn("[BookmarkService][restoreWorkspace] rollback destroy failed:", e.message)
-        );
-        throw new Error("Failed to restore any tabs from bookmarks");
-      }
+      // [H3] Rollback if no tabs were created -- after this step: the
+      // destroy activates another workspace, which queues on the chain.
+      if (tabIds.length === 0) return { rollback: true, wspId, previousId: previous?.id ?? null };
 
       // File the created tabs: locked merge onto the fresh record (not an
       // overwrite), and no zombie record if the workspace was deleted while
@@ -270,15 +270,27 @@ class BookmarkService {
       // Activate the first tab
       await browser.tabs.update(tabIds[0], { active: true });
 
-      // Hide inactive workspace tabs
-      await WorkspaceService.hideInactiveWspTabs(windowId, wspId);
-      WorkspaceService._updateActiveCache(windowId, freshWsp.tabs, wspId, freshWsp.containerId);
+      // Hide inactive workspace tabs. Re-checked: nothing on the chain can
+      // switch away, but the cache must never name an inactive workspace.
+      if (freshWsp.active) {
+        await WorkspaceService.hideInactiveWspTabs(windowId, wspId);
+        WorkspaceService._updateActiveCache(windowId, freshWsp.tabs, wspId, freshWsp.containerId);
+      }
       await MenuService.refreshTabMenu();
       await UIService.updateToolbarButton(windowId);
+      return { wspId, tabIds };
+    }));
 
-      console.log("[BookmarkService][restoreWorkspace] done - wspId:", wspId,
-        "tabs:", tabIds.length);
-      return { wspId, name: wspData.name, tabCount: tabIds.length };
-    });
+    if (outcome.rollback) {
+      console.warn("[BookmarkService][restoreWorkspace] all tab creations failed -- rolling back");
+      await WorkspaceService.destroyWsp(outcome.wspId, windowId, { successorId: outcome.previousId }).catch(e =>
+        console.warn("[BookmarkService][restoreWorkspace] rollback destroy failed:", e.message)
+      );
+      throw new Error("Failed to restore any tabs from bookmarks");
+    }
+    const { wspId, tabIds } = outcome;
+    console.log("[BookmarkService][restoreWorkspace] done - wspId:", wspId,
+      "tabs:", tabIds.length);
+    return { wspId, name: wspData.name, tabCount: tabIds.length };
   }
 }

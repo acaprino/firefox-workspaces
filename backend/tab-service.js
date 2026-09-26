@@ -223,7 +223,37 @@ class TabService {
 
   static async ungroup(tabIds) {
     TabService._ownUngroupAt = Date.now();
-    return browser.tabs.ungroup(tabIds);
+    await TabService._eachTab("ungroup", tabIds);
+  }
+
+  // tabs.hide / show / ungroup validate every id before acting on any. A tab
+  // that is closing is still returned by tabs.query (it stays in the strip
+  // while it animates closed) but its id is already invalid, so one such id
+  // used to reject the whole call and leave every other tab of the pass as
+  // it was: the previous workspace stayed on screen after a switch (X-104).
+  // Ids noted closed are dropped up front, and a rejected batch is retried
+  // tab by tab so one dead id cannot cancel the rest.
+  // hideTabs resolves to the ids Firefox actually hid. It silently refuses
+  // the selected tab, pinned tabs and tabs sharing camera, microphone or
+  // screen (see the sharingState listener in Brainer, X-103).
+  static async hideTabs(tabIds) {
+    return TabService._eachTab("hide", tabIds);
+  }
+
+  static async showTabs(tabIds) {
+    await TabService._eachTab("show", tabIds);
+  }
+
+  static async _eachTab(method, tabIds) {
+    const ids = [].concat(tabIds).filter(id => !TabService.wasRemoved(id));
+    if (ids.length === 0) return [];
+    try {
+      return (await browser.tabs[method](ids)) ?? [];
+    } catch (e) {
+      console.debug(`[TabService][_eachTab] tabs.${method} of ${ids.length} tab(s) failed (${e.message}) -- retrying tab by tab`);
+      const results = await Promise.allSettled(ids.map(async id => browser.tabs[method](id)));
+      return results.flatMap(r => (r.status === "fulfilled" ? [].concat(r.value ?? []) : []));
+    }
   }
 
   // `ignoreSessionTag`: file into the active workspace even when the tab
@@ -264,6 +294,13 @@ class TabService {
   // `afterHandoff`: internal, set on the re-run after a handoff settled.
   static async _fileTab(tab, { skipForceContainer = false, ignoreSessionTag = false, afterHandoff = false } = {}) {
     const workspaces = await WSPStorageManager.getWorkspaces(tab.windowId);
+    // Two flagged active: an activation has brought its target up and not
+    // yet stood the previous workspace down (X-29). Wait for it, as the
+    // no-active branch below waits for a handoff.
+    if (!afterHandoff && workspaces.filter(wsp => wsp.active).length > 1) {
+      await WorkspaceService.whenActivationsSettled();
+      return TabService._fileTab(tab, { skipForceContainer, ignoreSessionTag, afterHandoff: true });
+    }
     const activeWsp = workspaces.find(wsp => wsp.active);
     console.log("[TabService][addTabToWorkspace] activeWsp:", activeWsp?.id, activeWsp?.name,
       "totalWorkspaces:", workspaces.length);
@@ -482,9 +519,7 @@ class TabService {
     await WorkspaceService.whenActivationsSettled();
     let target = await WSPStorageManager.getWorkspace(wspId);
     if (target.windowId != null && !target.active) {
-      let hidden = [];
-      try { hidden = await browser.tabs.hide(tab.id) ?? []; }
-      catch (e) { console.debug("[TabService][_fileUnderTaggedWorkspace] tabs.hide failed for tab", tab.id, ":", e.message); }
+      const hidden = await TabService.hideTabs(tab.id);
       if (!hidden.includes(tab.id)) {
         let live = null;
         try { live = await browser.tabs.get(tab.id); }
@@ -500,7 +535,7 @@ class TabService {
           }
         } else if (live && !live.hidden) {
           console.warn("[TabService][_fileUnderTaggedWorkspace] Firefox refused to hide tab", tab.id,
-            "-- it stays visible until the next workspace switch hides it");
+            "-- it stays visible until it stops sharing or the next workspace switch hides it");
         }
       }
     } else if (target.active) {
@@ -702,20 +737,26 @@ class TabService {
       const sourceDestroyed = fromWsp.tabs.length === 0;
       console.log("[TabService][moveTabToWsp] sourceDestroyed:", sourceDestroyed,
         "tab.active:", tab.active);
+      // The destination comes up BEFORE an emptied source is destroyed.
+      // Destroying the active source first brought up whichever workspace
+      // came first in the window list -- an unrelated one flickered through
+      // (shown, focused, snapshot rewritten) before the destination (X-38).
+      if (tab.active || (sourceDestroyed && fromWsp.active)) {
+        console.log("[TabService][moveTabToWsp] activating destination workspace");
+        await WorkspaceService.activateWsp(toWspId, freshToWsp.windowId, tab.active ? effectiveTabId : null);
+      }
       if (sourceDestroyed) {
         console.log("[TabService][moveTabToWsp] source workspace empty — destroying:", fromWspId);
-        await WorkspaceService.destroyWsp(fromWspId);
+        await WorkspaceService.destroyWsp(fromWspId, freshToWsp.windowId, { successorId: toWspId });
       }
-      if (tab.active) {
-        console.log("[TabService][moveTabToWsp] active tab moved — activating destination workspace");
-        await WorkspaceService.activateWsp(toWspId, freshToWsp.windowId, effectiveTabId);
-      } else if (!sourceDestroyed) {
-        console.log("[TabService][moveTabToWsp] inactive tab moved — hiding inactive tabs, activeWsp:", fromWspId);
-        await WorkspaceService.hideInactiveWspTabs(freshToWsp.windowId, fromWspId);
-      } else {
+      if (!tab.active) {
+        // Hide the moved tab unless it landed in the workspace on screen
+        // (then show it: moved while hidden, e.g. part of a multiselection)
         const activeWsp = await WorkspaceService.getActiveWsp(freshToWsp.windowId);
-        if (activeWsp) {
-          console.log("[TabService][moveTabToWsp] source destroyed — hiding inactive tabs, activeWsp:", activeWsp.id);
+        if (activeWsp?.id === toWspId) {
+          await TabService.showTabs(effectiveTabId);
+        } else if (activeWsp) {
+          console.log("[TabService][moveTabToWsp] inactive tab moved — hiding inactive tabs, activeWsp:", activeWsp.id);
           await WorkspaceService.hideInactiveWspTabs(freshToWsp.windowId, activeWsp.id);
         }
       }

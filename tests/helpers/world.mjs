@@ -722,11 +722,15 @@ export function makeWorld({
     get browser() { return browserRef; },
     get focusedWindowId() { return focusedId; },
 
-    // Load the backend against this world and let its init settle.
-    async boot({ settleMs = 20 } = {}) {
+    // Load the backend against this world and let its init settle: at
+    // least `settleMs`, and until Brainer.initialize() has returned (its
+    // duration grows with storage latency and the number of init passes).
+    async boot({ settleMs = 20, initTimeoutMs = 5000 } = {}) {
       env = loadBackend({ storageData: storage, overrides, storageLatencyMs });
       browserRef = env.browser;
       await env.settle(settleMs);
+      const deadline = Date.now() + initTimeoutMs;
+      while (env.get("Brainer")._initStarted && Date.now() < deadline) await delay(1);
       await idle();
       return env;
     },

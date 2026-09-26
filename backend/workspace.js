@@ -58,6 +58,11 @@ class Workspace {
     // sees this wspId, so removeTabFromWorkspace becomes a no-op and cannot
     // re-create zombie state for the workspace we are about to delete.
     // deleteWspState and clearClosedTabs can come in any order after.
+    // Tombstone first: a background that dies before tabs.remove below
+    // leaves hidden tabs tagged with this id and no record, which the next
+    // init used to adopt into the active workspace -- tabs the user deleted
+    // coming back (X-96). The tombstone lets init finish the close instead.
+    await WSPStorageManager.addPendingDestroy(this.id);
     await WSPStorageManager.removeWsp(this.id, this.windowId);
     await WSPStorageManager.deleteWspState(this.id);
     await WSPStorageManager.clearClosedTabs(this.id);
@@ -81,6 +86,7 @@ class Workspace {
         }
       }
     }
+    await WSPStorageManager.removePendingDestroy(this.id);
     console.log("[Workspace][destroy] done — id:", this.id);
   }
 
@@ -109,18 +115,24 @@ class Workspace {
         group.tabs = group.tabs.filter(tabId => validTabSet.has(tabId));
         if (group.tabs.length > 0) {
           console.log("[Workspace][activate] grouping", group.tabs.length, "tabs for group:", group.title);
-          const groupId = await browser.tabs.group({tabIds: group.tabs});
-          await browser.tabGroups.update(groupId, {
-            title: group.title,
-            color: group.color,
-            collapsed: group.collapsed
-          });
+          // Cosmetic: tabs.group rejects the whole call when one tab closed
+          // meanwhile, and that used to abort the activation (X-104, X-29).
+          try {
+            const groupId = await browser.tabs.group({tabIds: group.tabs.filter(id => !TabService.wasRemoved(id))});
+            await browser.tabGroups.update(groupId, {
+              title: group.title,
+              color: group.color,
+              collapsed: group.collapsed
+            });
+          } catch (e) {
+            console.debug("[Workspace][activate] could not regroup", group.title, ":", e.message);
+          }
         }
       }
 
-      // show tabs
+      // show tabs (tolerates a tab closing meanwhile, X-104)
       console.log("[Workspace][activate] showing", this.tabs.length, "tabs");
-      await browser.tabs.show(this.tabs);
+      await TabService.showTabs(this.tabs);
     } else {
       console.log("[Workspace][activate] no tabs to show");
     }
@@ -138,7 +150,16 @@ class Workspace {
       const tabToFocus = isValid ? tabIdToActivate : this.tabs[0];
       console.log("[Workspace][activate] activating tab:", tabToFocus,
         isValid ? "(lastActive/requested)" : "(fallback: first tab)");
-      await browser.tabs.update(tabToFocus, {active: true});
+      // A tab that closed since the query must not abort the activation
+      // (X-29): fall back to another tab of this workspace.
+      for (const id of [tabToFocus, ...this.tabs.filter(t => t !== tabToFocus)]) {
+        try {
+          await browser.tabs.update(id, {active: true});
+          break;
+        } catch (e) {
+          console.debug("[Workspace][activate] could not select tab", id, ":", e.message);
+        }
+      }
     } else {
       console.log("[Workspace][activate] no tabs at all -- creating fallback tab");
       // Guard against onCreated racing with the manual tabs.push below:
@@ -191,7 +212,7 @@ class Workspace {
     const late = this.tabs.filter(id => !shown.has(id));
     if (late.length > 0) {
       console.log("[Workspace][activate] showing", late.length, "tab(s) filed during activation:", late);
-      await Promise.all(late.map(id => browser.tabs.show(id).catch(() => {})));
+      await TabService.showTabs(late);
     }
     console.log("[Workspace][activate] done — id:", this.id);
     return true;

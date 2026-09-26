@@ -407,6 +407,35 @@ async function _handleMessage(message) {
       return { success: true, exportedWorkspaces: exported.folders, alreadyExported: exported.deduped };
     }
 
+    // Banner action for the "primary-window-closed" warning (X-100): the
+    // window holding the workspaces closed while another stayed open, with
+    // the inactive workspaces' hidden tabs. Reopens it from Firefox's
+    // Recently Closed Windows and restores the workspaces into it -- only
+    // ever on this explicit request. Same compare-and-clear `when` echo as
+    // the other banner actions; allowed while no primary window exists.
+    case "reopenClosedPrimaryWindow": {
+      const reopenWhen = Number.isFinite(message.when) ? message.when : null;
+      if (reopenWhen != null) {
+        const pending = await WSPStorageManager.getLastRestoreError();
+        if (pending && Number.isFinite(pending.when) && pending.when !== reopenWhen) {
+          console.log("[Handler] reopenClosedPrimaryWindow -> stale request ignored (payload changed since display)");
+          return { success: false, stale: true };
+        }
+      }
+      try {
+        result = await Brainer.reopenClosedPrimaryWindow();
+      } catch (e) {
+        const msg = e?.message ?? String(e);
+        if (msg === Brainer.NOTHING_TO_REOPEN_MESSAGE || msg === Brainer.NOT_IN_RECENTLY_CLOSED_MESSAGE) {
+          console.log("[Handler] reopenClosedPrimaryWindow -> refused:", msg);
+          return { _error: true, _userFacing: true, message: msg };
+        }
+        throw e;
+      }
+      console.log("[Handler] reopenClosedPrimaryWindow -> windowId:", result?.windowId);
+      return { success: true, windowId: result.windowId };
+    }
+
     // Diagnostic dump for incident response. Returns every ld-wsp-* key plus
     // primary IDs and schema version. URL contents are returned as-is so the
     // user can decide what to share -- the popup can warn before copying to

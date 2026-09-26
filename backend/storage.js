@@ -52,6 +52,11 @@ const STORAGE_KEYS = {
   // loss would otherwise be re-detected and re-exported into new bookmark
   // folders on every launch.
   sessionLossExport: 'ld-wsp-session-loss-export',
+  // Workspaces whose destroy started (records dropped) but whose tabs were
+  // not closed yet. A background that dies in between leaves hidden tabs
+  // tagged with a workspace that no longer exists; init closes those instead
+  // of adopting them into the active workspace (Brainer._isDestroyLeftover).
+  pendingDestroys: 'ld-wsp-pending-destroys',
 };
 
 const LIMITS = {
@@ -69,6 +74,8 @@ const LIMITS = {
   SESSION_LOSS_SURVIVAL_RATIO: 0.5,
   // How many distinct export-set fingerprints to remember for dedup.
   MAX_EXPORT_FINGERPRINTS: 8,
+  // Destroy tombstones kept (see STORAGE_KEYS.pendingDestroys).
+  MAX_PENDING_DESTROYS: 20,
 };
 
 class WSPStorageManager {
@@ -309,6 +316,36 @@ class WSPStorageManager {
   // list's own lock above, which runs nested inside this one.
   static async withSessionLossExportLock(fn) {
     return _storageMutex.run("session-loss-export", fn);
+  }
+
+  // ── Destroy tombstones (resumable destroy, X-96) ──
+  // Bounded FIFO of workspace ids. An id stays only while its destroy is
+  // between dropping the records and closing the tabs, or forever (bounded)
+  // when the background died there: workspace ids are never reused.
+
+  static async getPendingDestroys() {
+    const key = STORAGE_KEYS.pendingDestroys;
+    const result = await browser.storage.local.get(key);
+    return Array.isArray(result[key]) ? result[key] : [];
+  }
+
+  static async addPendingDestroy(wspId) {
+    return _storageMutex.run("pending-destroys", async () => {
+      const list = await WSPStorageManager.getPendingDestroys();
+      if (!list.includes(wspId)) list.push(wspId);
+      while (list.length > LIMITS.MAX_PENDING_DESTROYS) list.shift();
+      await browser.storage.local.set({ [STORAGE_KEYS.pendingDestroys]: list });
+    });
+  }
+
+  static async removePendingDestroy(wspId) {
+    return _storageMutex.run("pending-destroys", async () => {
+      const list = await WSPStorageManager.getPendingDestroys();
+      if (!list.includes(wspId)) return;
+      const rest = list.filter(id => id !== wspId);
+      if (rest.length > 0) await browser.storage.local.set({ [STORAGE_KEYS.pendingDestroys]: rest });
+      else await browser.storage.local.remove(STORAGE_KEYS.pendingDestroys);
+    });
   }
 
   // ── Closed Tabs (Tier 2) ──
