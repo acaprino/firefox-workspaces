@@ -118,14 +118,13 @@ class TabService {
     const timer = setTimeout(async () => {
       TabService._snapshotTimers.delete(key);
       try {
-        // Acquire the per-workspace lock so a concurrent
+        // Locked fresh read-modify-write (mutateWorkspace) so a concurrent
         // addTabToWorkspace/removeTabFromWorkspace doesn't get its tabs[]
-        // change clobbered by our full-record _saveState here.
-        await WSPStorageManager.withWorkspaceLock(wspId, async () => {
-          const wsp = await WSPStorageManager.getWorkspace(wspId);
-          // Workspace may have been destroyed or rebound to a new window
-          // between schedule and fire. Either way, abort silently.
-          if (!wsp || !wsp.id || wsp.windowId !== windowId) return;
+        // change clobbered by our full-record save here. A destroyed
+        // workspace is skipped there.
+        await WSPStorageManager.mutateWorkspace(wspId, async (wsp) => {
+          // Rebound to a new window between schedule and fire: abort.
+          if (wsp.windowId !== windowId) return false;
           const tabs = await browser.tabs.query({ windowId, pinned: false });
           const tabMap = new Map(tabs.map(t => [t.id, t]));
           const fresh = wsp.tabs
@@ -135,9 +134,16 @@ class TabService {
           // Avoid a redundant write if nothing changed
           const same = fresh.length === wsp.tabSnapshot.length
             && fresh.every((u, i) => u === wsp.tabSnapshot[i]);
-          if (same) return;
+          if (same) return false;
+          // The window closed after this refresh was scheduled (another
+          // window keeps Firefox running, or macOS with no window left): the
+          // query found nothing, and writing that would replace the last
+          // good snapshot -- restore's URL fallback and the session-loss
+          // export -- with []. Never trade a member list for an empty one.
+          if (fresh.length === 0 && wsp.tabs.length > 0) return false;
+          try { await browser.windows.get(windowId); }
+          catch { return false; }
           wsp.tabSnapshot = fresh;
-          await wsp._saveState();
           console.log("[TabService][_scheduleSnapshotRefresh] refreshed wspId:", wspId,
             "windowId:", windowId, "URLs:", fresh.length);
         });
@@ -146,6 +152,24 @@ class TabService {
       }
     }, TabService._SNAPSHOT_DEBOUNCE_MS);
     TabService._snapshotTimers.set(key, timer);
+  }
+
+  // Drop the pending refreshes of one window (its primary closed, or a
+  // repair is about to rewrite its records). Returns the wspIds whose
+  // refresh was dropped so a caller can re-arm them afterwards.
+  static _cancelSnapshotRefreshes(windowId) {
+    const cancelled = [];
+    for (const [key, timer] of TabService._snapshotTimers) {
+      const sep = key.indexOf(":");
+      if (Number(key.slice(0, sep)) !== windowId) continue;
+      clearTimeout(timer);
+      TabService._snapshotTimers.delete(key);
+      cancelled.push(key.slice(sep + 1));
+    }
+    if (cancelled.length > 0) {
+      console.log("[TabService][_cancelSnapshotRefreshes] windowId:", windowId, "cancelled:", cancelled);
+    }
+    return cancelled;
   }
 
   // ── Sessions API helpers (Tier 1) ──
@@ -208,21 +232,23 @@ class TabService {
           if (targetWsp) {
             console.log("[TabService][addTabToWorkspace] session value points to workspace:",
               sessionWspId, "- honouring instead of active workspace");
-            const freshTarget = await WSPStorageManager.getWorkspace(sessionWspId);
-            if (!freshTarget.tabs.includes(tab.id)) {
-              freshTarget.tabs.push(tab.id);
-              await freshTarget._saveState();
+            const freshTarget = await WSPStorageManager.mutateWorkspace(sessionWspId, (fresh) => {
+              if (fresh.tabs.includes(tab.id)) return false;
+              fresh.tabs.push(tab.id);
+            });
+            if (freshTarget) {
+              if (freshTarget.active) {
+                WorkspaceService.addTabToActiveCache(tab.id, sessionWspId);
+              } else {
+                try { await browser.tabs.hide(tab.id); }
+                catch (e) { console.debug("[TabService][addTabToWorkspace] tabs.hide failed for tab", tab.id, ":", e.message); }
+              }
+              await TabService.setTabSessionValue(tab.id, sessionWspId);
+              await MenuService.refreshTabMenu();
+              await UIService.updateToolbarButton(tab.windowId);
+              return false;
             }
-            if (freshTarget.active) {
-              WorkspaceService.addTabToActiveCache(tab.id, sessionWspId);
-            } else {
-              try { await browser.tabs.hide(tab.id); }
-              catch (e) { console.debug("[TabService][addTabToWorkspace] tabs.hide failed for tab", tab.id, ":", e.message); }
-            }
-            await TabService.setTabSessionValue(tab.id, sessionWspId);
-            await MenuService.refreshTabMenu();
-            await UIService.updateToolbarButton(tab.windowId);
-            return false;
+            // Destroyed since the read above: file under the active workspace.
           }
         }
 
@@ -266,24 +292,33 @@ class TabService {
               currentTab.url);
           }
         }
-        // Lock the workspace to prevent concurrent add/remove from overwriting each other
-        await WSPStorageManager.withWorkspaceLock(activeWsp.id, async () => {
-          const freshWsp = await WSPStorageManager.getWorkspace(activeWsp.id);
-          if (clearContainerId) {
+        // Locked fresh read-modify-write so concurrent add/remove cannot
+        // overwrite each other; a workspace destroyed meanwhile is not
+        // resurrected as a zombie record.
+        let added = false;
+        const filed = await WSPStorageManager.mutateWorkspace(activeWsp.id, (freshWsp) => {
+          // Compare-and-clear: a concurrent setWorkspaceContainer to a
+          // working container must survive.
+          const clear = clearContainerId && freshWsp.containerId === activeWsp.containerId;
+          if (clear) {
             console.log("[TabService][addTabToWorkspace] clearing stale containerId on workspace:", freshWsp.id);
             freshWsp.containerId = null;
           }
-          if (!freshWsp.tabs.includes(tab.id)) {
-            freshWsp.tabs.push(tab.id);
-            await freshWsp._saveState();
-            // Keep active-workspace cache consistent so onTabActivated fast-path stays accurate
-            WorkspaceService.addTabToActiveCache(tab.id, freshWsp.id);
-            console.log("[TabService][addTabToWorkspace] tab", tab.id, "added to workspace",
-              freshWsp.id, "| workspace now has", freshWsp.tabs.length, "tabs");
-          } else {
-            console.log("[TabService][addTabToWorkspace] tab", tab.id, "already in fresh workspace — no-op");
+          if (freshWsp.tabs.includes(tab.id)) {
+            console.log("[TabService][addTabToWorkspace] tab", tab.id, "already in fresh workspace -- no-op");
+            return clear;
           }
+          freshWsp.tabs.push(tab.id);
+          added = true;
+          console.log("[TabService][addTabToWorkspace] tab", tab.id, "added to workspace",
+            freshWsp.id, "| workspace now has", freshWsp.tabs.length, "tabs");
         });
+        if (!filed) {
+          console.log("[TabService][addTabToWorkspace] workspace", activeWsp.id, "destroyed meanwhile -- tab not filed");
+          return false;
+        }
+        // Keep active-workspace cache consistent so onTabActivated fast-path stays accurate
+        if (added) WorkspaceService.addTabToActiveCache(tab.id, activeWsp.id);
         await TabService.setTabSessionValue(tab.id, activeWsp.id);
         TabService._scheduleSnapshotRefresh(tab.windowId, activeWsp.id);
         await MenuService.refreshTabMenu();
@@ -328,13 +363,14 @@ class TabService {
         // sees a cache miss until the post-activation patch below can run —
         // the old flow did this patch via _activeCache?.tabIds.add which was
         // a band-aid duplicating what activateWsp had already done internally.
-        await WSPStorageManager.withWorkspaceLock(targetWsp.id, async () => {
-          const freshActive = await WSPStorageManager.getWorkspace(targetWsp.id);
-          if (!freshActive.tabs.includes(tab.id)) {
-            freshActive.tabs.push(tab.id);
-            await freshActive._saveState();
-          }
+        const filed = await WSPStorageManager.mutateWorkspace(targetWsp.id, (freshActive) => {
+          if (freshActive.tabs.includes(tab.id)) return false;
+          freshActive.tabs.push(tab.id);
         });
+        if (!filed) {
+          console.log("[TabService][addTabToWorkspace] fallback target", targetWsp.id, "destroyed meanwhile -- tab not filed");
+          return false;
+        }
         await TabService.setTabSessionValue(tab.id, targetWsp.id);
         // Now activate: _updateActiveCache will pick up the fresh tab list
         // including our just-added tab in a single pass.
@@ -395,13 +431,17 @@ class TabService {
         console.warn("[TabService][forceTabIntoActiveContainer] reopen failed -- tab kept as-is");
         return;
       }
-      await WSPStorageManager.withWorkspaceLock(activeWspId, async () => {
-        const fresh = await WSPStorageManager.getWorkspace(activeWspId);
-        if (fresh && fresh.id && !fresh.tabs.includes(newTab.id)) {
-          fresh.tabs.push(newTab.id);
-          await fresh._saveState();
-        }
+      // mutateWorkspace skips a workspace destroyed meanwhile (the old
+      // `fresh.id` guard was always true: missing keys read as a stub).
+      const filed = await WSPStorageManager.mutateWorkspace(activeWspId, (fresh) => {
+        if (fresh.tabs.includes(newTab.id)) return false;
+        fresh.tabs.push(newTab.id);
       });
+      if (!filed) {
+        console.warn("[TabService][forceTabIntoActiveContainer] workspace", activeWspId,
+          "destroyed meanwhile -- new tab", newTab.id, "not filed");
+        return;
+      }
       WorkspaceService.addTabToActiveCache(newTab.id, activeWspId);
       await TabService.setTabSessionValue(newTab.id, activeWspId);
       TabService._scheduleSnapshotRefresh(tab.windowId, activeWspId);
@@ -437,18 +477,18 @@ class TabService {
       if (wsp.tabs.includes(tabId)) {
         console.log("[TabService][removeTabFromWorkspace] found tab", tabId,
           "in workspace:", wsp.id, wsp.name, "| before:", wsp.tabs.length, "tabs");
-        // Lock the workspace to prevent concurrent add/remove from overwriting each other
-        await WSPStorageManager.withWorkspaceLock(wsp.id, async () => {
-          const freshWsp = await WSPStorageManager.getWorkspace(wsp.id);
+        // Locked fresh read-modify-write so concurrent add/remove cannot
+        // overwrite each other. A close queued behind a destroy of this
+        // workspace no longer writes a zombie record back.
+        await WSPStorageManager.mutateWorkspace(wsp.id, (freshWsp) => {
           freshWsp.tabs = freshWsp.tabs.filter(id => id !== tabId);
           for (const group of freshWsp.groups) {
             group.tabs = group.tabs.filter(id => id !== tabId);
           }
-          await freshWsp._saveState();
-          // Keep active-workspace cache consistent
-          WorkspaceService.removeTabFromActiveCache(tabId);
-          console.log("[TabService][removeTabFromWorkspace] removed — workspace now has", freshWsp.tabs.length, "tabs");
+          console.log("[TabService][removeTabFromWorkspace] removed -- workspace now has", freshWsp.tabs.length, "tabs");
         });
+        // Keep active-workspace cache consistent
+        WorkspaceService.removeTabFromActiveCache(tabId);
         TabService._scheduleSnapshotRefresh(windowId, wsp.id);
         await MenuService.refreshTabMenu();
         return;
@@ -481,17 +521,15 @@ class TabService {
     // Remove from source first (safer ordering to avoid dual-membership
     // window). Locked read-modify-write, same discipline as add/remove.
     if (wasInSource) {
-      await WSPStorageManager.withWorkspaceLock(fromWspId, async () => {
-        const freshFrom = await WSPStorageManager.getWorkspace(fromWspId);
-        if (freshFrom.windowId == null) { wasInSource = false; return; }
-        freshFrom.tabs = freshFrom.tabs.filter(id => id !== tab.id);
-        for (const group of freshFrom.groups) {
+      const freshFrom = await WSPStorageManager.mutateWorkspace(fromWspId, (fresh) => {
+        fresh.tabs = fresh.tabs.filter(id => id !== tab.id);
+        for (const group of fresh.groups) {
           group.tabs = group.tabs.filter(id => id !== tab.id);
         }
-        await freshFrom._saveState();
-        // Reflect the post-save source size for the empty-source check below
-        fromWsp.tabs = freshFrom.tabs;
       });
+      // Reflect the post-save source size for the empty-source check below
+      if (freshFrom) fromWsp.tabs = freshFrom.tabs;
+      else wasInSource = false;
       // Keep active-workspace cache consistent when moving OUT of active workspace
       WorkspaceService.removeTabFromActiveCache(tab.id);
       console.log("[TabService][moveTabToWsp] removed from source, fromWsp now has", fromWsp.tabs.length, "tabs");
@@ -516,17 +554,14 @@ class TabService {
     }
 
     // Locked read-modify-write on the destination
-    await WSPStorageManager.withWorkspaceLock(toWspId, async () => {
-      const freshToWsp = await WSPStorageManager.getWorkspace(toWspId);
-      if (freshToWsp.windowId == null) return; // destroyed mid-move
-      if (!freshToWsp.tabs.includes(effectiveTabId)) {
-        freshToWsp.tabs.unshift(effectiveTabId);
-        await freshToWsp._saveState();
-        console.log("[TabService][moveTabToWsp] added tab", effectiveTabId,
-          "to destination workspace:", toWspId, "| now has", freshToWsp.tabs.length, "tabs");
-      } else {
+    await WSPStorageManager.mutateWorkspace(toWspId, (freshToWsp) => {
+      if (freshToWsp.tabs.includes(effectiveTabId)) {
         console.log("[TabService][moveTabToWsp] tab", effectiveTabId, "already in destination");
+        return false;
       }
+      freshToWsp.tabs.unshift(effectiveTabId);
+      console.log("[TabService][moveTabToWsp] added tab", effectiveTabId,
+        "to destination workspace:", toWspId, "| now has", freshToWsp.tabs.length, "tabs");
     });
     const freshToWsp = toWsp; // windowId/containerId only below; stub already validated
 

@@ -251,8 +251,11 @@ class Brainer {
           try {
             const sv = await browser.sessions.getTabValue(tab.id, "wspId");
             if (sv && UUID_RE.test(sv)) {
+              // windowId is the existence marker: a zombie record (written
+              // back after its workspace was destroyed) has none and must not
+              // keep a tag alive.
               const state = await WSPStorageManager.getWspState(sv);
-              if (state && Object.keys(state).length > 0) keepTag.add(tab.id);
+              if (state && state.windowId != null) keepTag.add(tab.id);
             }
           } catch (e) {
             console.debug("[Brainer][_ensureDefaultWorkspace] session lookup failed for tab",
@@ -334,6 +337,9 @@ class Brainer {
             console.log("[Brainer][onStartup] running post-init repair for windowId:", pid);
             Brainer._state = 'restoring';
             try {
+              // 'restoring' gates new activations; let one already in flight
+              // finish so it cannot show/hide from lists the repair rewrites.
+              await WorkspaceService._activationChain.catch(() => {});
               await Brainer._repairTabAssignments(pid, true);
             } finally {
               Brainer._state = 'ready';
@@ -357,6 +363,9 @@ class Brainer {
         const primaryId = await WSPStorageManager.getPrimaryWindowId();
         if (primaryId === windowId) {
           console.log("[Brainer][onWindowRemoved] primary window closed -- flushing last active tab, arming lastId, clearing primary");
+          // A pending snapshot refresh would query the closed window, find
+          // nothing and overwrite the last good tabSnapshot with [].
+          TabService._cancelSnapshotRefreshes(windowId);
           await WorkspaceService.flushLastActiveTab();
           // Arm the restart signal BEFORE dropping the primary claim. A crash
           // between these two writes then leaves BOTH keys set -- a state
@@ -806,7 +815,8 @@ class Brainer {
 
       if (oldOrder) {
         console.log("[Brainer][_restoreWorkspaces] migrating workspace order:", oldOrder);
-        await WSPStorageManager.saveWorkspaceOrder(window.id, oldOrder);
+        await WSPStorageManager.withOrderLock(window.id,
+          () => WSPStorageManager.saveWorkspaceOrder(window.id, oldOrder));
       }
 
       // Detach old window's metadata only. Per-workspace state was already
@@ -850,8 +860,11 @@ class Brainer {
               console.log("[Brainer][_restoreWorkspaces] lastActiveTabId stale for", wsp.name,
                 "- falling back to first tab:", wspObj.tabs[0]);
             }
-            wspObj.lastActiveTabId = remapped || wspObj.tabs[0];
-            await wspObj._saveState();
+            // Only the lastActiveTabId field, on the fresh record
+            await WSPStorageManager.mutateWorkspace(wsp.id, (fresh) => {
+              if (fresh.tabs.length === 0 || fresh.tabs.includes(fresh.lastActiveTabId)) return false;
+              fresh.lastActiveTabId = fresh.tabs.includes(remapped) ? remapped : fresh.tabs[0];
+            });
           }
         }
       }
@@ -860,8 +873,9 @@ class Brainer {
       console.log("[Brainer][_restoreWorkspaces] active workspace:", activeWspData?.id, activeWspData?.name);
       if (activeWspData) {
         const activeWspObj = await WSPStorageManager.getWorkspace(activeWspData.id);
-        await activeWspObj.activate();
-        WorkspaceService._updateActiveCache(window.id, activeWspObj.tabs, activeWspObj.id, activeWspObj.containerId);
+        if (await activeWspObj.activate()) {
+          WorkspaceService._updateActiveCache(window.id, activeWspObj.tabs, activeWspObj.id, activeWspObj.containerId);
+        }
       }
 
       await WorkspaceService.hideInactiveWspTabs(window.id, activeWspData ? activeWspData.id : null);
@@ -963,21 +977,26 @@ class Brainer {
   // every launch and would otherwise mint duplicate folders without bound.
   // Returns { folders, urls, deduped }; a failed export returns zeros WITHOUT
   // storing the fingerprint, so the next start retries.
+  // Check, export and record run as one step under the export lock: two
+  // exporters (startup sweep, session-loss detection, Give up) overlapping
+  // could both pass the check and export the same content twice.
   static async _exportSnapshotsSafe(workspaces) {
     try {
-      const fingerprint = Brainer._snapshotFingerprint(workspaces);
-      const known = await WSPStorageManager.getSessionLossExportFingerprints();
-      if (known.includes(fingerprint)) {
-        console.log("[Brainer][_exportSnapshotsSafe] identical snapshot content already exported -- skipping");
-        return { folders: 0, urls: 0, deduped: true };
-      }
-      const result = await BookmarkService.exportSnapshots(workspaces);
-      console.log("[Brainer][_exportSnapshotsSafe] exported", result.urls,
-        "URL(s) across", result.folders, "folder(s)");
-      if (result.folders > 0) {
-        await WSPStorageManager.addSessionLossExportFingerprint(fingerprint);
-      }
-      return { ...result, deduped: false };
+      return await WSPStorageManager.withSessionLossExportLock(async () => {
+        const fingerprint = Brainer._snapshotFingerprint(workspaces);
+        const known = await WSPStorageManager.getSessionLossExportFingerprints();
+        if (known.includes(fingerprint)) {
+          console.log("[Brainer][_exportSnapshotsSafe] identical snapshot content already exported -- skipping");
+          return { folders: 0, urls: 0, deduped: true };
+        }
+        const result = await BookmarkService.exportSnapshots(workspaces);
+        console.log("[Brainer][_exportSnapshotsSafe] exported", result.urls,
+          "URL(s) across", result.folders, "folder(s)");
+        if (result.folders > 0) {
+          await WSPStorageManager.addSessionLossExportFingerprint(fingerprint);
+        }
+        return { ...result, deduped: false };
+      });
     } catch (e) {
       console.error("[Brainer][_exportSnapshotsSafe] export failed:", e?.message);
       return { folders: 0, urls: 0, deduped: false };
@@ -1173,12 +1192,12 @@ class Brainer {
         console.log("[Brainer][_cleanStaleTabIds] workspace:", wsp.name,
           "removing", staleCount, "stale tab IDs:",
           wsp.tabs.filter(id => !openTabIds.has(id)));
-        const fresh = await WSPStorageManager.getWorkspace(wsp.id);
-        fresh.tabs = fresh.tabs.filter(id => openTabIds.has(id));
-        for (const group of fresh.groups) {
-          group.tabs = group.tabs.filter(id => openTabIds.has(id));
-        }
-        await fresh._saveState();
+        await WSPStorageManager.mutateWorkspace(wsp.id, (fresh) => {
+          fresh.tabs = fresh.tabs.filter(id => openTabIds.has(id));
+          for (const group of fresh.groups) {
+            group.tabs = group.tabs.filter(id => openTabIds.has(id));
+          }
+        });
         totalCleaned += staleCount;
       }
     }
@@ -1328,12 +1347,21 @@ class Brainer {
       const same = next.length === w.tabs.length && next.every((id, i) => id === w.tabs[i]);
       if (same) { summary.push(`${w.name}:${next.length}`); continue; }
       const movedIn = next.filter(id => filedUnder.get(id) !== w.id).length;
-      const fresh = await WSPStorageManager.getWorkspace(w.id);
-      fresh.tabs = next;
-      // Group membership is rebuilt on activate; just drop IDs that left.
-      const nextSet = new Set(next);
-      for (const g of fresh.groups) g.tabs = g.tabs.filter(id => nextSet.has(id));
-      await fresh._saveState();
+      // The plan was computed from the read above; merge it with any locked
+      // write that landed since instead of overwriting: drop ids this
+      // workspace lost meanwhile, keep ids it gained that the plan knows
+      // nothing about.
+      const planned = new Set(w.tabs);
+      await WSPStorageManager.mutateWorkspace(w.id, (fresh) => {
+        const current = new Set(fresh.tabs);
+        fresh.tabs = [
+          ...next.filter(id => !planned.has(id) || current.has(id)),
+          ...fresh.tabs.filter(id => !planned.has(id) && !desiredOf.has(id)),
+        ];
+        // Group membership is rebuilt on activate; just drop IDs that left.
+        const nextSet = new Set(fresh.tabs);
+        for (const g of fresh.groups) g.tabs = g.tabs.filter(id => nextSet.has(id));
+      });
       summary.push(`${w.name}:${next.length}(+${movedIn})`);
     }
 
@@ -1356,23 +1384,33 @@ class Brainer {
   // leftovers, then re-apply visibility if anything moved. Idempotent: a no-op
   // when assignments already match session values.
   static async _repairTabAssignments(windowId, restartLikely = false) {
-    // Session-loss check first: _reconcileLateTabs below can assign tabs and
-    // schedule snapshot refreshes, which would destroy the evidence (and the
-    // last good snapshots) this check needs.
-    if (restartLikely) await Brainer._detectSessionLoss(windowId);
-    await Brainer._cleanStaleTabIds(windowId);
-    const corrected = await Brainer._reconcileFromSessionValues(windowId, restartLikely);
-    await Brainer._reconcileLateTabs(windowId);
-    if (corrected) {
-      const active = await WorkspaceService.getActiveWsp(windowId);
-      if (active) {
-        const activeObj = await WSPStorageManager.getWorkspace(active.id);
-        await activeObj.activate();
-        WorkspaceService._updateActiveCache(windowId, activeObj.tabs, activeObj.id, activeObj.containerId);
+    // Hold back pending snapshot refreshes (scheduled before an onStartup
+    // that fired after init): they would land between the repair's writes
+    // and could overwrite the snapshots the session-loss check reads.
+    // Re-armed once the repair is done.
+    const deferred = TabService._cancelSnapshotRefreshes(windowId);
+    try {
+      // Session-loss check first: _reconcileLateTabs below can assign tabs and
+      // schedule snapshot refreshes, which would destroy the evidence (and the
+      // last good snapshots) this check needs.
+      if (restartLikely) await Brainer._detectSessionLoss(windowId);
+      await Brainer._cleanStaleTabIds(windowId);
+      const corrected = await Brainer._reconcileFromSessionValues(windowId, restartLikely);
+      await Brainer._reconcileLateTabs(windowId);
+      if (corrected) {
+        const active = await WorkspaceService.getActiveWsp(windowId);
+        if (active) {
+          const activeObj = await WSPStorageManager.getWorkspace(active.id);
+          if (await activeObj.activate()) {
+            WorkspaceService._updateActiveCache(windowId, activeObj.tabs, activeObj.id, activeObj.containerId);
+          }
+        }
+        await WorkspaceService.hideInactiveWspTabs(windowId, active ? active.id : null);
       }
-      await WorkspaceService.hideInactiveWspTabs(windowId, active ? active.id : null);
+      return corrected;
+    } finally {
+      for (const wspId of deferred) TabService._scheduleSnapshotRefresh(windowId, wspId);
     }
-    return corrected;
   }
 
   // Catch tabs that Firefox session-restored during the 'restoring' phase.
@@ -1413,13 +1451,10 @@ class Brainer {
     const toHide = [];
     for (const [wspId, tabs] of byWsp) {
       let wspActive = false;
-      await WSPStorageManager.withWorkspaceLock(wspId, async () => {
-        const wsp = await WSPStorageManager.getWorkspace(wspId);
-        if (wsp.windowId == null) return; // destroyed meanwhile
+      await WSPStorageManager.mutateWorkspace(wspId, (wsp) => {
         for (const tab of tabs) {
           if (!wsp.tabs.includes(tab.id)) wsp.tabs.push(tab.id);
         }
-        await wsp._saveState();
         wspActive = wsp.active;
         console.log("[Brainer][_reconcileLateTabs] assigned", tabs.length, "tabs to workspace", wsp.name);
       });
@@ -1436,13 +1471,10 @@ class Brainer {
 
     // Assign untagged tabs to active workspace (last resort)
     if (noSession.length > 0 && activeWsp) {
-      await WSPStorageManager.withWorkspaceLock(activeWsp.id, async () => {
-        const fresh = await WSPStorageManager.getWorkspace(activeWsp.id);
-        if (fresh.windowId == null) return; // destroyed meanwhile
+      await WSPStorageManager.mutateWorkspace(activeWsp.id, (fresh) => {
         for (const tab of noSession) {
           if (!fresh.tabs.includes(tab.id)) fresh.tabs.push(tab.id);
         }
-        await fresh._saveState();
       });
       await Promise.all(noSession.map(tab => TabService.setTabSessionValue(tab.id, activeWsp.id)));
       for (const tab of noSession) WorkspaceService.addTabToActiveCache(tab.id, activeWsp.id);

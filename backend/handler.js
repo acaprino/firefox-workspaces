@@ -37,6 +37,14 @@ function _validateContainerId(id) {
     throw new Error("Invalid containerId: " + String(id));
   }
 }
+// User-facing reply for an edit aimed at a workspace that no longer exists
+// (Workspace.NOT_FOUND_MESSAGE), or null for any other error.
+function _notFoundRefusal(e) {
+  const msg = e?.message ?? String(e);
+  if (!msg.startsWith("Workspace not found")) return null;
+  console.log("[Handler] refused:", msg);
+  return { _error: true, _userFacing: true, message: msg };
+}
 function _sanitizeName(name) {
   if (typeof name !== "string") return name;
   return name.replace(CONTROL_AND_BIDI_RE, '').trim().slice(0, 200);
@@ -139,7 +147,15 @@ async function _handleMessage(message) {
         console.warn("[Handler] renameWorkspace rejecting color:", message.wspColor);
         message.wspColor = null;
       }
-      await WorkspaceService.renameWorkspace(message.wspId, { name: message.wspName, icon: message.wspIcon, color: message.wspColor });
+      try {
+        await WorkspaceService.renameWorkspace(message.wspId, { name: message.wspName, icon: message.wspIcon, color: message.wspColor });
+      } catch (e) {
+        // Deleted while the edit dialog was open: say so instead of a
+        // generic error (and instead of the old silent zombie write).
+        const refusal = _notFoundRefusal(e);
+        if (refusal) return refusal;
+        throw e;
+      }
       console.log("[Handler] renameWorkspace -> success");
       return { success: true };
     case "getNumWorkspaces":
@@ -196,7 +212,13 @@ async function _handleMessage(message) {
     case "setWorkspaceContainer":
       _validateWspId(message.wspId);
       _validateContainerId(message.containerId);
-      await WorkspaceService.setWorkspaceContainer(message.wspId, message.containerId || null);
+      try {
+        await WorkspaceService.setWorkspaceContainer(message.wspId, message.containerId || null);
+      } catch (e) {
+        const refusal = _notFoundRefusal(e);
+        if (refusal) return refusal;
+        throw e;
+      }
       console.log("[Handler] setWorkspaceContainer -> success");
       return { success: true };
     // Tier 2: Closed tabs

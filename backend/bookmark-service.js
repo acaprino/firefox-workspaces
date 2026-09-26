@@ -252,10 +252,17 @@ class BookmarkService {
         throw new Error("Failed to restore any tabs from bookmarks");
       }
 
-      // Update workspace with created tabs
-      const freshWsp = await WSPStorageManager.getWorkspace(wspId);
-      freshWsp.tabs = tabIds;
-      await freshWsp._saveState();
+      // File the created tabs: locked merge onto the fresh record (not an
+      // overwrite), and no zombie record if the workspace was deleted while
+      // its tabs were opening.
+      const freshWsp = await WSPStorageManager.mutateWorkspace(wspId, (fresh) => {
+        for (const id of tabIds) {
+          if (!fresh.tabs.includes(id)) fresh.tabs.push(id);
+        }
+      });
+      if (!freshWsp) {
+        throw new Error("Failed to restore: the workspace was deleted while its tabs were opening");
+      }
       // Keep tabSnapshot fresh for restart resilience (IC3) -- restore opens
       // the bookmarked URLs as brand-new tabs.
       TabService._scheduleSnapshotRefresh(windowId, wspId);
@@ -265,7 +272,7 @@ class BookmarkService {
 
       // Hide inactive workspace tabs
       await WorkspaceService.hideInactiveWspTabs(windowId, wspId);
-      WorkspaceService._updateActiveCache(windowId, tabIds, wspId, freshWsp.containerId);
+      WorkspaceService._updateActiveCache(windowId, freshWsp.tabs, wspId, freshWsp.containerId);
       await MenuService.refreshTabMenu();
       await UIService.updateToolbarButton(windowId);
 
