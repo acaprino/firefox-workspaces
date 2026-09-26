@@ -52,6 +52,11 @@ const STORAGE_KEYS = {
   // loss would otherwise be re-detected and re-exported into new bookmark
   // folders on every launch.
   sessionLossExport: 'ld-wsp-session-loss-export',
+  // Workspaces whose destroy started (records dropped) but whose tabs were
+  // not closed yet. A background that dies in between leaves hidden tabs
+  // tagged with a workspace that no longer exists; init closes those instead
+  // of adopting them into the active workspace (Brainer._isDestroyLeftover).
+  pendingDestroys: 'ld-wsp-pending-destroys',
 };
 
 const LIMITS = {
@@ -69,17 +74,47 @@ const LIMITS = {
   SESSION_LOSS_SURVIVAL_RATIO: 0.5,
   // How many distinct export-set fingerprints to remember for dedup.
   MAX_EXPORT_FINGERPRINTS: 8,
+  // Destroy tombstones kept (see STORAGE_KEYS.pendingDestroys).
+  MAX_PENDING_DESTROYS: 20,
+  // Automatic retries of a failed Brainer.initialize() pass, one delay per
+  // retry. Past the last one, Dismiss on the banner retries.
+  INIT_RETRY_DELAYS_MS: [1000, 10000],
 };
 
 class WSPStorageManager {
+  // Schema versioning contract:
+  //  - Bump SCHEMA_VERSION only for a change that old readers cannot absorb
+  //    through the Workspace constructor defaults (a renamed, repurposed or
+  //    re-typed field). Adding a field with a safe default needs no bump.
+  //  - A bump to N adds `_MIGRATIONS[N]`: an idempotent async function that
+  //    rewrites v(N-1) data to vN (a crash mid-way re-runs it on next start).
+  //  - Downgrades (AMO rollback, an older unlisted build) cannot be migrated
+  //    back: the older build keeps running on the newer data, never stamps
+  //    the stored version down, warns in the console and flags the mismatch
+  //    in the diagnostics dump (`_storedSchemaVersion`, `_schemaDowngrade`).
   static SCHEMA_VERSION = 2;
+  static _MIGRATIONS = {
+    // 2: none -- v1 -> v2 shipped without a data rewrite.
+  };
+  // Version found in storage at startup, before any migration (diagnostics).
+  static _storedSchemaVersion = null;
 
   static async ensureSchemaVersion() {
     const key = STORAGE_KEYS.schemaVersion;
     const result = await browser.storage.local.get(key);
     const current = result[key] || 1;
+    WSPStorageManager._storedSchemaVersion = current;
+    if (current > WSPStorageManager.SCHEMA_VERSION) {
+      console.warn("[WSPStorageManager][ensureSchemaVersion] stored schema", current,
+        "is newer than this build's", WSPStorageManager.SCHEMA_VERSION,
+        "-- downgraded extension; running on newer data without migrating");
+      return;
+    }
     if (current < WSPStorageManager.SCHEMA_VERSION) {
-      // Future migrations go here (e.g., if current === 1 then migrate v1 -> v2)
+      for (let v = current + 1; v <= WSPStorageManager.SCHEMA_VERSION; v++) {
+        const migrate = WSPStorageManager._MIGRATIONS[v];
+        if (migrate) await migrate();
+      }
       await browser.storage.local.set({ [key]: WSPStorageManager.SCHEMA_VERSION });
     }
   }
@@ -121,9 +156,40 @@ class WSPStorageManager {
   }
 
   static async getNumWorkspaces(windowId) {
+    return (await WSPStorageManager.getWorkspaceIds(windowId)).length;
+  }
+
+  // The window's workspace id list alone (no per-workspace record reads).
+  static async getWorkspaceIds(windowId) {
     const key = STORAGE_KEYS.windowWsps(windowId);
     const results = await browser.storage.local.get(key);
-    return (results[key] || []).length;
+    return results[key] || [];
+  }
+
+  // Locked read-modify-write of ONE existing workspace record: the single
+  // sanctioned way to change a record after creation. Takes the workspace
+  // lock, re-reads the record, bails when it no longer exists, runs
+  // `fn(fresh)` and saves the whole fresh record. Writers that saved a copy
+  // read before an await (or skipped the existence check) used to revert
+  // concurrent updates and resurrect destroyed workspaces as zombie
+  // `ld-wsp-{id}` records.
+  //  - Existence: getWorkspace returns a stub for a missing key, so windowId
+  //    is the only existence marker.
+  //  - `fn` may be async; returning `false` skips the save (no-op change).
+  //  - Resolves to the fresh Workspace (saved or not), or null if missing.
+  //  - NOT re-entrant (see AsyncMutex): `fn` must never mutate, lock or
+  //    destroy the same wspId again, directly or through a service call.
+  static async mutateWorkspace(wspId, fn) {
+    return WSPStorageManager.withWorkspaceLock(wspId, async () => {
+      const fresh = await WSPStorageManager.getWorkspace(wspId);
+      if (fresh.windowId == null) {
+        console.log("[WSPStorageManager][mutateWorkspace] wspId:", wspId, "no longer exists -- skipped");
+        return null;
+      }
+      if (await fn(fresh) === false) return fresh;
+      await fresh._saveState();
+      return fresh;
+    });
   }
 
   static async addWsp(wspId, windowId) {
@@ -236,17 +302,65 @@ class WSPStorageManager {
     return Array.isArray(value) ? value : [];
   }
 
+  // Locked read-modify-write: two exporters finishing together used to drop
+  // one fingerprint, so the next start exported that content again.
   static async addSessionLossExportFingerprint(fingerprint) {
-    const list = await WSPStorageManager.getSessionLossExportFingerprints();
-    if (!list.includes(fingerprint)) list.push(fingerprint);
-    while (list.length > LIMITS.MAX_EXPORT_FINGERPRINTS) list.shift();
-    await browser.storage.local.set({ [STORAGE_KEYS.sessionLossExport]: list });
+    return _storageMutex.run("export-fingerprints", async () => {
+      const list = await WSPStorageManager.getSessionLossExportFingerprints();
+      if (!list.includes(fingerprint)) list.push(fingerprint);
+      while (list.length > LIMITS.MAX_EXPORT_FINGERPRINTS) list.shift();
+      await browser.storage.local.set({ [STORAGE_KEYS.sessionLossExport]: list });
+    });
+  }
+
+  // Serializes whole automatic exports (fingerprint check -> bookmark export
+  // -> fingerprint record) so two exporters of the same content cannot both
+  // pass the check and create duplicate folders. Distinct key from the
+  // list's own lock above, which runs nested inside this one.
+  static async withSessionLossExportLock(fn) {
+    return _storageMutex.run("session-loss-export", fn);
+  }
+
+  // ── Destroy tombstones (resumable destroy, X-96) ──
+  // Bounded FIFO of workspace ids. An id stays only while its destroy is
+  // between dropping the records and closing the tabs, or forever (bounded)
+  // when the background died there: workspace ids are never reused.
+
+  static async getPendingDestroys() {
+    const key = STORAGE_KEYS.pendingDestroys;
+    const result = await browser.storage.local.get(key);
+    return Array.isArray(result[key]) ? result[key] : [];
+  }
+
+  static async addPendingDestroy(wspId) {
+    return _storageMutex.run("pending-destroys", async () => {
+      const list = await WSPStorageManager.getPendingDestroys();
+      if (!list.includes(wspId)) list.push(wspId);
+      while (list.length > LIMITS.MAX_PENDING_DESTROYS) list.shift();
+      await browser.storage.local.set({ [STORAGE_KEYS.pendingDestroys]: list });
+    });
+  }
+
+  static async removePendingDestroy(wspId) {
+    return _storageMutex.run("pending-destroys", async () => {
+      const list = await WSPStorageManager.getPendingDestroys();
+      if (!list.includes(wspId)) return;
+      const rest = list.filter(id => id !== wspId);
+      if (rest.length > 0) await browser.storage.local.set({ [STORAGE_KEYS.pendingDestroys]: rest });
+      else await browser.storage.local.remove(STORAGE_KEYS.pendingDestroys);
+    });
   }
 
   // ── Closed Tabs (Tier 2) ──
 
   static async saveClosedTab(wspId, tabInfo) {
     return _storageMutex.run(`closed-${wspId}`, async () => {
+      // The owner was resolved before this lock; a destroy since then already
+      // cleared this list, and writing now would leave an orphan key behind.
+      if ((await WSPStorageManager.getWspState(wspId)).windowId == null) {
+        console.log("[WSPStorageManager][saveClosedTab] workspace", wspId, "no longer exists -- skipped");
+        return;
+      }
       const key = STORAGE_KEYS.closedTabs(wspId);
       const results = await browser.storage.local.get(key);
       const closedTabs = results[key] || [];
@@ -262,9 +376,12 @@ class WSPStorageManager {
     return results[key] || [];
   }
 
+  // Same mutex as saveClosedTab: a save that had already read the list would
+  // otherwise write the cleared entries back.
   static async clearClosedTabs(wspId) {
-    const key = STORAGE_KEYS.closedTabs(wspId);
-    await browser.storage.local.remove(key);
+    return _storageMutex.run(`closed-${wspId}`, async () => {
+      await browser.storage.local.remove(STORAGE_KEYS.closedTabs(wspId));
+    });
   }
 
   // Remove a closed-tab entry by identity (url + closedAt) instead of by
@@ -287,7 +404,9 @@ class WSPStorageManager {
 
   // Per-workspace mutex for read-modify-write cycles.
   // Prevents addTabToWorkspace and removeTabFromWorkspace from overwriting
-  // each other's changes when they interleave at await points.
+  // each other's changes when they interleave at await points. Record
+  // changes go through mutateWorkspace; take this lock directly only for
+  // whole-record lifecycle steps (create, destroy).
   static async withWorkspaceLock(wspId, fn) {
     return _storageMutex.run(`wsp-${wspId}`, fn);
   }
@@ -315,7 +434,16 @@ class WSPStorageManager {
   // Used by the popup's "Copy diagnostic dump" action when investigating loss.
   static async getDiagnostics() {
     const all = await browser.storage.local.get(null);
-    const out = { _generatedAt: new Date().toISOString(), _schemaVersion: WSPStorageManager.SCHEMA_VERSION };
+    const out = {
+      _generatedAt: new Date().toISOString(),
+      _schemaVersion: WSPStorageManager.SCHEMA_VERSION,
+      // What storage held at startup; above _schemaVersion means this build
+      // was downgraded and runs on data written by a newer schema.
+      _storedSchemaVersion: WSPStorageManager._storedSchemaVersion,
+    };
+    if (WSPStorageManager._storedSchemaVersion > WSPStorageManager.SCHEMA_VERSION) {
+      out._schemaDowngrade = true;
+    }
     for (const [k, v] of Object.entries(all)) {
       if (k.startsWith("ld-wsp-") || k === STORAGE_KEYS.primaryWindow ||
           k === STORAGE_KEYS.primaryWindowLast || k === STORAGE_KEYS.schemaVersion) {
@@ -333,6 +461,8 @@ class WSPStorageManager {
     return results[key] ?? null;
   }
 
+  // Raw setter: callers hold withOrderLock(windowId) around their
+  // read-modify-write (WorkspaceService.saveWorkspaceOrder for user reorders).
   static async saveWorkspaceOrder(windowId, orderedIds) {
     const key = STORAGE_KEYS.wspOrder(windowId);
     await browser.storage.local.set({[key]: orderedIds});

@@ -9,6 +9,10 @@ class TabPreviewTooltip {
     this._callBackgroundTask = callBackgroundTask;
     this._timeout = null;
     this._el = null;
+    // The row under the pointer, and the row whose aria-describedby points
+    // at the shown tooltip.
+    this._hovered = null;
+    this._describedLi = null;
   }
 
   attach(li, wspId, getDragState) {
@@ -16,19 +20,27 @@ class TabPreviewTooltip {
       // Don't show tooltip during drag operations
       if (getDragState()) return;
 
+      this._hovered = li;
+      clearTimeout(this._timeout);
       this._timeout = setTimeout(async () => {
+        this._timeout = null;
         const result = await this._callBackgroundTask("getTabPreviews", {
           wspId: wspId,
           limit: 15
         });
+        // The pointer left this row (maybe for another one) while the
+        // previews loaded: a late reply must not open on the wrong row.
+        if (this._hovered !== li) return;
         if (!result || result.previews.length === 0) return;
-        // Check if mouse has already left (timeout cleared)
-        if (this._timeout === null) return;
 
         // Guard against race condition on rapid hover
         if (this._el && this._el.parentElement) {
           this._el.remove();
           this._el = null;
+        }
+        if (this._describedLi) {
+          this._describedLi.removeAttribute("aria-describedby");
+          this._describedLi = null;
         }
 
         this._el = document.createElement("div");
@@ -90,14 +102,17 @@ class TabPreviewTooltip {
         const tooltipId = `wsp-preview-tooltip-${++_tooltipIdCounter}`;
         this._el.setAttribute("role", "tooltip");
         li.setAttribute("aria-describedby", tooltipId);
+        this._describedLi = li;
         this._el.id = tooltipId;
       }, 300);
     });
 
     li.addEventListener("mouseleave", () => {
+      if (this._hovered === li) this._hovered = null;
       clearTimeout(this._timeout);
       this._timeout = null;
       li.removeAttribute("aria-describedby");
+      if (this._describedLi === li) this._describedLi = null;
 
       if (this._el && this._el.parentElement) {
         const el = this._el;

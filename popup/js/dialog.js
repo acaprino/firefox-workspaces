@@ -54,7 +54,9 @@ function _createIconElement(iconName, className) {
    Custom Dialog (with Container picker support)
    ============================================================ */
 
-function showCustomDialog({ message, withInput = false, defaultValue = "", defaultIcon = "", showContainerPicker = false, defaultContainerId = null, containers = [], showColorPicker = false, defaultColor = null, showCheckbox = false, checkboxLabel = "", checkboxDefault = false, showFolderPicker = false, folders = [] }) {
+// Resolves false on Cancel / Escape. On OK: the form values, or true for a
+// plain confirmation or an `infoOnly` notice (a single OK button).
+function showCustomDialog({ message, withInput = false, defaultValue = "", defaultIcon = "", showContainerPicker = false, defaultContainerId = null, containers = [], showColorPicker = false, defaultColor = null, showCheckbox = false, checkboxLabel = "", checkboxDefault = false, showFolderPicker = false, folders = [], infoOnly = false }) {
   return new Promise((resolve) => {
     const backdrop = document.getElementById("custom-dialog-backdrop");
     const msgEl = document.getElementById("custom-dialog-message");
@@ -75,12 +77,15 @@ function showCustomDialog({ message, withInput = false, defaultValue = "", defau
     const folderSelect = document.getElementById("custom-dialog-folder-select");
     const okBtn = document.getElementById("custom-dialog-ok");
     const cancelBtn = document.getElementById("custom-dialog-cancel");
+    const footerEl = backdrop.querySelector(".custom-dialog-footer");
 
     _initIconPicker();
 
     msgEl.textContent = message;
     inputRow.hidden = !withInput;
     inputEl.value = defaultValue;
+    // A notice has nothing to cancel: a lone OK button.
+    cancelBtn.hidden = infoOnly;
 
     // Container picker setup
     containerRow.hidden = !showContainerPicker;
@@ -155,23 +160,51 @@ function showCustomDialog({ message, withInput = false, defaultValue = "", defau
     let selectedIcon = defaultIcon || "";
     _updateIconBtn(iconBtn, selectedIcon);
     iconPicker.classList.remove("open");
+    // The collapsed picker is only visually hidden (max-height: 0), so keep
+    // its 33 buttons out of the Tab order and the accessibility tree.
+    iconPicker.inert = true;
     iconBtn.classList.remove("picker-open");
+    iconBtn.setAttribute("aria-expanded", "false");
 
     // Clear previous selection highlights
     for (const btn of iconGrid.children) {
-      btn.classList.toggle("selected", btn.dataset.icon === selectedIcon);
+      const isSel = btn.dataset.icon === selectedIcon;
+      btn.classList.toggle("selected", isSel);
+      btn.setAttribute("aria-pressed", String(isSel));
     }
 
     updateOkButtonState();
 
     // Expand popup viewport so Firefox doesn't clip the dialog
     function syncPopupHeight() {
-      if (showFolderPicker || showCheckbox) {
+      if (showFolderPicker) {
         document.body.style.minHeight = "180px";
         return;
       }
+      if (showCheckbox) {
+        // Grow for a long message (the diagnostics notice) so the checkbox
+        // and the buttons stay in view.
+        let minHeight = 180;
+        if (backdrop.classList.contains("show")) {
+          const bodyEl = backdrop.querySelector(".custom-dialog-body");
+          const need = Math.ceil(msgEl.offsetHeight + bodyEl.scrollHeight + footerEl.offsetHeight);
+          if (Number.isFinite(need)) minHeight = Math.max(minHeight, need);
+        }
+        document.body.style.minHeight = `${minHeight}px`;
+        return;
+      }
       if (!withInput) {
-        document.body.style.minHeight = "140px";
+        // Grow for long messages (the Give up warning keeps its paragraph
+        // breaks) so the buttons stay in view. Measured at natural height,
+        // not at the flex-stretched height of the current viewport.
+        let minHeight = 140;
+        if (backdrop.classList.contains("show")) {
+          msgEl.style.flex = "none";
+          const need = Math.ceil(msgEl.offsetHeight + footerEl.offsetHeight);
+          msgEl.style.flex = "";
+          if (Number.isFinite(need)) minHeight = Math.max(minHeight, need);
+        }
+        document.body.style.minHeight = `${minHeight}px`;
         return;
       }
       const pickerOpen = iconPicker.classList.contains("open");
@@ -186,15 +219,31 @@ function showCustomDialog({ message, withInput = false, defaultValue = "", defau
     } else {
       dialog.classList.add("dialog-confirm");
     }
+    // Forms are dialogs; confirmations and notices interrupt, so they are
+    // alert dialogs (wsp.html sets aria-modal and the message as the label).
+    dialog.setAttribute("role", hasBody ? "dialog" : "alertdialog");
 
-    syncPopupHeight();
+    // Remember the control that opened the dialog: the list behind it goes
+    // display:none, and focus must return there when the dialog closes.
+    const returnFocusTo = document.activeElement;
+    let closed = false;
+
     backdrop.classList.add("show");
+    syncPopupHeight();
 
+    // Move focus into the dialog. Confirmations start on Cancel, so a stray
+    // Enter cannot delete a workspace, give up the restore retry or close a
+    // workspace after export; notices start on their only button.
     if (withInput) {
       requestAnimationFrame(() => {
+        if (closed) return;
         inputEl.focus();
         inputEl.select();
       });
+    } else if (showFolderPicker) {
+      folderSelect.focus();
+    } else {
+      (infoOnly ? okBtn : cancelBtn).focus();
     }
 
     function _updateIconBtn(btn, iconName) {
@@ -221,20 +270,26 @@ function showCustomDialog({ message, withInput = false, defaultValue = "", defau
       selectedIcon = icon;
       _updateIconBtn(iconBtn, icon);
       for (const btn of iconGrid.children) {
-        btn.classList.toggle("selected", btn.dataset.icon === icon);
+        const isSel = btn.dataset.icon === icon;
+        btn.classList.toggle("selected", isSel);
+        btn.setAttribute("aria-pressed", String(isSel));
       }
     }
 
     function closePicker() {
       iconPicker.classList.remove("open");
+      iconPicker.inert = true;
       iconBtn.classList.remove("picker-open");
+      iconBtn.setAttribute("aria-expanded", "false");
       syncPopupHeight();
     }
 
     function onIconBtn(e) {
       e.stopPropagation();
       const isOpen = iconPicker.classList.toggle("open");
+      iconPicker.inert = !isOpen;
       iconBtn.classList.toggle("picker-open", isOpen);
+      iconBtn.setAttribute("aria-expanded", String(isOpen));
       syncPopupHeight();
     }
 
@@ -268,6 +323,7 @@ function showCustomDialog({ message, withInput = false, defaultValue = "", defau
     }
 
     function cleanup(result) {
+      closed = true;
       // Remove listeners immediately to prevent double-fire
       okBtn.removeEventListener("click", onOk);
       cancelBtn.removeEventListener("click", onCancel);
@@ -286,6 +342,11 @@ function showCustomDialog({ message, withInput = false, defaultValue = "", defau
         dialog.classList.remove("dialog-confirm");
         closePicker();
         document.body.style.minHeight = "";
+        // The list is displayed again, so its controls can take focus back.
+        if (returnFocusTo && returnFocusTo !== document.body &&
+            returnFocusTo.isConnected && !backdrop.contains(returnFocusTo)) {
+          returnFocusTo.focus();
+        }
         resolve(result);
       }
       backdrop.addEventListener("animationend", onAnimEnd);
@@ -328,12 +389,31 @@ function showCustomDialog({ message, withInput = false, defaultValue = "", defau
       }
     }
 
+    // This document listener runs before the browser turns Enter on a
+    // focused button into a click, so Enter confirms only from the name
+    // field or a non-interactive target. On Cancel, OK, a swatch, the icon
+    // button, the checkbox or a select the control's own action runs instead
+    // (confirming here made Enter on Cancel delete the workspace).
     function onKeyDown(e) {
-      if (e.key === "Enter" && !okBtn.disabled) {
-        onOk();
+      // Keys that commit or cancel an IME composition belong to the IME.
+      if (e.isComposing || e.keyCode === 229) return;
+      if (e.key === "Enter") {
+        // Auto-repeat of the Enter that opened the dialog must not act on it.
+        if (e.repeat) {
+          e.preventDefault();
+          return;
+        }
+        const t = e.target;
+        if (t !== inputEl && typeof t?.closest === "function" &&
+            t.closest("button, input, select, textarea, a[href], [role=button], [role=radio]")) {
+          return;
+        }
+        e.preventDefault();
+        if (!okBtn.disabled) onOk();
       } else if (e.key === "Escape") {
         if (iconPicker.classList.contains("open")) {
           closePicker();
+          iconBtn.focus();
         } else {
           onCancel();
         }

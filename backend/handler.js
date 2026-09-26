@@ -37,6 +37,14 @@ function _validateContainerId(id) {
     throw new Error("Invalid containerId: " + String(id));
   }
 }
+// User-facing reply for an edit aimed at a workspace that no longer exists
+// (Workspace.NOT_FOUND_MESSAGE), or null for any other error.
+function _notFoundRefusal(e) {
+  const msg = e?.message ?? String(e);
+  if (!msg.startsWith("Workspace not found")) return null;
+  console.log("[Handler] refused:", msg);
+  return { _error: true, _userFacing: true, message: msg };
+}
 function _sanitizeName(name) {
   if (typeof name !== "string") return name;
   return name.replace(CONTROL_AND_BIDI_RE, '').trim().slice(0, 200);
@@ -100,7 +108,10 @@ async function _handleMessage(message) {
       _error: true,
       _userFacing: true,
       retriable: true,
-      message: "Workspaces is still starting up (restoring the previous session). Please try again in a moment.",
+      // A failed start is not "starting up": it waits for a retry (X-06)
+      message: Brainer._initFailure
+        ? "Workspaces could not start - see the warning at the top of this popup. Dismiss it to try again, or restart Firefox."
+        : "Workspaces is still starting up (restoring the previous session). Please try again in a moment.",
     };
   }
 
@@ -139,7 +150,15 @@ async function _handleMessage(message) {
         console.warn("[Handler] renameWorkspace rejecting color:", message.wspColor);
         message.wspColor = null;
       }
-      await WorkspaceService.renameWorkspace(message.wspId, { name: message.wspName, icon: message.wspIcon, color: message.wspColor });
+      try {
+        await WorkspaceService.renameWorkspace(message.wspId, { name: message.wspName, icon: message.wspIcon, color: message.wspColor });
+      } catch (e) {
+        // Deleted while the edit dialog was open: say so instead of a
+        // generic error (and instead of the old silent zombie write).
+        const refusal = _notFoundRefusal(e);
+        if (refusal) return refusal;
+        throw e;
+      }
       console.log("[Handler] renameWorkspace -> success");
       return { success: true };
     case "getNumWorkspaces":
@@ -196,7 +215,13 @@ async function _handleMessage(message) {
     case "setWorkspaceContainer":
       _validateWspId(message.wspId);
       _validateContainerId(message.containerId);
-      await WorkspaceService.setWorkspaceContainer(message.wspId, message.containerId || null);
+      try {
+        await WorkspaceService.setWorkspaceContainer(message.wspId, message.containerId || null);
+      } catch (e) {
+        const refusal = _notFoundRefusal(e);
+        if (refusal) return refusal;
+        throw e;
+      }
       console.log("[Handler] setWorkspaceContainer -> success");
       return { success: true };
     // Tier 2: Closed tabs
@@ -314,14 +339,17 @@ async function _handleMessage(message) {
     // workspace tab arrays.
     //
     // Two distinct user actions:
-    //   - acknowledgeLastRestoreError: dismisses the banner only. Leaves
+    //   - acknowledgeLastRestoreError: dismisses the banner. Leaves
     //     primaryWindowLastId intact so the next restart can still retry the
-    //     restore. Also clears the in-memory _refuseToWipeActive flag so a
-    //     re-attempt can run during the same Firefox session.
-    //   - giveUpRestoreRetry: destructive. Also clears primaryWindowLastId
-    //     so the next start enters the first-startup path and creates a
-    //     fresh default workspace. Old `ld-wsp-{wspId}` records become
-    //     orphaned (recoverable only via the diagnostic dump).
+    //     restore, and clears the in-memory _refuseToWipeActive flag. Then
+    //     resumes what can resume now (Brainer.resumeAfterDismiss, X-34): a
+    //     failed start is retried, and waiting workspaces are restored into
+    //     a normal window that already holds their tabs.
+    //   - giveUpRestoreRetry: destructive (Brainer.giveUpRestore). Exports
+    //     the waiting workspaces' snapshots to bookmarks, detaches their
+    //     window index, clears primaryWindowLastId and starts over at once
+    //     with a fresh default workspace in the current window. Old
+    //     `ld-wsp-{wspId}` records stay for the diagnostic dump.
     case "getLastRestoreError":
       result = await WSPStorageManager.getLastRestoreError();
       console.log("[Handler] getLastRestoreError ->", result ? "present" : "none");
@@ -347,42 +375,70 @@ async function _handleMessage(message) {
       // helper falls back to the last-focused window when no primary exists
       // (refuse-to-wipe / phase4-failure states).
       await UIService.refreshWarnBadge();
-      console.log("[Handler] acknowledgeLastRestoreError -> banner cleared, retry signal kept");
-      return { success: true };
+      const resumed = await Brainer.resumeAfterDismiss();
+      console.log("[Handler] acknowledgeLastRestoreError -> banner cleared, retry signal kept, resumed:", resumed);
+      return { success: true, resumed };
     }
     case "giveUpRestoreRetry": {
       // Compare-and-clear, same as acknowledgeLastRestoreError: this action
       // is destructive (drops the retry signal), so a payload that changed
       // while the confirm dialog was open must not be silently discarded.
+      // Before orphaning the old records, their URL snapshots are exported
+      // to bookmark folders: the extension holds everything needed to
+      // rebuild (names + ordered URL lists), and "give up" used to discard
+      // the only user-reachable copy. Exported folders are restorable later
+      // via the normal restore-from-bookmarks flow. _exportSnapshotsSafe
+      // never throws and dedupes against the automatic session-loss export,
+      // so a loss that was already backed up is not duplicated here.
       const giveUpWhen = Number.isFinite(message.when) ? message.when : null;
-      if (giveUpWhen != null) {
-        const pending = await WSPStorageManager.getLastRestoreError();
-        if (pending && Number.isFinite(pending.when) && pending.when !== giveUpWhen) {
-          console.log("[Handler] giveUpRestoreRetry -> stale request ignored (payload changed since display)");
-          return { success: false, stale: true };
+      try {
+        result = await Brainer.giveUpRestore(giveUpWhen);
+      } catch (e) {
+        // Refused while a start or a restore runs (X-72)
+        if (e?.message === Brainer.RESTORE_BUSY_MESSAGE) {
+          console.log("[Handler] giveUpRestoreRetry -> refused:", e.message);
+          return { _error: true, _userFacing: true, retriable: true, message: e.message };
         }
+        throw e;
       }
-      // Before orphaning the old records, export their URL snapshots to
-      // bookmark folders: the extension holds everything needed to rebuild
-      // (names + ordered URL lists), and "give up" used to discard the only
-      // user-reachable copy. Exported folders are restorable later via the
-      // normal restore-from-bookmarks flow. _exportSnapshotsSafe never throws
-      // and dedupes against the automatic session-loss export, so a loss that
-      // was already backed up is not duplicated here.
-      let exported = { folders: 0, urls: 0, deduped: false };
-      const lastId = await WSPStorageManager.getPrimaryWindowLastId();
-      if (lastId != null) {
-        const orphans = await WSPStorageManager.getWorkspaces(lastId);
-        exported = await Brainer._exportSnapshotsSafe(orphans);
+      if (result.stale) {
+        console.log("[Handler] giveUpRestoreRetry -> stale request ignored (payload changed since display)");
+        return { success: false, stale: true };
       }
-      await WSPStorageManager.clearLastRestoreError();
-      await WSPStorageManager.removePrimaryWindowLastId();
-      Brainer.setRefuseToWipeActive(false);
-      await UIService.refreshWarnBadge();
+      const exported = result.exported;
       console.log("[Handler] giveUpRestoreRetry -> banner + retry signal cleared,",
         exported.folders, "workspace snapshot(s) exported to bookmarks",
         exported.deduped ? "(deduped -- already exported)" : "");
       return { success: true, exportedWorkspaces: exported.folders, alreadyExported: exported.deduped };
+    }
+
+    // Banner action for the "primary-window-closed" warning (X-100): the
+    // window holding the workspaces closed while another stayed open, with
+    // the inactive workspaces' hidden tabs. Reopens it from Firefox's
+    // Recently Closed Windows and restores the workspaces into it -- only
+    // ever on this explicit request. Same compare-and-clear `when` echo as
+    // the other banner actions; allowed while no primary window exists.
+    case "reopenClosedPrimaryWindow": {
+      const reopenWhen = Number.isFinite(message.when) ? message.when : null;
+      if (reopenWhen != null) {
+        const pending = await WSPStorageManager.getLastRestoreError();
+        if (pending && Number.isFinite(pending.when) && pending.when !== reopenWhen) {
+          console.log("[Handler] reopenClosedPrimaryWindow -> stale request ignored (payload changed since display)");
+          return { success: false, stale: true };
+        }
+      }
+      try {
+        result = await Brainer.reopenClosedPrimaryWindow();
+      } catch (e) {
+        const msg = e?.message ?? String(e);
+        if (msg === Brainer.NOTHING_TO_REOPEN_MESSAGE || msg === Brainer.NOT_IN_RECENTLY_CLOSED_MESSAGE) {
+          console.log("[Handler] reopenClosedPrimaryWindow -> refused:", msg);
+          return { _error: true, _userFacing: true, message: msg };
+        }
+        throw e;
+      }
+      console.log("[Handler] reopenClosedPrimaryWindow -> windowId:", result?.windowId);
+      return { success: true, windowId: result.windowId };
     }
 
     // Diagnostic dump for incident response. Returns every ld-wsp-* key plus
