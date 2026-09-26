@@ -1932,6 +1932,18 @@ class Brainer {
           return;
         }
 
+        // Stale event: Firefox delivers onActivated asynchronously, and an
+        // activation that ran meanwhile has selected another tab. Switching
+        // back for it undid that activation, whose own selection event then
+        // switched again: back-to-back activations (keyboard cycling, a
+        // destroy followed by a switch) ping-ponged between two workspaces.
+        const [selectedNow] = await browser.tabs.query({ active: true, windowId: activeInfo.windowId });
+        if (selectedNow && selectedNow.id !== activeInfo.tabId) {
+          console.log("[Brainer][onTabActivated] tab", activeInfo.tabId, "is no longer selected (now",
+            selectedNow.id, ") -- stale event, no switch");
+          return;
+        }
+
         for (const workspace of workspaces) {
           if (workspace.tabs.includes(activeInfo.tabId)) {
             console.log("[Brainer][onTabActivated] tab", activeInfo.tabId,

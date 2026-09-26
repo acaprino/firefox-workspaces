@@ -134,6 +134,24 @@ test("X-37: two quick Alt+Period presses step two workspaces", async (t) => {
   assert.deepEqual(world.visible(1), [5]);
 });
 
+test("X-37: back-to-back switches whose selection events arrive late do not ping-pong", async (t) => {
+  // No latency: both activations finish before Firefox's onActivated for
+  // the tab the first one selected is delivered -- a stale event.
+  const world = threeWorkspaces();
+  const { WS } = await boot(world, t);
+  let runs = 0;
+  const realDo = WS._doActivateWsp.bind(WS);
+  WS._doActivateWsp = (...args) => { runs++; return realDo(...args); };
+
+  await WS.activateWsp(WSP_B, 1);
+  await WS.activateWsp(WSP_C, 1);
+  await world.idle();
+
+  assert.equal(runs, 2, "no switch back to B and forth again");
+  assert.deepEqual(activeIds(world), [WSP_C]);
+  assert.deepEqual(world.visible(1), [5]);
+});
+
 test("X-38: moving a workspace's only tab to another brings the destination up without a detour", async (t) => {
   const world = makeWorld({
     tabs: [
