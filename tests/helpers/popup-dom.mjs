@@ -12,6 +12,9 @@
 //     hidden / inert / display:none ancestors), and focus loss when the
 //     focused node leaves the document
 //   - key presses in Gecko's order (see press())
+//   - theming inputs: browser.theme.getCurrent, a live prefers-color-scheme
+//     MediaQueryList, CSS.supports("color", v), and getComputedStyle for
+//     the popup's color and -moz-Dialog probes (see computedStyleModel)
 // Not modelled: layout (sizes are plain writable numbers, 0 by default),
 // the capture phase, real CSS cascade. The few display:none rules the
 // dialog depends on are mirrored from wsp.css in DISPLAY_NONE below.
@@ -695,6 +698,87 @@ export function readPopupCss() {
   return parseCss(readFileSync(join(POPUP_DIR, "css", "wsp.css"), "utf8"));
 }
 
+// ---------------------------------------------------------------- style
+
+// CSS.supports("color", v), modelled: Gecko's color parser for the shapes a
+// theme uses. One token only: a hex color, a named color, or rgb()/rgba()
+// with 3 or 4 numeric components (other color functions are accepted when
+// their parentheses are balanced and not nested). Tests pass their own
+// cssSupports to reject a specific value.
+const NAMED_COLORS = {
+  black: [0, 0, 0], white: [255, 255, 255], red: [255, 0, 0], green: [0, 128, 0],
+  blue: [0, 0, 255], yellow: [255, 255, 0], cyan: [0, 255, 255], magenta: [255, 0, 255],
+  gray: [128, 128, 128], grey: [128, 128, 128], orange: [255, 165, 0],
+  purple: [128, 0, 128], pink: [255, 192, 203], brown: [165, 42, 42],
+};
+export function cssSupportsModel(prop, value) {
+  if (prop !== "color" || typeof value !== "string") return false;
+  const v = value.trim().toLowerCase();
+  if (/^#([0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/.test(v)) return true;
+  if (v in NAMED_COLORS || v === "transparent" || v === "currentcolor") return true;
+  const rgb = /^rgba?\(([^()]*)\)$/.exec(v);
+  if (rgb) return parseRgbArgs(rgb[1]) !== null;
+  return /^(hsla?|hwb|lab|lch|oklab|oklch|color)\([^()]*\)$/.test(v);
+}
+
+function parseRgbArgs(args) {
+  const parts = args.includes(",")
+    ? args.split(",").map((x) => x.trim())
+    : args.replace("/", " / ").trim().split(/\s+/).filter((x) => x !== "/");
+  if (parts.length < 3 || parts.length > 4) return null;
+  // Percentages: of 255 for the channels, of 1 for the alpha.
+  const nums = parts.map((x, i) => x.endsWith("%") ? Number(x.slice(0, -1)) * (i < 3 ? 2.55 : 0.01) : Number(x));
+  return nums.every(Number.isFinite) ? nums : null;
+}
+
+// The computed `color` of an inline color, serialized as Gecko does for
+// sRGB colors: "rgb(r, g, b)" or "rgba(r, g, b, a)". Other syntaxes (lab(),
+// oklch(), color()) keep their own form, as they do in Gecko.
+function computedColor(value) {
+  const v = String(value ?? "").trim().toLowerCase();
+  let rgba = null;
+  const hex = /^#([0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/.exec(v);
+  if (hex) {
+    let h = hex[1];
+    if (h.length <= 4) h = [...h].map((c) => c + c).join("");
+    rgba = [0, 2, 4].map((i) => parseInt(h.slice(i, i + 2), 16));
+    if (h.length === 8) rgba.push(+(parseInt(h.slice(6, 8), 16) / 255).toFixed(3));
+  } else if (v in NAMED_COLORS) {
+    rgba = NAMED_COLORS[v];
+  } else if (v === "transparent") {
+    rgba = [0, 0, 0, 0];
+  } else {
+    const m = /^rgba?\(([^()]*)\)$/.exec(v);
+    if (m) rgba = parseRgbArgs(m[1]);
+  }
+  if (!rgba) return v;
+  const [r, g, b] = rgba.slice(0, 3).map((n) => Math.round(Math.min(255, Math.max(0, n))));
+  return rgba.length === 4 && rgba[3] !== 1 ? `rgba(${r}, ${g}, ${b}, ${rgba[3]})` : `rgb(${r}, ${g}, ${b})`;
+}
+
+// getComputedStyle, modelled for what the popup reads:
+//   color: the element's inline color (computedColor);
+//   backgroundColor: -moz-Dialog resolved for the element's color-scheme,
+//     which is its own inline one, else the root's (the [data-theme] rules
+//     of wsp.css, "light dark" without data-theme). "light dark" follows
+//     the OS preference. Any other element reads white, as before.
+const MOZ_DIALOG = { light: "rgb(240, 240, 244)", dark: "rgb(43, 42, 51)" };
+function computedStyleModel(el, doc, state) {
+  const style = el?.style ?? {};
+  const own = style.colorScheme || /(?:^|;)\s*color-scheme\s*:\s*([^;]+)/i.exec(style.cssText || "")?.[1];
+  const rootTheme = doc.documentElement.getAttribute("data-theme");
+  const scheme = (own || (rootTheme === "light" || rootTheme === "dark" ? rootTheme : "light dark")).trim();
+  const used = /\blight\b/.test(scheme) && /\bdark\b/.test(scheme)
+    ? (state.prefersDark ? "dark" : "light")
+    : (/\bdark\b/.test(scheme) ? "dark" : "light");
+  const probesDialog = /background\s*:\s*-moz-dialog/i.test(style.cssText || "");
+  return {
+    backgroundColor: probesDialog ? MOZ_DIALOG[used] : "rgb(255, 255, 255)",
+    color: style.color ? computedColor(style.color) : "rgb(0, 0, 0)",
+    getPropertyValue: () => "",
+  };
+}
+
 // ---------------------------------------------------------------- loader
 
 function makeListenerEvent() {
@@ -725,7 +809,14 @@ const DEFAULT_REPLIES = {
 //   replies:  { action: value | (message) => value } for runtime.sendMessage.
 //   reducedMotion: what matchMedia("(prefers-reduced-motion: reduce)") says;
 //             with false the dialog waits for an animationend event.
-export function loadPopup({ scripts = null, replies = {}, reducedMotion = true } = {}) {
+//   theme:    what browser.theme.getCurrent() returns (a copy each call).
+//   prefersDark: the OS color scheme; setPrefersDark() flips it later and
+//             fires the prefers-color-scheme change listeners.
+//   cssSupports: CSS.supports(property, value); defaults to cssSupportsModel.
+export function loadPopup({
+  scripts = null, replies = {}, reducedMotion = true,
+  theme = { colors: {} }, prefersDark = false, cssSupports = cssSupportsModel,
+} = {}) {
   const doc = new Document();
   const html = readFileSync(join(POPUP_DIR, "wsp.html"), "utf8");
   const roots = parseHtml(html, doc);
@@ -735,10 +826,11 @@ export function loadPopup({ scripts = null, replies = {}, reducedMotion = true }
   doc._active = null;
 
   const sent = [];
-  const state = { closed: false, clipboard: null };
+  const state = { closed: false, clipboard: null, prefersDark, theme };
+  const mediaLists = [];
   const browser = {
     windows: { getCurrent: async () => ({ id: 1, type: "normal", incognito: false }) },
-    theme: { getCurrent: async () => ({ colors: {} }), onUpdated: makeListenerEvent() },
+    theme: { getCurrent: async () => structuredClone(state.theme), onUpdated: makeListenerEvent() },
     storage: { onChanged: makeListenerEvent() },
     runtime: {
       sendMessage: async (message) => {
@@ -759,12 +851,27 @@ export function loadPopup({ scripts = null, replies = {}, reducedMotion = true }
     URL, crypto: globalThis.crypto,
     requestAnimationFrame: (fn) => setTimeout(() => fn(Date.now()), 0),
     cancelAnimationFrame: (id) => clearTimeout(id),
-    matchMedia: (q) => ({
-      matches: /prefers-reduced-motion:\s*reduce/.test(q) ? reducedMotion : false,
-      media: q,
-      addEventListener() {}, removeEventListener() {},
-    }),
-    getComputedStyle: () => ({ backgroundColor: "rgb(255, 255, 255)", getPropertyValue: () => "" }),
+    // A live MediaQueryList: `matches` follows the state, and "change"
+    // listeners run on setPrefersDark().
+    matchMedia: (q) => {
+      const listeners = [];
+      const mql = {
+        get matches() {
+          if (/prefers-reduced-motion:\s*reduce/.test(q)) return reducedMotion;
+          if (/prefers-color-scheme:\s*dark/.test(q)) return state.prefersDark;
+          if (/prefers-color-scheme:\s*light/.test(q)) return !state.prefersDark;
+          return false;
+        },
+        media: q,
+        addEventListener(type, fn) { if (type === "change") listeners.push(fn); },
+        removeEventListener(type, fn) { const i = listeners.indexOf(fn); if (i !== -1) listeners.splice(i, 1); },
+        _listeners: listeners,
+      };
+      mediaLists.push(mql);
+      return mql;
+    },
+    getComputedStyle: (el) => computedStyleModel(el, doc, state),
+    CSS: { supports: (prop, value) => cssSupports(prop, value) },
     navigator: { clipboard: { writeText: async (t) => { state.clipboard = t; } } },
     innerHeight: 600,
     innerWidth: 400,
@@ -797,6 +904,14 @@ export function loadPopup({ scripts = null, replies = {}, reducedMotion = true }
     type,
     fire: (target, type, init) => fire(target, type, init),
     settle: (ms = 10) => new Promise((r) => setTimeout(r, ms)),
+    // Flip the OS color scheme, as the OS does at a scheduled switch.
+    setPrefersDark: (dark) => {
+      state.prefersDark = dark;
+      for (const mql of mediaLists) {
+        if (!/prefers-color-scheme/.test(mql.media)) continue;
+        for (const fn of [...mql._listeners]) fn({ type: "change", matches: mql.matches, media: mql.media });
+      }
+    },
     // Deliver a storage.onChanged event, as browser.storage.local.set/remove
     // in the background does: { key: newValue } (undefined = removed).
     storageChange: (values, area = "local") => {

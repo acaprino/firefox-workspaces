@@ -31,7 +31,14 @@
   --wsp-border:         var(--ff-popup-border, transparent);
   --wsp-text-secondary: color-mix(in srgb, var(--wsp-color) 55%, transparent);
   --wsp-hover:          var(--ff-popup-highlight, color-mix(in srgb, var(--wsp-color) 8%, transparent));
-  --wsp-active:         color-mix(in srgb, var(--ff-popup-highlight, var(--wsp-color)) 20%, transparent);
+  /* Text on --wsp-hover. applyTheme() only injects a theme highlight
+     together with the text color of its own key family; the default tint
+     sits on the popup background and keeps the popup text. */
+  --wsp-hover-text:     var(--ff-popup-highlight-text, var(--wsp-color));
+  /* Pressed: the hover surface pushed a little toward its text, so the
+     hover text still reads on it. Without a theme highlight this is the
+     text color at 20% alpha. */
+  --wsp-active:         color-mix(in srgb, var(--wsp-hover) 87%, var(--wsp-hover-text));
 
   /* Accent derives from the theme's accentcolor via --ff-popup-accent.
      Falls back to the CSS AccentColor system color when no theme chain
@@ -39,10 +46,11 @@
   --wsp-primary:        var(--ff-popup-accent, AccentColor);
   --wsp-primary-hover:  color-mix(in srgb, var(--wsp-primary) 85%, var(--wsp-color));
   --wsp-primary-active: color-mix(in srgb, var(--wsp-primary) 72%, var(--wsp-color));
-  /* Text on a primary-colored background (e.g. dialog OK button). Prefer the
-     theme's popup_highlight_text when defined; else fall back to the CSS
-     AccentColorText system color which pairs with AccentColor automatically. */
-  --wsp-on-primary:     var(--ff-popup-highlight-text, AccentColorText);
+  /* Text on a primary-colored background (e.g. dialog OK button). With a
+     theme accent, applyTheme() picks black or white by the accent's own
+     brightness; else the CSS AccentColorText system color, which pairs with
+     AccentColor automatically. */
+  --wsp-on-primary:     var(--ff-popup-on-accent, AccentColorText);
 
   /* Button surfaces derived from the text color. With --wsp-bg transparent
      by default, these become subtle tints layered over the panel chrome,
@@ -88,16 +96,60 @@
 /* color-scheme tells the browser which system color palette to use, so
    CanvasText, AccentColor, AccentColorText, GrayText, and other CSS system
    colors resolve to the dark or light variant as the theme requires.
-   JS sets data-theme via _isFirefoxThemeDark() -> applyTheme(). */
+   applyTheme() in JS sets data-theme from the popup background: the theme's
+   own background color when it has one, else _isFirefoxThemeDark(). */
 :root[data-theme="light"] { color-scheme: light; }
 :root[data-theme="dark"]  { color-scheme: dark;  }
 
 /* SVG icons use fill="currentColor" which resolves to black in <img>;
-   invert them when the Firefox theme is dark (detected via JS -> data-theme). */
+   invert them when the popup background is dark (JS -> data-theme). */
 :root[data-theme="dark"] .icon-picker-btn img,
 :root[data-theme="dark"] .icon-grid button img,
 :root[data-theme="dark"] li.wsp-list-item img.wsp-icon {
   filter: invert(1);
+}
+
+/* Everything painted with --wsp-hover takes --wsp-hover-text, for itself
+   and everything inside it: re-pointing the text tokens here reaches the
+   secondary text, mask icons and bars derived from them. Keep this list in
+   step with the rules whose background is var(--wsp-hover). */
+.wsp-search-result:hover,
+.wsp-search-result:focus-visible,
+li.wsp-list-item:hover,
+li.wsp-list-item.active,
+.wsp-closed-tabs-clear:hover,
+.wsp-closed-tab-item:hover,
+.footer#createNewWsp:hover,
+.footer#restoreFromBookmarks:hover,
+.footer#wsp-copy-diagnostics:hover,
+.icon-picker-btn:hover,
+.icon-grid button:hover:not(.selected),
+.icon-clear-btn:hover {
+  --wsp-color: var(--wsp-hover-text);
+  --wsp-text-secondary: color-mix(in srgb, var(--wsp-hover-text) 55%, transparent);
+  color: var(--wsp-color);
+}
+
+/* <img> icons cannot take a text color: on a theme highlight or text field
+   they follow that surface's brightness instead of the popup's
+   (applyTheme() sets data-highlight / data-field only for theme colors). */
+:root[data-field="dark"] .icon-picker-btn img {
+  filter: invert(1);
+}
+:root[data-field="light"] .icon-picker-btn img {
+  filter: none;
+}
+:root[data-highlight="dark"] li.wsp-list-item:hover img.wsp-icon,
+:root[data-highlight="dark"] li.wsp-list-item.active img.wsp-icon,
+:root[data-highlight="dark"] .icon-picker-btn:hover img,
+:root[data-highlight="dark"] .icon-grid button:hover:not(.selected) img {
+  filter: invert(1);
+}
+:root[data-highlight="light"] li.wsp-list-item:hover img.wsp-icon,
+:root[data-highlight="light"] li.wsp-list-item.active img.wsp-icon,
+:root[data-highlight="light"] .icon-picker-btn:hover img,
+:root[data-highlight="light"] .icon-grid button:hover:not(.selected) img {
+  filter: none;
 }
 
 /* ----------------------------------------------------------

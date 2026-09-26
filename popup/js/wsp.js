@@ -5,34 +5,41 @@
 
 // ── Theme detection ──────────────────────────────────────────
 
-// Strict CSS color validator. Mirror of backend/ui-service.js's _isSafeCssColor
-// so both sites accept exactly the same shape. Rejects anything containing
-// ;, }, {, <, >, url(, or backslash to prevent a malicious/malformed LWT
-// theme from feeding arbitrary CSS tokens into style.setProperty.
+// Strict CSS color validator for theme colors (themes are low-trust: any
+// installed theme, or any extension with the "theme" permission, can supply
+// arbitrary strings). A value is accepted only when it is ONE color token:
+// a hex color, a whitelisted name, or a color function with no nested
+// parentheses, so url(), image-set(), var() and a second value after the
+// color ("rgb(0 0 0 / 0) url(...)", which the background shorthand would
+// fetch) are all rejected. The browser's own parser then has the last word:
+// anything CSS.supports("color", v) rejects is rejected too.
+// backend/ui-service.js has its own copy for the toolbar badge.
 const _WSP_NAMED_COLOR_RE = /^(transparent|currentcolor|black|white|red|green|blue|yellow|cyan|magenta|gray|grey|orange|purple|pink|brown)$/i;
 const _WSP_HEX_COLOR_RE   = /^#([0-9a-f]{3}|[0-9a-f]{4}|[0-9a-f]{6}|[0-9a-f]{8})$/i;
-const _WSP_FUNC_COLOR_RE  = /^(rgba?|hsla?|hwb|lab|lch|oklab|oklch|color)\([^;{}<>\\]*\)$/i;
+const _WSP_FUNC_COLOR_RE  = /^(rgba?|hsla?|hwb|lab|lch|oklab|oklch|color)\([^;{}<>\\()]*\)$/i;
 function _isSafeCssColor(value) {
   if (typeof value !== 'string') return false;
   const s = value.trim();
   if (s.length === 0 || s.length > 128) return false;
   if (/[;{}<>\\]/.test(s)) return false;
-  return _WSP_HEX_COLOR_RE.test(s) || _WSP_FUNC_COLOR_RE.test(s) || _WSP_NAMED_COLOR_RE.test(s);
+  if (!(_WSP_HEX_COLOR_RE.test(s) || _WSP_FUNC_COLOR_RE.test(s) || _WSP_NAMED_COLOR_RE.test(s))) return false;
+  return typeof CSS !== 'undefined' && typeof CSS.supports === 'function' && CSS.supports('color', s);
 }
 
 // Normalize a theme API color value (string or [R,G,B] / [R,G,B,A] array)
 // to a CSS color string, or null if absent/untrusted. String values pass
-// through _isSafeCssColor to reject injection-shaped tokens that a hostile
-// LWT theme could supply (themes on AMO are low-trust; any installed theme
-// could provide arbitrary strings).
+// through _isSafeCssColor. Array alpha is 0-1, as Firefox itself reads it
+// (ext-theme builds rgba() from the array as is); a value above 1 can only
+// be a 0-255 alpha and is scaled.
 function _toCSSColor(v) {
   if (!v) return null;
   if (Array.isArray(v)) {
     if (v.length < 3) return null;
     const [r, g, b] = v;
     if (!Number.isFinite(r) || !Number.isFinite(g) || !Number.isFinite(b)) return null;
-    if (v.length >= 4) {
-      const a = +(Math.min(1, Math.max(0, v[3] / 255))).toFixed(3);
+    if (v.length >= 4 && Number.isFinite(v[3])) {
+      const alpha = v[3] > 1 ? v[3] / 255 : v[3];
+      const a = +(Math.min(1, Math.max(0, alpha))).toFixed(3);
       return `rgba(${r | 0},${g | 0},${b | 0},${a})`;
     }
     return `rgb(${r | 0},${g | 0},${b | 0})`;
@@ -46,6 +53,9 @@ function _toCSSColor(v) {
 // useful color (Firefox built-in themes return theme.colors = {}), fall
 // back to a -moz-Dialog DOM probe which reflects the actual OS dark mode
 // even when privacy.resistFingerprinting spoofs prefers-color-scheme.
+// The chain looks at the toolbar first: the result picks the toolbar icon
+// variant (setDarkModeHint). The popup's own data-theme follows the popup
+// background instead (applyTheme).
 function _isFirefoxThemeDark(theme) {
   const colors = theme?.colors ?? null;
   console.log("[WSP][_isFirefoxThemeDark] colors:", JSON.stringify(colors));
@@ -58,7 +68,11 @@ function _isFirefoxThemeDark(theme) {
   try {
     const probe = document.createElement("div");
     document.documentElement.appendChild(probe);
-    probe.style.cssText = "position:absolute;visibility:hidden;pointer-events:none;background:-moz-Dialog";
+    // System colors resolve for the element's color-scheme, and the root's
+    // [data-theme] rule pins it to the previous verdict: without its own
+    // "light dark" the probe would only ever confirm that verdict after an
+    // OS scheme flip. "light dark" is what the root has on first open.
+    probe.style.cssText = "position:absolute;visibility:hidden;pointer-events:none;color-scheme:light dark;background:-moz-Dialog";
     const bg = getComputedStyle(probe).backgroundColor;
     document.documentElement.removeChild(probe);
     console.log("[WSP][_isFirefoxThemeDark] branch=mozDialog bg:", bg);
@@ -80,54 +94,176 @@ function _isFirefoxThemeDark(theme) {
   return result;
 }
 
-// Each entry: [cssVar, [theme.colors keys in priority order]]
-// The first non-null resolved color from the priority chain is injected as
-// a --ff-popup-* CSS var. When a custom LWT theme is active, the popup can
-// match its palette exactly. When the user is on a Firefox built-in theme
-// (Default / Dark / System), theme.colors is empty and these vars stay
-// unset — the CSS falls through to CSS system colors (Canvas, CanvasText,
-// AccentColor, ...) which the browser resolves to the active theme/OS
-// palette on its own.
-// NOTE: --ff-popup-accent MUST stay in sync with THEME_ACCENT_KEYS in
-// backend/theme-utils.js so the toolbar badge color matches the popup accent.
-const _FF_POPUP_PROPS = [
-  ['--ff-popup-bg',             ['popup', 'frame', 'toolbar']],
-  ['--ff-popup-text',           ['popup_text', 'toolbar_text', 'bookmark_text']],
-  ['--ff-popup-border',         ['popup_border', 'toolbar_field_border']],
-  ['--ff-popup-highlight',      ['popup_highlight', 'toolbar_field_focus', 'tab_selected']],
-  ['--ff-popup-highlight-text', ['popup_highlight_text', 'toolbar_field_highlight_text']],
-  ['--ff-popup-accent',         ['accentcolor', 'toolbar_field_focus_border', 'icons_attention', 'tab_loading', 'popup_highlight']],
-  ['--ff-popup-input-bg',       ['toolbar_field', 'popup', 'frame']],
-  ['--ff-popup-input-text',     ['toolbar_field_text', 'popup_text', 'toolbar_text']],
-  ['--ff-popup-input-border',   ['toolbar_field_border', 'popup_border']],
+// [r, g, b] of a CSS color string, read back through the style system so
+// every syntax the validator lets through is covered. null when there is no
+// usable sRGB value: transparent or currentcolor, an alpha of 0, or a color
+// that computes to its own syntax (lab(), oklch(), color()).
+function _cssColorRgb(css) {
+  if (/^(transparent|currentcolor)$/i.test(css)) return null;
+  let computed = "";
+  try {
+    const probe = document.createElement("div");
+    probe.style.cssText = "position:absolute;visibility:hidden;pointer-events:none";
+    probe.style.color = css;
+    document.documentElement.appendChild(probe);
+    computed = getComputedStyle(probe).color || "";
+    document.documentElement.removeChild(probe);
+  } catch (e) {
+    console.warn("[WSP][_cssColorRgb] probe failed:", e);
+    return null;
+  }
+  const m = /^rgba?\(\s*([\d.]+)[\s,]+([\d.]+)[\s,]+([\d.]+)(?:\s*[,/]\s*([\d.]+)(%?))?\s*\)$/i.exec(computed);
+  if (!m) return null;
+  if (m[4] !== undefined && Number(m[4]) === 0) return null;
+  return [Number(m[1]), Number(m[2]), Number(m[3])];
+}
+
+// true = dark, false = light, null = unknown. Same luminance split as the
+// shared detector in theme-utils.js.
+function _isDarkCssColor(css) {
+  const lum = _themeLuminance(_cssColorRgb(css));
+  return lum === null ? null : lum < 128;
+}
+
+// Theme colors come in families: Firefox paints each surface with the text
+// color of its own family (the popup with popup_text, the selected tab with
+// tab_text, ...). A surface from one family under the text of another can be
+// the same color, so every surface is resolved together with its partner.
+// Each entry: [surface key, [text keys, in Firefox's own fallback order]].
+//
+// Popup background: the first surface the theme defines. When its family
+// has no text color, --ff-popup-text stays unset and CanvasText, resolved
+// for the data-theme derived from that surface, contrasts with it.
+const _FF_POPUP_BG_FAMILIES = [
+  ['popup',   ['popup_text']],
+  ['frame',   ['tab_background_text']],
+  ['toolbar', ['toolbar_text', 'bookmark_text']],
 ];
+// Row highlight (hover, active workspace) and text field: the first family
+// that defines BOTH colors, else nothing, and the CSS falls back to tints
+// of the popup's own text color, which always read on the popup.
+const _FF_POPUP_HIGHLIGHT_FAMILIES = [
+  ['popup_highlight',     ['popup_highlight_text']],
+  ['toolbar_field_focus', ['toolbar_field_text_focus', 'toolbar_field_text']],
+  ['tab_selected',        ['tab_text', 'toolbar_text', 'bookmark_text']],
+];
+const _FF_POPUP_FIELD_FAMILIES = [
+  ['toolbar_field', ['toolbar_field_text']],
+];
+
+// Single colors with no text on them: [cssVar, [theme.colors keys in
+// priority order]]. The first resolved color is injected.
+const _FF_POPUP_PROPS = [
+  ['--ff-popup-border',       ['popup_border', 'toolbar_field_border']],
+  ['--ff-popup-input-border', ['toolbar_field_border', 'popup_border']],
+];
+// --ff-popup-accent, in priority order.
+// NOTE: MUST stay in sync with THEME_ACCENT_KEYS in backend/theme-utils.js
+// so the toolbar badge color matches the popup accent.
+const _FF_POPUP_ACCENT_KEYS = ['accentcolor', 'toolbar_field_focus_border', 'icons_attention', 'tab_loading', 'popup_highlight'];
+
+// Every --ff-popup-* var applyTheme may set, so a re-apply clears them all.
+const _FF_POPUP_VARS = [
+  '--ff-popup-bg', '--ff-popup-text',
+  '--ff-popup-highlight', '--ff-popup-highlight-text',
+  '--ff-popup-input-bg', '--ff-popup-input-text',
+  '--ff-popup-accent', '--ff-popup-on-accent',
+  ..._FF_POPUP_PROPS.map(([cssVar]) => cssVar),
+];
+
+// First of `keys` that yields a safe color, or null.
+function _pickThemeColor(colors, keys) {
+  for (const k of keys) {
+    const v = _toCSSColor(colors[k]);
+    if (v) return v;
+  }
+  return null;
+}
+
+// First family in `families` with both a surface and a text color whose
+// brightness is known: { surface, text, dark }, or null.
+function _pickThemePair(colors, families) {
+  for (const [surfaceKey, textKeys] of families) {
+    const surface = _toCSSColor(colors[surfaceKey]);
+    const text = surface && _pickThemeColor(colors, textKeys);
+    const dark = text ? _isDarkCssColor(surface) : null;
+    if (dark !== null) return { surface, text, dark };
+  }
+  return null;
+}
 
 // Apply theme colors from the Firefox LWT theme API.
 // If the theme provides colors (only custom LWT themes do; built-ins return
-// an empty object), inject them as --ff-popup-* CSS vars. Otherwise the CSS
-// falls through to CSS system colors (Canvas, CanvasText, AccentColor, ...)
-// which Firefox resolves to the active theme/OS palette automatically.
-// Returns isDark boolean so callers can forward it to the background.
+// an empty object), inject them as --ff-popup-* CSS vars, each surface with
+// the text color of its own family (see above). Otherwise the CSS falls
+// through to CSS system colors (Canvas, CanvasText, AccentColor, ...) which
+// Firefox resolves to the active theme/OS palette automatically.
+// data-theme (color-scheme, icon inversion) follows the popup background;
+// data-highlight / data-field give the brightness of a theme highlight or
+// field, which the CSS uses for icons drawn on them.
+// Returns the toolbar's isDark (_isFirefoxThemeDark) for setDarkModeHint.
 function applyTheme(theme) {
   const dark = _isFirefoxThemeDark(theme);
-  console.log("[WSP][applyTheme] isDark:", dark);
-  document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+  console.log("[WSP][applyTheme] toolbar isDark:", dark);
 
-  const s = document.documentElement.style;
+  const root = document.documentElement;
+  const s = root.style;
   // Always clear previously injected vars so stale values can't linger.
-  for (const [cssVar] of _FF_POPUP_PROPS) s.removeProperty(cssVar);
-
-  // Walk each cssVar's priority chain and inject the first resolved color.
+  for (const cssVar of _FF_POPUP_VARS) s.removeProperty(cssVar);
+  const set = (cssVar, v) => {
+    s.setProperty(cssVar, v);
+    console.log(`[WSP][applyTheme] ${cssVar} = ${v}`);
+  };
   const c = theme?.colors ?? {};
-  for (const [cssVar, keys] of _FF_POPUP_PROPS) {
-    for (const k of keys) {
-      const v = _toCSSColor(c[k]);
-      if (v) {
-        s.setProperty(cssVar, v);
-        console.log(`[WSP][applyTheme] ${cssVar} <- theme.colors.${k} = ${v}`);
-        break;
-      }
+
+  // Popup background and its text.
+  let bgDark = null;
+  for (const [surfaceKey, textKeys] of _FF_POPUP_BG_FAMILIES) {
+    const bg = _toCSSColor(c[surfaceKey]);
+    if (!bg) continue;
+    set('--ff-popup-bg', bg);
+    const text = _pickThemeColor(c, textKeys);
+    if (text) set('--ff-popup-text', text);
+    bgDark = _isDarkCssColor(bg);
+    if (bgDark === null && text) {
+      const textDark = _isDarkCssColor(text);
+      if (textDark !== null) bgDark = !textDark;
     }
+    break;
+  }
+  root.dataset.theme = (bgDark ?? dark) ? 'dark' : 'light';
+
+  const highlight = _pickThemePair(c, _FF_POPUP_HIGHLIGHT_FAMILIES);
+  if (highlight) {
+    set('--ff-popup-highlight', highlight.surface);
+    set('--ff-popup-highlight-text', highlight.text);
+    root.dataset.highlight = highlight.dark ? 'dark' : 'light';
+  } else {
+    delete root.dataset.highlight;
+  }
+
+  const field = _pickThemePair(c, _FF_POPUP_FIELD_FAMILIES);
+  if (field) {
+    set('--ff-popup-input-bg', field.surface);
+    set('--ff-popup-input-text', field.text);
+    root.dataset.field = field.dark ? 'dark' : 'light';
+  } else {
+    delete root.dataset.field;
+  }
+
+  // The accent carries text only on the dialog's OK button: pick black or
+  // white by the accent's own brightness. An accent whose brightness is
+  // unknown is left out, so AccentColor keeps its AccentColorText partner.
+  const accent = _pickThemeColor(c, _FF_POPUP_ACCENT_KEYS);
+  const accentDark = accent ? _isDarkCssColor(accent) : null;
+  if (accentDark !== null) {
+    set('--ff-popup-accent', accent);
+    set('--ff-popup-on-accent', accentDark ? 'white' : 'black');
+  }
+
+  for (const [cssVar, keys] of _FF_POPUP_PROPS) {
+    const v = _pickThemeColor(c, keys);
+    if (v) set(cssVar, v);
   }
   return dark;
 }
