@@ -7,11 +7,45 @@ class Brainer {
   static _initStarted = false;
   static _lastFocusedWindowId = null;
   static _primaryWindowId = null;
-  // Set when refuse-to-wipe trips; blocks _onWindowCreated and initialize from
-  // re-entering the restore path on every new window the user opens during the
-  // recovery banner. Cleared on successful restore or via acknowledge/giveUp.
+  // Set when refuse-to-wipe (or a Phase 4 failure) trips: the restore is
+  // paused for the user. While set, only a window holding the workspaces'
+  // tagged tabs takes them over (see _windowTakeOverMode). Cleared on
+  // successful restore or via acknowledge/giveUp.
   // In-memory only -- a fresh Firefox start naturally clears it.
   static _refuseToWipeActive = false;
+
+  // The error of the last initialize() pass that failed for any reason other
+  // than a refused restore, null otherwise (X-06). While set, _state stays
+  // 'uninitialized' (tab events, menus and mutating actions stay gated, as
+  // stored tab ids may be stale), the "init-failure" banner explains it, a
+  // retry is scheduled (LIMITS.INIT_RETRY_DELAYS_MS) and Dismiss retries at
+  // once. A failed pass used to leave _state at 'initializing' for the rest
+  // of the session, which every re-entry point refuses.
+  static _initFailure = null;
+  static _initRetryTimer = null;
+  static _initRetryCount = 0;
+  static INIT_FAILURE_REASON = "init-failure";
+
+  // The primary window closed while the browser kept running: another
+  // window stayed open, or macOS keeps Firefox running without windows (an
+  // initialize() that finds no normal window is in the same situation).
+  // { windowId, noted } -- `noted`: the primary-window-closed banner was
+  // raised for it. A window opened afterwards is not a browser restart
+  // (X-11); see _windowTakeOverMode. In-memory only: a restart or an
+  // extension reload starts without it (the banner, when raised, persists).
+  static _closedPrimary = null;
+
+  // Listeners are registered once per background page, however many
+  // initialize() passes run (X-06 retries, re-init after Give up).
+  static _listenersRegistered = false;
+  // storage.session restart evidence, read once per background page: a
+  // retried pass would otherwise find the sentinel the first pass wrote and
+  // lose the restart signal.
+  static _sessionRestartEvidence = null;
+  // windows.onCreated is handled one window at a time (_queueWindowCreated).
+  static _windowCreatedChain = Promise.resolve();
+  // An update is waiting for the background to go idle (_reloadWhenIdle).
+  static _reloadPending = false;
 
   // Tabs that look like Firefox session-restore placeholders rather than real
   // user content. When refuse-to-wipe evaluates, these don't count as "live
