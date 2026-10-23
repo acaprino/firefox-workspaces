@@ -31,7 +31,14 @@
   --wsp-border:         var(--ff-popup-border, transparent);
   --wsp-text-secondary: color-mix(in srgb, var(--wsp-color) 55%, transparent);
   --wsp-hover:          var(--ff-popup-highlight, color-mix(in srgb, var(--wsp-color) 8%, transparent));
-  --wsp-active:         color-mix(in srgb, var(--ff-popup-highlight, var(--wsp-color)) 20%, transparent);
+  /* Text on --wsp-hover. applyTheme() only injects a theme highlight
+     together with the text color of its own key family; the default tint
+     sits on the popup background and keeps the popup text. */
+  --wsp-hover-text:     var(--ff-popup-highlight-text, var(--wsp-color));
+  /* Pressed: the hover surface pushed a little toward its text, so the
+     hover text still reads on it. Without a theme highlight this is the
+     text color at 20% alpha. */
+  --wsp-active:         color-mix(in srgb, var(--wsp-hover) 87%, var(--wsp-hover-text));
 
   /* Accent derives from the theme's accentcolor via --ff-popup-accent.
      Falls back to the CSS AccentColor system color when no theme chain
@@ -39,10 +46,11 @@
   --wsp-primary:        var(--ff-popup-accent, AccentColor);
   --wsp-primary-hover:  color-mix(in srgb, var(--wsp-primary) 85%, var(--wsp-color));
   --wsp-primary-active: color-mix(in srgb, var(--wsp-primary) 72%, var(--wsp-color));
-  /* Text on a primary-colored background (e.g. dialog OK button). Prefer the
-     theme's popup_highlight_text when defined; else fall back to the CSS
-     AccentColorText system color which pairs with AccentColor automatically. */
-  --wsp-on-primary:     var(--ff-popup-highlight-text, AccentColorText);
+  /* Text on a primary-colored background (e.g. dialog OK button). With a
+     theme accent, applyTheme() picks black or white by the accent's own
+     brightness; else the CSS AccentColorText system color, which pairs with
+     AccentColor automatically. */
+  --wsp-on-primary:     var(--ff-popup-on-accent, AccentColorText);
 
   /* Button surfaces derived from the text color. With --wsp-bg transparent
      by default, these become subtle tints layered over the panel chrome,
@@ -88,16 +96,60 @@
 /* color-scheme tells the browser which system color palette to use, so
    CanvasText, AccentColor, AccentColorText, GrayText, and other CSS system
    colors resolve to the dark or light variant as the theme requires.
-   JS sets data-theme via _isFirefoxThemeDark() -> applyTheme(). */
+   applyTheme() in JS sets data-theme from the popup background: the theme's
+   own background color when it has one, else _isFirefoxThemeDark(). */
 :root[data-theme="light"] { color-scheme: light; }
 :root[data-theme="dark"]  { color-scheme: dark;  }
 
 /* SVG icons use fill="currentColor" which resolves to black in <img>;
-   invert them when the Firefox theme is dark (detected via JS -> data-theme). */
+   invert them when the popup background is dark (JS -> data-theme). */
 :root[data-theme="dark"] .icon-picker-btn img,
 :root[data-theme="dark"] .icon-grid button img,
 :root[data-theme="dark"] li.wsp-list-item img.wsp-icon {
   filter: invert(1);
+}
+
+/* Everything painted with --wsp-hover takes --wsp-hover-text, for itself
+   and everything inside it: re-pointing the text tokens here reaches the
+   secondary text, mask icons and bars derived from them. Keep this list in
+   step with the rules whose background is var(--wsp-hover). */
+.wsp-search-result:hover,
+.wsp-search-result:focus-visible,
+li.wsp-list-item:hover,
+li.wsp-list-item.active,
+.wsp-closed-tabs-clear:hover,
+.wsp-closed-tab-item:hover,
+.footer#createNewWsp:hover,
+.footer#restoreFromBookmarks:hover,
+.footer#wsp-copy-diagnostics:hover,
+.icon-picker-btn:hover,
+.icon-grid button:hover:not(.selected),
+.icon-clear-btn:hover {
+  --wsp-color: var(--wsp-hover-text);
+  --wsp-text-secondary: color-mix(in srgb, var(--wsp-hover-text) 55%, transparent);
+  color: var(--wsp-color);
+}
+
+/* <img> icons cannot take a text color: on a theme highlight or text field
+   they follow that surface's brightness instead of the popup's
+   (applyTheme() sets data-highlight / data-field only for theme colors). */
+:root[data-field="dark"] .icon-picker-btn img {
+  filter: invert(1);
+}
+:root[data-field="light"] .icon-picker-btn img {
+  filter: none;
+}
+:root[data-highlight="dark"] li.wsp-list-item:hover img.wsp-icon,
+:root[data-highlight="dark"] li.wsp-list-item.active img.wsp-icon,
+:root[data-highlight="dark"] .icon-picker-btn:hover img,
+:root[data-highlight="dark"] .icon-grid button:hover:not(.selected) img {
+  filter: invert(1);
+}
+:root[data-highlight="light"] li.wsp-list-item:hover img.wsp-icon,
+:root[data-highlight="light"] li.wsp-list-item.active img.wsp-icon,
+:root[data-highlight="light"] .icon-picker-btn:hover img,
+:root[data-highlight="light"] .icon-grid button:hover:not(.selected) img {
+  filter: none;
 }
 
 /* ----------------------------------------------------------
@@ -219,7 +271,8 @@ body {
   transition: background-color 0.08s ease-out;
 }
 
-.wsp-search-result:hover {
+.wsp-search-result:hover,
+.wsp-search-result:focus-visible {
   background: var(--wsp-hover);
 }
 
@@ -309,6 +362,25 @@ li.wsp-list-item.active.has-color {
   border-left-style: solid;
 }
 
+/* Row body: the focusable switch target (role=button) around the dot, icon,
+   name and tab count. It fills the row; the focus ring goes on the row. */
+li.wsp-list-item .wsp-row-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+}
+
+li.wsp-list-item .wsp-row-main:focus-visible {
+  outline: none;
+}
+
+li.wsp-list-item:has(> .wsp-row-main:focus-visible) {
+  outline: 2px solid var(--wsp-focus);
+  outline-offset: -2px;
+}
+
 li.wsp-list-item img.wsp-icon {
   flex-shrink: 0;
   width: 16px;
@@ -351,6 +423,11 @@ li.wsp-list-item.drag-over {
   box-shadow: inset 0 2px 0 color-mix(in srgb, var(--wsp-color) 55%, transparent);
 }
 
+/* Moving a row down drops it below the target: draw the line there. */
+li.wsp-list-item.drag-over.drag-over-below {
+  box-shadow: inset 0 -2px 0 color-mix(in srgb, var(--wsp-color) 55%, transparent);
+}
+
 /* ----------------------------------------------------------
    6. Action Buttons (Rename / Delete)
    ---------------------------------------------------------- */
@@ -372,13 +449,19 @@ li.wsp-list-item .edit-btn {
   opacity: 0;
 }
 
-li.wsp-list-item:hover .edit-btn {
+/* Also on keyboard focus: a focused control must not be invisible. */
+li.wsp-list-item:hover .edit-btn,
+li.wsp-list-item:has(:focus-visible) .edit-btn {
   opacity: 0.7;
 }
 
 li.wsp-list-item .edit-btn:hover {
   opacity: 1;
   background: var(--wsp-active);
+}
+
+li.wsp-list-item .edit-btn:focus-visible {
+  opacity: 1;
 }
 
 li.wsp-list-item .export-btn {
@@ -666,11 +749,13 @@ li.no-wsp {
   mask-size: contain;
 }
 
-.wsp-closed-tab-item:hover .wsp-closed-tab-restore {
+.wsp-closed-tab-item:hover .wsp-closed-tab-restore,
+.wsp-closed-tab-item:has(:focus-visible) .wsp-closed-tab-restore {
   opacity: 0.7;
 }
 
-.wsp-closed-tab-restore:hover {
+.wsp-closed-tab-restore:hover,
+.wsp-closed-tab-restore:focus-visible {
   opacity: 1 !important;
 }
 
@@ -819,6 +904,8 @@ li.no-wsp {
   font-size: 13px;
   font-weight: 600;
   line-height: 1.4;
+  /* Keep the paragraph breaks of multi-paragraph messages (Give up). */
+  white-space: pre-line;
 }
 
 /* Scrollable form area */
@@ -835,11 +922,15 @@ li.no-wsp {
   border-top: 1px solid var(--wsp-border);
 }
 
-/* Delete confirmation mode - centered message, hidden body */
+/* Delete confirmation mode - centered message, hidden body. A message
+   taller than the popup scrolls (safe center keeps its top reachable)
+   instead of pushing the buttons out of view. */
 .custom-dialog.dialog-confirm .custom-dialog-message {
   flex: 1;
+  min-height: 0;
+  overflow-y: auto;
   display: flex;
-  align-items: center;
+  align-items: safe center;
   justify-content: center;
   padding: 32px 16px;
   text-align: center;
@@ -1336,14 +1427,23 @@ li.no-wsp {
   background: var(--wsp-btn-hover);
 }
 
-.footer-diagnostic {
-  margin-left: auto;
-  opacity: 0.7;
+/* Small and muted, but always shown: it is the way to the diagnostic dump
+   when no banner is up, including in the restricted popup. */
+.footer#wsp-copy-diagnostics {
+  display: block;
+  width: auto;
+  padding: 4px 10px;
+  color: var(--wsp-text-secondary);
   font-size: 11px;
+  text-decoration: none;
+  text-align: start;
+  border-radius: var(--wsp-radius-sm);
+  cursor: default;
 }
 
-.footer-diagnostic:hover {
-  opacity: 1;
+.footer#wsp-copy-diagnostics:hover {
+  background: var(--wsp-hover);
+  color: var(--wsp-color);
 }
 
 /* "Give up" is destructive -- soft accent to set it apart from Dismiss. */
@@ -1354,4 +1454,68 @@ li.no-wsp {
 
 .wsp-error-banner-actions button.wsp-error-give-up:hover {
   opacity: 1;
+}
+
+/* ----------------------------------------------------------
+   14. Forced colors (Windows High Contrast, Firefox "Override colors")
+   ---------------------------------------------------------- */
+@media (forced-colors: active) {
+  /* Mask icons are painted with `background`, which forced colors replace
+     with the page background, so the icons vanish. Opt them out and paint
+     them with the text system color. */
+  .title::before,
+  li.wsp-list-item .export-btn::after,
+  li.wsp-list-item .rename-btn::after,
+  li.wsp-list-item .delete-btn::after,
+  li.wsp-list-item .export-btn:hover::after,
+  li.wsp-list-item .rename-btn:hover::after,
+  li.wsp-list-item .delete-btn:hover::after,
+  .wsp-closed-tab-restore::after,
+  .footer#createNewWsp::before,
+  .footer#restoreFromBookmarks::before,
+  .color-swatch-remove::after {
+    forced-color-adjust: none;
+    background: CanvasText;
+  }
+
+  /* Swatch and container colors are information, not decoration: keep
+     them, and mark the selected swatch with system colors (forced colors
+     drop the box-shadow ring used otherwise). */
+  .color-swatch,
+  .wsp-container-dot {
+    forced-color-adjust: none;
+  }
+
+  .color-swatch {
+    border-color: Canvas;
+  }
+
+  .color-swatch-remove {
+    border-color: GrayText;
+  }
+
+  .color-swatch.selected,
+  .color-swatch-remove.selected {
+    border-color: Canvas;
+    box-shadow: 0 0 0 2px Highlight;
+  }
+
+  .color-swatch:focus-visible {
+    outline: 2px solid CanvasText;
+    outline-offset: 2px;
+  }
+
+  .icon-grid button.selected {
+    border-color: Highlight;
+  }
+
+  /* Borderless buttons and the preview panel need an edge to be seen. */
+  .custom-dialog-buttons button,
+  .wsp-error-banner-actions button {
+    border: 1px solid ButtonText;
+  }
+
+  .wsp-tab-preview {
+    outline: 1px solid CanvasText;
+  }
 }

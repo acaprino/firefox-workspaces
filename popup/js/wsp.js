@@ -5,34 +5,41 @@
 
 // ── Theme detection ──────────────────────────────────────────
 
-// Strict CSS color validator. Mirror of backend/ui-service.js's _isSafeCssColor
-// so both sites accept exactly the same shape. Rejects anything containing
-// ;, }, {, <, >, url(, or backslash to prevent a malicious/malformed LWT
-// theme from feeding arbitrary CSS tokens into style.setProperty.
+// Strict CSS color validator for theme colors (themes are low-trust: any
+// installed theme, or any extension with the "theme" permission, can supply
+// arbitrary strings). A value is accepted only when it is ONE color token:
+// a hex color, a whitelisted name, or a color function with no nested
+// parentheses, so url(), image-set(), var() and a second value after the
+// color ("rgb(0 0 0 / 0) url(...)", which the background shorthand would
+// fetch) are all rejected. The browser's own parser then has the last word:
+// anything CSS.supports("color", v) rejects is rejected too.
+// backend/ui-service.js has its own copy for the toolbar badge.
 const _WSP_NAMED_COLOR_RE = /^(transparent|currentcolor|black|white|red|green|blue|yellow|cyan|magenta|gray|grey|orange|purple|pink|brown)$/i;
 const _WSP_HEX_COLOR_RE   = /^#([0-9a-f]{3}|[0-9a-f]{4}|[0-9a-f]{6}|[0-9a-f]{8})$/i;
-const _WSP_FUNC_COLOR_RE  = /^(rgba?|hsla?|hwb|lab|lch|oklab|oklch|color)\([^;{}<>\\]*\)$/i;
+const _WSP_FUNC_COLOR_RE  = /^(rgba?|hsla?|hwb|lab|lch|oklab|oklch|color)\([^;{}<>\\()]*\)$/i;
 function _isSafeCssColor(value) {
   if (typeof value !== 'string') return false;
   const s = value.trim();
   if (s.length === 0 || s.length > 128) return false;
   if (/[;{}<>\\]/.test(s)) return false;
-  return _WSP_HEX_COLOR_RE.test(s) || _WSP_FUNC_COLOR_RE.test(s) || _WSP_NAMED_COLOR_RE.test(s);
+  if (!(_WSP_HEX_COLOR_RE.test(s) || _WSP_FUNC_COLOR_RE.test(s) || _WSP_NAMED_COLOR_RE.test(s))) return false;
+  return typeof CSS !== 'undefined' && typeof CSS.supports === 'function' && CSS.supports('color', s);
 }
 
 // Normalize a theme API color value (string or [R,G,B] / [R,G,B,A] array)
 // to a CSS color string, or null if absent/untrusted. String values pass
-// through _isSafeCssColor to reject injection-shaped tokens that a hostile
-// LWT theme could supply (themes on AMO are low-trust; any installed theme
-// could provide arbitrary strings).
+// through _isSafeCssColor. Array alpha is 0-1, as Firefox itself reads it
+// (ext-theme builds rgba() from the array as is); a value above 1 can only
+// be a 0-255 alpha and is scaled.
 function _toCSSColor(v) {
   if (!v) return null;
   if (Array.isArray(v)) {
     if (v.length < 3) return null;
     const [r, g, b] = v;
     if (!Number.isFinite(r) || !Number.isFinite(g) || !Number.isFinite(b)) return null;
-    if (v.length >= 4) {
-      const a = +(Math.min(1, Math.max(0, v[3] / 255))).toFixed(3);
+    if (v.length >= 4 && Number.isFinite(v[3])) {
+      const alpha = v[3] > 1 ? v[3] / 255 : v[3];
+      const a = +(Math.min(1, Math.max(0, alpha))).toFixed(3);
       return `rgba(${r | 0},${g | 0},${b | 0},${a})`;
     }
     return `rgb(${r | 0},${g | 0},${b | 0})`;
@@ -46,6 +53,9 @@ function _toCSSColor(v) {
 // useful color (Firefox built-in themes return theme.colors = {}), fall
 // back to a -moz-Dialog DOM probe which reflects the actual OS dark mode
 // even when privacy.resistFingerprinting spoofs prefers-color-scheme.
+// The chain looks at the toolbar first: the result picks the toolbar icon
+// variant (setDarkModeHint). The popup's own data-theme follows the popup
+// background instead (applyTheme).
 function _isFirefoxThemeDark(theme) {
   const colors = theme?.colors ?? null;
   console.log("[WSP][_isFirefoxThemeDark] colors:", JSON.stringify(colors));
@@ -58,7 +68,11 @@ function _isFirefoxThemeDark(theme) {
   try {
     const probe = document.createElement("div");
     document.documentElement.appendChild(probe);
-    probe.style.cssText = "position:absolute;visibility:hidden;pointer-events:none;background:-moz-Dialog";
+    // System colors resolve for the element's color-scheme, and the root's
+    // [data-theme] rule pins it to the previous verdict: without its own
+    // "light dark" the probe would only ever confirm that verdict after an
+    // OS scheme flip. "light dark" is what the root has on first open.
+    probe.style.cssText = "position:absolute;visibility:hidden;pointer-events:none;color-scheme:light dark;background:-moz-Dialog";
     const bg = getComputedStyle(probe).backgroundColor;
     document.documentElement.removeChild(probe);
     console.log("[WSP][_isFirefoxThemeDark] branch=mozDialog bg:", bg);
@@ -80,58 +94,267 @@ function _isFirefoxThemeDark(theme) {
   return result;
 }
 
-// Each entry: [cssVar, [theme.colors keys in priority order]]
-// The first non-null resolved color from the priority chain is injected as
-// a --ff-popup-* CSS var. When a custom LWT theme is active, the popup can
-// match its palette exactly. When the user is on a Firefox built-in theme
-// (Default / Dark / System), theme.colors is empty and these vars stay
-// unset — the CSS falls through to CSS system colors (Canvas, CanvasText,
-// AccentColor, ...) which the browser resolves to the active theme/OS
-// palette on its own.
-// NOTE: --ff-popup-accent MUST stay in sync with THEME_ACCENT_KEYS in
-// backend/theme-utils.js so the toolbar badge color matches the popup accent.
-const _FF_POPUP_PROPS = [
-  ['--ff-popup-bg',             ['popup', 'frame', 'toolbar']],
-  ['--ff-popup-text',           ['popup_text', 'toolbar_text', 'bookmark_text']],
-  ['--ff-popup-border',         ['popup_border', 'toolbar_field_border']],
-  ['--ff-popup-highlight',      ['popup_highlight', 'toolbar_field_focus', 'tab_selected']],
-  ['--ff-popup-highlight-text', ['popup_highlight_text', 'toolbar_field_highlight_text']],
-  ['--ff-popup-accent',         ['accentcolor', 'toolbar_field_focus_border', 'icons_attention', 'tab_loading', 'popup_highlight']],
-  ['--ff-popup-input-bg',       ['toolbar_field', 'popup', 'frame']],
-  ['--ff-popup-input-text',     ['toolbar_field_text', 'popup_text', 'toolbar_text']],
-  ['--ff-popup-input-border',   ['toolbar_field_border', 'popup_border']],
+// [r, g, b] of a CSS color string, read back through the style system so
+// every syntax the validator lets through is covered. null when there is no
+// usable sRGB value: transparent or currentcolor, an alpha of 0, or a color
+// that computes to its own syntax (lab(), oklch(), color()).
+function _cssColorRgb(css) {
+  if (/^(transparent|currentcolor)$/i.test(css)) return null;
+  let computed = "";
+  try {
+    const probe = document.createElement("div");
+    probe.style.cssText = "position:absolute;visibility:hidden;pointer-events:none";
+    probe.style.color = css;
+    document.documentElement.appendChild(probe);
+    computed = getComputedStyle(probe).color || "";
+    document.documentElement.removeChild(probe);
+  } catch (e) {
+    console.warn("[WSP][_cssColorRgb] probe failed:", e);
+    return null;
+  }
+  const m = /^rgba?\(\s*([\d.]+)[\s,]+([\d.]+)[\s,]+([\d.]+)(?:\s*[,/]\s*([\d.]+)(%?))?\s*\)$/i.exec(computed);
+  if (!m) return null;
+  if (m[4] !== undefined && Number(m[4]) === 0) return null;
+  return [Number(m[1]), Number(m[2]), Number(m[3])];
+}
+
+// true = dark, false = light, null = unknown. Same luminance split as the
+// shared detector in theme-utils.js.
+function _isDarkCssColor(css) {
+  const lum = _themeLuminance(_cssColorRgb(css));
+  return lum === null ? null : lum < 128;
+}
+
+// Theme colors come in families: Firefox paints each surface with the text
+// color of its own family (the popup with popup_text, the selected tab with
+// tab_text, ...). A surface from one family under the text of another can be
+// the same color, so every surface is resolved together with its partner.
+// Each entry: [surface key, [text keys, in Firefox's own fallback order]].
+//
+// Popup background: the first surface the theme defines. When its family
+// has no text color, --ff-popup-text stays unset and CanvasText, resolved
+// for the data-theme derived from that surface, contrasts with it.
+const _FF_POPUP_BG_FAMILIES = [
+  ['popup',   ['popup_text']],
+  ['frame',   ['tab_background_text']],
+  ['toolbar', ['toolbar_text', 'bookmark_text']],
 ];
+// Row highlight (hover, active workspace) and text field: the first family
+// that defines BOTH colors, else nothing, and the CSS falls back to tints
+// of the popup's own text color, which always read on the popup.
+const _FF_POPUP_HIGHLIGHT_FAMILIES = [
+  ['popup_highlight',     ['popup_highlight_text']],
+  ['toolbar_field_focus', ['toolbar_field_text_focus', 'toolbar_field_text']],
+  ['tab_selected',        ['tab_text', 'toolbar_text', 'bookmark_text']],
+];
+const _FF_POPUP_FIELD_FAMILIES = [
+  ['toolbar_field', ['toolbar_field_text']],
+];
+
+// Single colors with no text on them: [cssVar, [theme.colors keys in
+// priority order]]. The first resolved color is injected.
+const _FF_POPUP_PROPS = [
+  ['--ff-popup-border',       ['popup_border', 'toolbar_field_border']],
+  ['--ff-popup-input-border', ['toolbar_field_border', 'popup_border']],
+];
+// --ff-popup-accent, in priority order.
+// NOTE: MUST stay in sync with THEME_ACCENT_KEYS in backend/theme-utils.js
+// so the toolbar badge color matches the popup accent.
+const _FF_POPUP_ACCENT_KEYS = ['accentcolor', 'toolbar_field_focus_border', 'icons_attention', 'tab_loading', 'popup_highlight'];
+
+// Every --ff-popup-* var applyTheme may set, so a re-apply clears them all.
+const _FF_POPUP_VARS = [
+  '--ff-popup-bg', '--ff-popup-text',
+  '--ff-popup-highlight', '--ff-popup-highlight-text',
+  '--ff-popup-input-bg', '--ff-popup-input-text',
+  '--ff-popup-accent', '--ff-popup-on-accent',
+  ..._FF_POPUP_PROPS.map(([cssVar]) => cssVar),
+];
+
+// First of `keys` that yields a safe color, or null.
+function _pickThemeColor(colors, keys) {
+  for (const k of keys) {
+    const v = _toCSSColor(colors[k]);
+    if (v) return v;
+  }
+  return null;
+}
+
+// First family in `families` with both a surface and a text color whose
+// brightness is known: { surface, text, dark }, or null.
+function _pickThemePair(colors, families) {
+  for (const [surfaceKey, textKeys] of families) {
+    const surface = _toCSSColor(colors[surfaceKey]);
+    const text = surface && _pickThemeColor(colors, textKeys);
+    const dark = text ? _isDarkCssColor(surface) : null;
+    if (dark !== null) return { surface, text, dark };
+  }
+  return null;
+}
 
 // Apply theme colors from the Firefox LWT theme API.
 // If the theme provides colors (only custom LWT themes do; built-ins return
-// an empty object), inject them as --ff-popup-* CSS vars. Otherwise the CSS
-// falls through to CSS system colors (Canvas, CanvasText, AccentColor, ...)
-// which Firefox resolves to the active theme/OS palette automatically.
-// Returns isDark boolean so callers can forward it to the background.
+// an empty object), inject them as --ff-popup-* CSS vars, each surface with
+// the text color of its own family (see above). Otherwise the CSS falls
+// through to CSS system colors (Canvas, CanvasText, AccentColor, ...) which
+// Firefox resolves to the active theme/OS palette automatically.
+// data-theme (color-scheme, icon inversion) follows the popup background;
+// data-highlight / data-field give the brightness of a theme highlight or
+// field, which the CSS uses for icons drawn on them.
+// Returns the toolbar's isDark (_isFirefoxThemeDark) for setDarkModeHint.
 function applyTheme(theme) {
   const dark = _isFirefoxThemeDark(theme);
-  console.log("[WSP][applyTheme] isDark:", dark);
-  document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+  console.log("[WSP][applyTheme] toolbar isDark:", dark);
 
-  const s = document.documentElement.style;
+  const root = document.documentElement;
+  const s = root.style;
   // Always clear previously injected vars so stale values can't linger.
-  for (const [cssVar] of _FF_POPUP_PROPS) s.removeProperty(cssVar);
-
-  // Walk each cssVar's priority chain and inject the first resolved color.
+  for (const cssVar of _FF_POPUP_VARS) s.removeProperty(cssVar);
+  const set = (cssVar, v) => {
+    s.setProperty(cssVar, v);
+    console.log(`[WSP][applyTheme] ${cssVar} = ${v}`);
+  };
   const c = theme?.colors ?? {};
-  for (const [cssVar, keys] of _FF_POPUP_PROPS) {
-    for (const k of keys) {
-      const v = _toCSSColor(c[k]);
-      if (v) {
-        s.setProperty(cssVar, v);
-        console.log(`[WSP][applyTheme] ${cssVar} <- theme.colors.${k} = ${v}`);
-        break;
-      }
+
+  // Popup background and its text.
+  let bgDark = null;
+  for (const [surfaceKey, textKeys] of _FF_POPUP_BG_FAMILIES) {
+    const bg = _toCSSColor(c[surfaceKey]);
+    if (!bg) continue;
+    set('--ff-popup-bg', bg);
+    const text = _pickThemeColor(c, textKeys);
+    if (text) set('--ff-popup-text', text);
+    bgDark = _isDarkCssColor(bg);
+    if (bgDark === null && text) {
+      const textDark = _isDarkCssColor(text);
+      if (textDark !== null) bgDark = !textDark;
     }
+    break;
+  }
+  root.dataset.theme = (bgDark ?? dark) ? 'dark' : 'light';
+
+  const highlight = _pickThemePair(c, _FF_POPUP_HIGHLIGHT_FAMILIES);
+  if (highlight) {
+    set('--ff-popup-highlight', highlight.surface);
+    set('--ff-popup-highlight-text', highlight.text);
+    root.dataset.highlight = highlight.dark ? 'dark' : 'light';
+  } else {
+    delete root.dataset.highlight;
+  }
+
+  const field = _pickThemePair(c, _FF_POPUP_FIELD_FAMILIES);
+  if (field) {
+    set('--ff-popup-input-bg', field.surface);
+    set('--ff-popup-input-text', field.text);
+    root.dataset.field = field.dark ? 'dark' : 'light';
+  } else {
+    delete root.dataset.field;
+  }
+
+  // The accent carries text only on the dialog's OK button: pick black or
+  // white by the accent's own brightness. An accent whose brightness is
+  // unknown is left out, so AccentColor keeps its AccentColorText partner.
+  const accent = _pickThemeColor(c, _FF_POPUP_ACCENT_KEYS);
+  const accentDark = accent ? _isDarkCssColor(accent) : null;
+  if (accentDark !== null) {
+    set('--ff-popup-accent', accent);
+    set('--ff-popup-on-accent', accentDark ? 'white' : 'black');
+  }
+
+  for (const [cssVar, keys] of _FF_POPUP_PROPS) {
+    const v = _pickThemeColor(c, keys);
+    if (v) set(cssVar, v);
   }
   return dark;
 }
 // ─────────────────────────────────────────────────────────────
+
+// Give a role="button" element the keyboard behaviour of a real <button>:
+// Enter activates on keydown (never on auto-repeat), Space on keyup.
+function _bindButtonKeys(el) {
+  el.addEventListener("keydown", (e) => {
+    if (e.target !== el || e.altKey || e.ctrlKey || e.metaKey || e.isComposing) return;
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      if (e.key === "Enter" && !e.repeat) el.click();
+    }
+  });
+  el.addEventListener("keyup", (e) => {
+    if (e.target !== el || e.key !== " ") return;
+    e.preventDefault();
+    el.click();
+  });
+}
+
+// Storage keys the popup watches. The literals match STORAGE_KEYS in
+// backend/storage.js (the popup does not load backend scripts).
+const PRIMARY_WINDOW_KEY = "primary-window-id";
+const LAST_RESTORE_ERROR_KEY = "ld-wsp-last-restore-error";
+
+// How long a workspace click keeps the popup open for the reply. A refusal
+// ("still starting up") comes back at once and must be shown before the
+// popup closes; a switch still running after this finishes in the
+// background page without the popup.
+const ACTIVATE_REPLY_GRACE_MS = 200;
+
+// Workspace names are capped at the limit the background enforces
+// (handler.js _sanitizeName, bookmark folder titles): 200 UTF-16 code units.
+// Cutting at the same limit here means a name is never cut again there, and
+// the cut never ends on the first half of a surrogate pair (half an emoji is
+// stored, and exported to bookmarks, as U+FFFD). Keep in sync with the
+// maxlength of #custom-dialog-input in wsp.html.
+const WSP_NAME_MAX = 200;
+function _clampWspName(name) {
+  let s = String(name).trim().slice(0, WSP_NAME_MAX);
+  if (/[\uD800-\uDBFF]$/.test(s)) s = s.slice(0, -1);
+  return s.trimEnd();
+}
+
+// The diagnostic dump is every ld-wsp-* storage key, including saved tab
+// addresses (tabSnapshot, lastActiveTabUrl) and recently closed tabs with
+// their titles and icons. The default copy keeps structure and counts but
+// cuts every web address down to its site and drops titles and icons, so a
+// dump pasted into a public bug report carries no browsing history or
+// tokens from URLs. Equal addresses get equal tags (salted per copy, so a
+// tag cannot be matched against a guessed address), which still shows
+// which saved entries point at the same page.
+const _DIAG_URL_RE = /\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>]*|\b(?:about|data|blob|javascript|view-source|mailto):[^\s"'<>]*/gi;
+function _redactDiagnostics(dump) {
+  const salt = Array.from(crypto.getRandomValues(new Uint32Array(2)), (n) => n.toString(36)).join("");
+  const tag = (s) => {
+    let h = 0x811c9dc5;
+    const t = salt + s;
+    for (let i = 0; i < t.length; i++) {
+      h = Math.imul(h ^ t.charCodeAt(i), 0x01000193) >>> 0;
+    }
+    return h.toString(16).padStart(8, "0");
+  };
+  const redactUrl = (u) => {
+    let url;
+    try { url = new URL(u); } catch { return `[url ${tag(u)}]`; }
+    if (/^(https?|wss?|ftp):$/.test(url.protocol)) {
+      const bare = url.pathname === "/" && !url.search && !url.hash && !url.username && !url.password;
+      return `${url.protocol}//${url.host}/` + (bare ? "" : `[${tag(u)}]`);
+    }
+    // about:home / about:newtab say something about the session; a query
+    // (about:reader?url=...) can hold a full address.
+    if (url.protocol === "about:") {
+      return `about:${url.pathname}` + (url.search || url.hash ? `[${tag(u)}]` : "");
+    }
+    return `${url.protocol}[${tag(u)}]`;
+  };
+  const walk = (v, key) => {
+    if (Array.isArray(v)) return v.map((x) => walk(x, key));
+    if (v && typeof v === "object") {
+      return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, walk(x, k)]));
+    }
+    if (typeof v !== "string" || v === "") return v;
+    if (key === "title") return "[title removed]";
+    if (key === "favIconUrl") return "[icon removed]";
+    return v.replace(_DIAG_URL_RE, redactUrl);
+  };
+  return walk(dump, null);
+}
 
 class WorkspaceUI {
   constructor() {
@@ -140,6 +363,10 @@ class WorkspaceUI {
     this.currentWindowId = null;
     this._dragDrop = null;
     this._tooltip = null;
+    this._fullUi = false;
+    this._activating = false;
+    this._copyingDiagnostics = false;
+    this._closedTabsSeq = 0;
   }
 
   async initialize() {
@@ -191,26 +418,73 @@ class WorkspaceUI {
       }
     });
 
+    // The recovery surface (banner, diagnostics link) needs messaging only
+    // and works in every state, including the restricted view: a failed or
+    // aborted restore leaves NO primary window at all. Start it first and in
+    // parallel, so a warning written while the popup loads is not missed.
+    this._setupDiagnosticsLink();
+    const bannerReady = this._setupRestoreErrorBanner();
+
+    await this._watchPrimaryWindow();
+    await bannerReady;
+    console.log("[WorkspaceUI][initialize] done");
+  }
+
+  // Show the workspace UI when this window is the primary one, a notice
+  // otherwise. A restart restore claims the primary window last, possibly
+  // while the popup is open, so follow storage.onChanged and switch to the
+  // full UI then. The listener is registered before the first read, so a
+  // claim landing in between is not lost.
+  async _watchPrimaryWindow() {
+    let changes = 0;
+    const apply = (primaryWindowId) => {
+      if (this._fullUi) return undefined; // once shown, the list stays
+      if (primaryWindowId === this.currentWindowId) {
+        this._fullUi = true;
+        browser.storage.onChanged.removeListener(onChanged);
+        return this._showWorkspaces();
+      }
+      this._showRestricted(primaryWindowId ?? null);
+      return undefined;
+    };
+    const onChanged = (c, area) => {
+      if (area !== "local" || !(PRIMARY_WINDOW_KEY in c)) return;
+      changes++;
+      Promise.resolve(apply(c[PRIMARY_WINDOW_KEY].newValue))
+        .catch(e => console.warn("[WorkspaceUI][_watchPrimaryWindow] switch failed:", e));
+    };
+    browser.storage.onChanged.addListener(onChanged);
+
+    const seen = changes;
     const primaryWindowId = await this._callBackgroundTask("getPrimaryWindowId");
     console.log("[WorkspaceUI][initialize] primaryWindowId:", primaryWindowId,
       "currentWindowId:", this.currentWindowId,
       "isPrimary:", primaryWindowId === this.currentWindowId);
-    if (primaryWindowId !== this.currentWindowId) {
-      console.log("[WorkspaceUI][initialize] not primary window — showing restricted UI");
-      document.getElementById("createNewWsp").style.display = "none";
-      document.getElementById("restoreFromBookmarks").style.display = "none";
-      document.getElementById("wsp-search").hidden = true;
-      const noWspLi = document.createElement("li");
-      noWspLi.className = "no-wsp";
-      noWspLi.textContent = "Workspaces are only available in the primary window.";
-      document.getElementById("wsp-list").replaceChildren(noWspLi);
-      // A failed or aborted restore leaves NO primary window at all, so this
-      // branch is the only UI the user can reach in that state. The recovery
-      // banner and diagnostics link need messaging only, not workspace data.
-      this._setupDiagnosticsLink();
-      await this._setupRestoreErrorBanner();
-      return;
-    }
+    // A change event during the read already applied a newer value.
+    if (changes === seen) await apply(primaryWindowId);
+  }
+
+  _showRestricted(primaryWindowId) {
+    console.log("[WorkspaceUI][initialize] not primary window -- showing restricted UI, primary:", primaryWindowId);
+    document.getElementById("createNewWsp").style.display = "none";
+    document.getElementById("restoreFromBookmarks").style.display = "none";
+    document.getElementById("wsp-search").hidden = true;
+    const noWspLi = document.createElement("li");
+    noWspLi.className = "no-wsp";
+    // No primary window at all: a restart restore claims it last, and a
+    // failed or paused restore leaves none (the banner explains that case).
+    noWspLi.textContent = primaryWindowId == null
+      ? "Workspaces are not active yet - right after Firefox starts, they appear here once the previous session is restored."
+      : "Workspaces are only available in the primary window.";
+    document.getElementById("wsp-list").replaceChildren(noWspLi);
+  }
+
+  async _showWorkspaces() {
+    // Undo the restricted view (this window became the primary while the
+    // popup was open).
+    document.getElementById("createNewWsp").style.display = "";
+    document.getElementById("restoreFromBookmarks").style.display = "";
+    document.getElementById("wsp-search").hidden = false;
 
     this._dragDrop = new DragDropHandler(
       this._callBackgroundTask.bind(this),
@@ -224,18 +498,26 @@ class WorkspaceUI {
       this.getWorkspaces(this.currentWindowId)
     ]);
     this.containers = containers || [];
-    this.workspaces.push(...(workspaces || []));
+    const wspList = document.getElementById("wsp-list");
+    wspList.replaceChildren();
+    if (Array.isArray(workspaces)) {
+      this.workspaces.push(...workspaces);
+    } else {
+      // A failed read is not an empty list: say so instead of showing none.
+      const errLi = document.createElement("li");
+      errLi.className = "no-wsp";
+      errLi.textContent = "Could not load the workspaces - close and reopen this popup to try again.";
+      wspList.appendChild(errLi);
+    }
     console.log("[WorkspaceUI][initialize] containers:", this.containers.length,
       "workspaces:", this.workspaces.length,
       this.workspaces.map(w => `"${w.name}"(${w.tabs.length}t,active:${w.active})`));
     this.displayWorkspaces();
+    this._bindArrowNavigation(wspList, ".wsp-row-main");
     this._setupCreateButton();
     this._setupRestoreButton();
-    this._setupDiagnosticsLink();
-    this._setupRestoreErrorBanner();
     this.setupSearch();
     this.showClosedTabs();
-    console.log("[WorkspaceUI][initialize] done");
   }
 
   // Render an inline banner when a restore-error payload is pending (see
@@ -255,29 +537,23 @@ class WorkspaceUI {
   // The banner stays in sync with the background via storage.onChanged.
   async _setupRestoreErrorBanner() {
     const banner = document.getElementById("wsp-error-banner");
-    if (!banner) return;
-    let info;
-    try {
-      info = await this._callBackgroundTask("getLastRestoreError");
-    } catch (e) {
-      console.debug("[WSP][_setupRestoreErrorBanner] getLastRestoreError failed:", e?.message);
-      return;
-    }
-    // Popup may have been torn down while we awaited the background reply.
-    // Re-fetch DOM nodes after the await and bail if any are missing.
     const text = document.getElementById("wsp-error-banner-text");
     const copyBtn = document.getElementById("wsp-error-copy");
     const ackBtn = document.getElementById("wsp-error-acknowledge");
     const giveUpBtn = document.getElementById("wsp-error-give-up");
-    if (!text || !copyBtn || !ackBtn || !giveUpBtn) return;
+    if (!banner || !text || !copyBtn || !ackBtn || !giveUpBtn) return;
 
     // Storage values can be edited via about:debugging; validate before
     // formatting them into user-visible text.
     const isFiniteNum = (v) => typeof v === "number" && Number.isFinite(v);
     // `when` of the payload currently rendered; echoed with dismiss/give-up.
     let displayedWhen = null;
+    // Bumped on every render. A fetched payload is rendered only if nothing
+    // rendered while it was in flight: a change event is always newer.
+    let renderSeq = 0;
 
     const render = (payload) => {
+      renderSeq++;
       if (!payload) {
         displayedWhen = null;
         banner.hidden = true;
@@ -336,12 +612,26 @@ class WorkspaceUI {
       banner.hidden = false;
     };
 
+    // Re-read the pending payload. False when the background could not be
+    // asked; the banner then keeps what it shows.
+    const refresh = async () => {
+      const seq = renderSeq;
+      let payload;
+      try {
+        payload = await this._request("getLastRestoreError");
+      } catch (e) {
+        console.debug("[WSP][_setupRestoreErrorBanner] getLastRestoreError failed:", e?.message);
+        return false;
+      }
+      if (seq === renderSeq) render(payload || null);
+      return true;
+    };
+
     // Keep the banner in sync with the background for the popup's lifetime:
     // a warning raised or replaced after open (slow session-loss export, a
-    // restore committing mid-popup) re-renders instead of going stale. The
-    // key literal matches STORAGE_KEYS.lastRestoreError in backend/storage.js
-    // (the popup does not load backend scripts).
-    const LAST_RESTORE_ERROR_KEY = "ld-wsp-last-restore-error";
+    // restore committing mid-popup) re-renders instead of going stale.
+    // Registered BEFORE the first read: a warning written between the
+    // background's read and a later registration would never reach this popup.
     browser.storage.onChanged.addListener((changes, area) => {
       if (area !== "local" || !(LAST_RESTORE_ERROR_KEY in changes)) return;
       render(changes[LAST_RESTORE_ERROR_KEY].newValue || null);
@@ -357,20 +647,25 @@ class WorkspaceUI {
       // even if the background storage write is slow. On failure or a stale
       // ack (payload changed since display) re-sync from storage so the
       // banner and the toolbar badge cannot disagree.
+      const when = displayedWhen;
       banner.hidden = true;
+      let result;
+      let error = null;
       try {
-        const result = await this._callBackgroundTask("acknowledgeLastRestoreError", { when: displayedWhen });
-        if (result && result.stale) {
-          const fresh = await this._callBackgroundTask("getLastRestoreError");
-          render(fresh);
-        }
+        result = await this._request("acknowledgeLastRestoreError", { when });
       } catch (e) {
         console.debug("[WSP][acknowledge] failed:", e?.message);
-        try { render(await this._callBackgroundTask("getLastRestoreError")); }
-        catch { banner.hidden = false; }
+        error = e;
       }
+      if (!error && !result?.stale) return;
+      if (!(await refresh())) banner.hidden = false;
+      if (error?.userFacing) await this._showFailure(error, null);
     });
     giveUpBtn.addEventListener("click", async () => {
+      // The confirm hides the banner while it is open, and the payload can
+      // change meanwhile (a restore committing, a session-loss warning):
+      // act only on the payload that was displayed when the user clicked.
+      const whenAtClick = displayedWhen;
       // showCustomDialog returns true on OK, false on Cancel for no-input dialogs.
       const ok = await showCustomDialog({
         message:
@@ -382,30 +677,49 @@ class WorkspaceUI {
           "If you have not copied the diagnostic dump yet, do that first."
       });
       if (!ok) return;
-      banner.hidden = true;
-      try {
-        const result = await this._callBackgroundTask("giveUpRestoreRetry", { when: displayedWhen });
-        if (result && result.stale) {
-          const fresh = await this._callBackgroundTask("getLastRestoreError");
-          render(fresh);
-          return;
-        }
-        if (result && result.exportedWorkspaces > 0) {
-          await showCustomDialog({
-            message: `Saved ${result.exportedWorkspaces} workspace(s) to bookmarks ` +
-              `under "Workspaces". Restore them any time via "Restore from bookmarks".`
-          });
-        } else if (result && result.alreadyExported) {
-          await showCustomDialog({
-            message: `The workspace tab lists were already saved to bookmarks under ` +
-              `"Workspaces". Restore them any time via "Restore from bookmarks".`
-          });
-        }
+      const showChanged = () => showCustomDialog({
+        message: "The restore status changed while this dialog was open, so nothing was given up." +
+          (banner.hidden ? "" : " The banner shows the current status."),
+        infoOnly: true
+      });
+      if (banner.hidden || displayedWhen !== whenAtClick) {
+        await showChanged();
+        return;
       }
-      catch (e) { console.debug("[WSP][giveUpRestoreRetry] failed:", e?.message); }
+      banner.hidden = true;
+      let result;
+      let error = null;
+      try {
+        result = await this._request("giveUpRestoreRetry", { when: whenAtClick });
+      } catch (e) {
+        console.debug("[WSP][giveUpRestoreRetry] failed:", e?.message);
+        error = e;
+      }
+      if (error || result?.stale) {
+        if (!(await refresh())) banner.hidden = false;
+        if (error) {
+          await this._showFailure(error, "Could not give up the restore retry. Please try again.");
+        } else {
+          await showChanged();
+        }
+        return;
+      }
+      if (result?.exportedWorkspaces > 0) {
+        await showCustomDialog({
+          message: `Saved ${result.exportedWorkspaces} workspace(s) to bookmarks ` +
+            `under "Workspaces". Restore them any time via "Restore from bookmarks".`,
+          infoOnly: true
+        });
+      } else if (result?.alreadyExported) {
+        await showCustomDialog({
+          message: `The workspace tab lists were already saved to bookmarks under ` +
+            `"Workspaces". Restore them any time via "Restore from bookmarks".`,
+          infoOnly: true
+        });
+      }
     });
 
-    render(info);
+    await refresh();
   }
 
   _setupDiagnosticsLink() {
@@ -417,26 +731,62 @@ class WorkspaceUI {
     });
   }
 
+  // Ask first, then copy: by default a redacted dump (see
+  // _redactDiagnostics), the full one only when the user ticks the box.
   async _copyDiagnostics() {
-    let dump;
+    // The banner button and the footer link share this; one dialog at a time.
+    if (this._copyingDiagnostics) return;
+    this._copyingDiagnostics = true;
     try {
-      dump = await this._callBackgroundTask("getDiagnostics");
-    } catch (e) {
-      console.warn("[WSP][_copyDiagnostics] failed:", e?.message);
-      await showCustomDialog({ message: "Failed to read diagnostics: " + (e?.message || e) });
-      return;
-    }
-    const json = JSON.stringify(dump, null, 2);
-    try {
-      await navigator.clipboard.writeText(json);
-      console.log("[WSP][_copyDiagnostics] copied", json.length, "chars");
-      await showCustomDialog({
-        message: `Diagnostics copied to clipboard (${json.length} chars). ` +
-          `Includes workspace metadata + URL snapshots -- review before sharing.`
+      const choice = await showCustomDialog({
+        message:
+          "Copy a diagnostic dump to the clipboard?\n\n" +
+          "It lists your workspaces (names, icons, colors, containers, window and tab ids, " +
+          "tab counts) and the saved restore state. Web addresses are cut down to their " +
+          "site, for example https://example.com/, and tab titles and icons are left out.\n\n" +
+          "Tick the box only if you were asked for the full dump: it also holds the complete " +
+          "address of every saved and recently closed tab - including any login or session " +
+          "tokens in them - and their titles.",
+        showCheckbox: true,
+        checkboxLabel: "Include full web addresses and tab titles",
+        checkboxDefault: false
       });
-    } catch (e) {
-      console.warn("[WSP][_copyDiagnostics] clipboard write failed:", e?.message);
-      await showCustomDialog({ message: "Clipboard write blocked. JSON length: " + json.length });
+      if (!choice) return;
+      const full = !!choice.checked;
+
+      let dump;
+      try {
+        dump = await this._request("getDiagnostics");
+      } catch (e) {
+        console.warn("[WSP][_copyDiagnostics] failed:", e?.message);
+      }
+      if (!dump || typeof dump !== "object") {
+        await showCustomDialog({
+          message: "Could not read the diagnostic data. Close and reopen this popup, then try again.",
+          infoOnly: true
+        });
+        return;
+      }
+      const json = JSON.stringify(full ? dump : _redactDiagnostics(dump), null, 2);
+      try {
+        await navigator.clipboard.writeText(json);
+      } catch (e) {
+        console.warn("[WSP][_copyDiagnostics] clipboard write failed:", e?.message);
+        await showCustomDialog({ message: "Clipboard write blocked. JSON length: " + json.length, infoOnly: true });
+        return;
+      }
+      console.log("[WSP][_copyDiagnostics] copied", json.length, "chars, full:", full);
+      await showCustomDialog({
+        message: full
+          ? `Full diagnostic dump copied to the clipboard (${json.length} characters). ` +
+            `It contains complete web addresses and tab titles - review it before sharing.`
+          : `Diagnostic dump copied to the clipboard (${json.length} characters). ` +
+            `Web addresses were cut down to their site and tab titles were left out - ` +
+            `review it before sharing.`,
+        infoOnly: true
+      });
+    } finally {
+      this._copyingDiagnostics = false;
     }
   }
 
@@ -463,7 +813,7 @@ class WorkspaceUI {
         const result = await showCustomDialog({
           message: "Create workspace:",
           withInput: true,
-          defaultValue: await this._callBackgroundTask("getWorkspaceName"),
+          defaultValue: (await this._callBackgroundTask("getWorkspaceName")) || "",
           showContainerPicker: this.containers.length > 0,
           containers: this.containers,
           showColorPicker: true
@@ -473,7 +823,7 @@ class WorkspaceUI {
           return;
         }
 
-        const wspName = result.name.trim().slice(0, 100);
+        const wspName = _clampWspName(result.name);
         if (wspName.length === 0) return;
         console.log("[WorkspaceUI][createNewWsp] creating workspace:", wspName,
           "icon:", result.icon || "(none)", "color:", result.color || null,
@@ -489,19 +839,30 @@ class WorkspaceUI {
           containerId: result.containerId || null
         };
 
-        const created = await this._callBackgroundTask("createWorkspaceWithTab", wsp);
-        if (!created) {
+        let created;
+        try {
+          created = await this._request("createWorkspaceWithTab", wsp);
+        } catch (err) {
           console.log("[WorkspaceUI][createNewWsp] create failed");
+          await this._showFailure(err, "Could not create the workspace. Please try again.");
+          return;
+        }
+        if (!created?.wspId) {
+          console.log("[WorkspaceUI][createNewWsp] create returned no workspace id");
           return;
         }
 
         wsp.id = created.wspId;
         wsp.tabs.push(created.tabId);
         this.workspaces.push(wsp);
-        console.log("[WorkspaceUI][createNewWsp] workspace created — wspId:", wsp.id, "tabId:", created.tabId);
+        console.log("[WorkspaceUI][createNewWsp] workspace created -- wspId:", wsp.id, "tabId:", created.tabId);
 
-        this._removePreviouslyActiveLi();
         this._addWorkspace(wsp);
+        // The new workspace is the active one now: move the flag in the
+        // model too, and show its (empty) Recently Closed list instead of
+        // the previous workspace's, whose Restore / Clear would act there.
+        this._setActiveWorkspace(wsp.id);
+        this.showClosedTabs();
       } finally {
         delete btn.dataset.busy;
       }
@@ -517,9 +878,15 @@ class WorkspaceUI {
       try {
         console.log("[WorkspaceUI][restoreFromBookmarks] clicked");
 
-        const folders = await this._callBackgroundTask("getBookmarkWorkspaces");
+        let folders;
+        try {
+          folders = await this._request("getBookmarkWorkspaces");
+        } catch (err) {
+          await this._showFailure(err, "Could not read the saved workspaces from bookmarks.");
+          return;
+        }
         if (!folders || folders.length === 0) {
-          await showCustomDialog({ message: "No saved workspaces found in bookmarks." });
+          await showCustomDialog({ message: "No saved workspaces found in bookmarks.", infoOnly: true });
           return;
         }
 
@@ -535,17 +902,19 @@ class WorkspaceUI {
         }
 
         console.log("[WorkspaceUI][restoreFromBookmarks] restoring folder:", result.folderId);
-        const restored = await this._callBackgroundTask("restoreWorkspaceFromBookmarks", {
-          folderId: result.folderId,
-          windowId: this.currentWindowId
-        });
-
-        if (!restored) {
+        let restored;
+        try {
+          restored = await this._request("restoreWorkspaceFromBookmarks", {
+            folderId: result.folderId,
+            windowId: this.currentWindowId
+          });
+        } catch (err) {
           console.log("[WorkspaceUI][restoreFromBookmarks] restore failed");
+          await this._showFailure(err, "Could not restore the workspace from bookmarks.");
           return;
         }
 
-        console.log("[WorkspaceUI][restoreFromBookmarks] restored:", restored.name, "tabs:", restored.tabCount);
+        console.log("[WorkspaceUI][restoreFromBookmarks] restored:", restored?.name, "tabs:", restored?.tabCount);
         window.close();
       } finally {
         delete restoreLink.dataset.busy;
@@ -561,69 +930,109 @@ class WorkspaceUI {
     const wspList = document.getElementById("wsp-list");
     const closedTabs = document.getElementById("wsp-closed-tabs");
     let debounceTimer = null;
+    let searchSeq = 0;
+    let pendingSearch = null;
+
+    const runSearch = async () => {
+      const seq = ++searchSeq;
+      const query = searchInput.value.trim();
+      if (query.length === 0) {
+        searchResults.hidden = true;
+        searchResults.replaceChildren();
+        wspList.hidden = false;
+        closedTabs.hidden = false;
+        this.showClosedTabs();
+        return;
+      }
+
+      const results = await this._callBackgroundTask("searchTabs", {
+        query,
+        windowId: this.currentWindowId
+      });
+      // Drop a stale reply: a newer search started, or the box changed
+      // (for example was cleared, and its own debounced run is still
+      // pending) while this one was in flight.
+      if (seq !== searchSeq || searchInput.value.trim() !== query) return;
+
+      searchResults.replaceChildren();
+      wspList.hidden = true;
+      closedTabs.hidden = true;
+
+      if (!results || results.length === 0) {
+        const empty = document.createElement("div");
+        empty.className = "wsp-search-empty";
+        // null is a failed search, not an empty result.
+        empty.textContent = results === null ? "Search is not available right now" : "No matching tabs found";
+        searchResults.replaceChildren(empty);
+        searchResults.hidden = false;
+        return;
+      }
+
+      for (const r of results) {
+        const item = document.createElement("div");
+        item.classList.add("wsp-search-result");
+        item.dataset.wspId = r.wspId;
+        item.dataset.tabId = r.tabId;
+        item.setAttribute("role", "button");
+        item.tabIndex = 0;
+        _bindButtonKeys(item);
+
+        const titleEl = document.createElement("span");
+        titleEl.classList.add("wsp-search-result-title");
+        titleEl.textContent = r.title;
+        item.appendChild(titleEl);
+
+        const wspEl = document.createElement("span");
+        wspEl.classList.add("wsp-search-result-wsp");
+        wspEl.textContent = r.wspName;
+        item.appendChild(wspEl);
+
+        item.addEventListener("click", () => {
+          if (this._activating) return;
+          this._activateWorkspace({
+            wspId: r.wspId,
+            windowId: this.currentWindowId,
+            tabId: r.tabId
+          });
+        });
+
+        searchResults.appendChild(item);
+      }
+      searchResults.hidden = false;
+    };
 
     searchInput.addEventListener("input", () => {
       clearTimeout(debounceTimer);
-      debounceTimer = setTimeout(async () => {
-        const query = searchInput.value.trim();
-        if (query.length === 0) {
-          searchResults.hidden = true;
-          searchResults.replaceChildren();
-          wspList.hidden = false;
-          closedTabs.hidden = false;
-          this.showClosedTabs();
-          return;
-        }
-
-        const results = await this._callBackgroundTask("searchTabs", {
-          query,
-          windowId: this.currentWindowId
-        });
-
-        searchResults.replaceChildren();
-        wspList.hidden = true;
-        closedTabs.hidden = true;
-
-        if (!results || results.length === 0) {
-          const empty = document.createElement("div");
-          empty.className = "wsp-search-empty";
-          empty.textContent = "No matching tabs found";
-          searchResults.replaceChildren(empty);
-          searchResults.hidden = false;
-          return;
-        }
-
-        for (const r of results) {
-          const item = document.createElement("div");
-          item.classList.add("wsp-search-result");
-          item.dataset.wspId = r.wspId;
-          item.dataset.tabId = r.tabId;
-
-          const titleEl = document.createElement("span");
-          titleEl.classList.add("wsp-search-result-title");
-          titleEl.textContent = r.title;
-          item.appendChild(titleEl);
-
-          const wspEl = document.createElement("span");
-          wspEl.classList.add("wsp-search-result-wsp");
-          wspEl.textContent = r.wspName;
-          item.appendChild(wspEl);
-
-          item.addEventListener("click", () => {
-            // Fire-and-forget, same rationale as the workspace click.
-            this._callBackgroundTask("activateWorkspace", {
-              wspId: r.wspId,
-              windowId: this.currentWindowId,
-              tabId: r.tabId
-            }).catch(() => {});
-            window.close();
-          });
-
-          searchResults.appendChild(item);
-        }
-        searchResults.hidden = false;
+      debounceTimer = setTimeout(() => {
+        debounceTimer = null;
+        pendingSearch = runSearch();
       }, 150);
     });
+
+    // Enter opens the first hit; Down moves into the results (or the list).
+    searchInput.addEventListener("keydown", async (e) => {
+      if (e.isComposing || e.keyCode === 229) return;
+      if (e.key === "Enter" && !e.repeat) {
+        e.preventDefault();
+        // Run a still-debounced search now, so the hit matches what was typed.
+        if (debounceTimer !== null) {
+          clearTimeout(debounceTimer);
+          debounceTimer = null;
+          pendingSearch = runSearch();
+        }
+        await pendingSearch;
+        if (!searchResults.hidden) searchResults.querySelector(".wsp-search-result")?.click();
+      } else if (e.key === "ArrowDown") {
+        const first = searchResults.hidden
+          ? wspList.querySelector(".wsp-row-main")
+          : searchResults.querySelector(".wsp-search-result");
+        if (first) {
+          e.preventDefault();
+          first.focus();
+        }
+      }
+    });
+    this._bindArrowNavigation(searchResults, ".wsp-search-result");
 
     // Focus search on Ctrl+F
     document.addEventListener("keydown", (e) => {
@@ -641,15 +1050,19 @@ class WorkspaceUI {
     const container = document.getElementById("wsp-closed-tabs");
     const list = document.getElementById("wsp-closed-tabs-list");
     const clearBtn = document.getElementById("wsp-closed-tabs-clear");
+    // Only the latest render may paint: an older one can still be waiting
+    // for the list of a workspace that is no longer active.
+    const seq = ++this._closedTabsSeq;
 
     const activeWsp = this.workspaces.find(w => w.active);
     if (!activeWsp) {
-      console.log("[WorkspaceUI][showClosedTabs] no active workspace — hiding section");
+      console.log("[WorkspaceUI][showClosedTabs] no active workspace -- hiding section");
       container.hidden = true;
       return;
     }
 
     const closedTabs = await this._callBackgroundTask("getClosedTabs", { wspId: activeWsp.id });
+    if (seq !== this._closedTabsSeq) return;
     console.log("[WorkspaceUI][showClosedTabs] activeWsp:", activeWsp.id, activeWsp.name,
       "closedTabs:", closedTabs?.length ?? 0);
     if (!closedTabs || closedTabs.length === 0) {
@@ -675,6 +1088,7 @@ class WorkspaceUI {
       restoreBtn.type = "button";
       restoreBtn.classList.add("wsp-closed-tab-restore");
       restoreBtn.title = "Restore tab";
+      restoreBtn.setAttribute("aria-label", `Restore "${tab.title || tab.url}"`);
 
       li.addEventListener("click", async () => {
         // Disable all closed-tab items to prevent double clicks
@@ -685,12 +1099,18 @@ class WorkspaceUI {
         // stored array mutates while the popup is open (new closures
         // unshift), so a render-time index can restore the wrong tab.
         console.log("[WorkspaceUI][restoreClosedTab] restoring:", tab.url);
-        await this._callBackgroundTask("restoreClosedTab", {
-          wspId: activeWsp.id,
-          url: tab.url,
-          closedAt: tab.closedAt,
-          windowId: this.currentWindowId
-        });
+        try {
+          // A null reply is not a failure: the entry was already restored
+          // or cleared, and the re-render below drops it.
+          await this._request("restoreClosedTab", {
+            wspId: activeWsp.id,
+            url: tab.url,
+            closedAt: tab.closedAt,
+            windowId: this.currentWindowId
+          });
+        } catch (err) {
+          await this._showFailure(err, "Could not restore the tab. Please try again.");
+        }
         this.showClosedTabs();
       });
 
@@ -700,45 +1120,114 @@ class WorkspaceUI {
 
     // Clear all handler
     clearBtn.onclick = async () => {
-      await this._callBackgroundTask("clearClosedTabs", { wspId: activeWsp.id });
+      try {
+        await this._request("clearClosedTabs", { wspId: activeWsp.id });
+      } catch (err) {
+        await this._showFailure(err, "Could not clear the recently closed tabs. Please try again.");
+        return;
+      }
       container.hidden = true;
     };
   }
 
-  async _callBackgroundTask(action, args) {
+  // Up/Down move focus between the items of a list (workspace rows, search
+  // results); Up from the first item returns to the search box.
+  _bindArrowNavigation(container, itemSelector) {
+    container.addEventListener("keydown", (e) => {
+      if (e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+      if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+      const items = [...container.querySelectorAll(itemSelector)];
+      const i = items.indexOf(e.target);
+      if (i === -1) return;
+      e.preventDefault();
+      const next = items[i + (e.key === "ArrowDown" ? 1 : -1)];
+      if (next) {
+        next.focus();
+      } else if (e.key === "ArrowUp" && !document.getElementById("wsp-search").hidden) {
+        document.getElementById("wsp-search-input").focus();
+      }
+    });
+  }
+
+  // Send `action` to the background and resolve with its reply. Rejects on
+  // a messaging failure (e.g. background not ready on a cold start) and on
+  // an `_error` reply; `err.userFacing` marks a deliberate refusal ("Cannot
+  // destroy the last workspace", "still starting up", ...) whose message is
+  // written for the user. Callers that must tell a failure from a null
+  // reply, or report the failure themselves, use this.
+  async _request(action, args) {
     const message = { action, ...args };
     if (WSP_DEBUG) {
-      console.log("[WorkspaceUI][_callBackgroundTask] ->", action,
+      console.log("[WorkspaceUI][_request] ->", action,
         args ? JSON.stringify(args) : "");
     }
     let result;
     try {
       result = await browser.runtime.sendMessage(message);
     } catch (e) {
-      // Messaging failure (e.g. background not ready on a cold start): fail
-      // soft like an _error reply instead of an unhandled rejection.
       console.error(`[Workspaces] ${action} failed:`, e?.message);
-      return null;
+      throw e instanceof Error ? e : new Error(String(e));
     }
     if (result && result._error) {
       console.error(`[Workspaces] ${action} failed:`, result.message);
-      // Deliberate, user-actionable refusals from the handler ("Cannot
-      // destroy the last workspace", "still starting up", ...) used to be
-      // flattened to null here, so the user clicked a button and nothing
-      // visibly happened. Surface them; fire-and-forget so callers that
-      // close the popup right after are not blocked.
-      if (result._userFacing && result.message) {
-        showCustomDialog({ message: result.message }).catch(() => {});
-      }
-      return null;
+      const err = new Error(result.message || "An internal error occurred");
+      err.userFacing = !!(result._userFacing && result.message);
+      throw err;
     }
     if (WSP_DEBUG) {
-      console.log("[WorkspaceUI][_callBackgroundTask] <-", action, "result:",
+      console.log("[WorkspaceUI][_request] <-", action, "result:",
         result === null ? "null" :
         Array.isArray(result) ? `[array len=${result.length}]` :
         typeof result === "object" ? `{${Object.keys(result).join(",")}}` : result);
     }
     return result;
+  }
+
+  // Fail-soft variant for reads and fire-and-forget calls: resolves with the
+  // reply, or null on any failure. A refusal meant for the user is still
+  // shown (fire-and-forget, so a caller is not blocked by the notice); a
+  // caller that gets null must not show a dialog of its own.
+  async _callBackgroundTask(action, args) {
+    try {
+      return await this._request(action, args);
+    } catch (e) {
+      if (e.userFacing) showCustomDialog({ message: e.message, infoOnly: true }).catch(() => {});
+      return null;
+    }
+  }
+
+  // Tell the user that an action failed: in the background's own words for
+  // a deliberate refusal, else `fallback` (nothing when it is null).
+  async _showFailure(err, fallback) {
+    const message = err?.userFacing ? err.message : fallback;
+    if (!message) return;
+    await showCustomDialog({ message, infoOnly: true }).catch(() => {});
+  }
+
+  // Ask the background to switch workspaces, then close the popup. The
+  // switch is not awaited in full (on large windows the hide/show cascade
+  // takes seconds, and the persistent background page finishes it without
+  // the popup), but a refusal comes back at once - the handler refuses
+  // while Firefox is still restoring the session - so wait briefly for it
+  // and keep the popup open to show it, instead of closing on a click that
+  // did nothing. `onFailed` undoes the caller's optimistic UI.
+  async _activateWorkspace(args, onFailed = null) {
+    this._activating = true;
+    const PENDING = {};
+    let timer;
+    const grace = new Promise((resolve) => { timer = setTimeout(() => resolve(PENDING), ACTIVATE_REPLY_GRACE_MS); });
+    const reply = this._request("activateWorkspace", args).then(() => null, (e) => e);
+    const early = await Promise.race([reply, grace]);
+    clearTimeout(timer);
+    if (early === PENDING || early === null) {
+      console.log("[WorkspaceUI][switchWorkspace] done -- closing popup");
+      window.close();
+      return;
+    }
+    console.log("[WorkspaceUI][switchWorkspace] refused:", early.message);
+    this._activating = false;
+    if (onFailed) onFailed();
+    await this._showFailure(early, "Could not switch workspaces. Please try again.");
   }
 
   _createWorkspaceItem(workspace) {
@@ -747,6 +1236,20 @@ class WorkspaceUI {
     if (workspace.active) li.classList.add("active");
     li.dataset.wspId = workspace.id;
     li.draggable = true;
+
+    // Row body: the keyboard and screen-reader target for switching, holding
+    // the dot, icon, name and tab count. A role="button" element, not a
+    // <button>, so dragging the row still works (Firefox does not start a
+    // drag from a <button>). The action buttons stay outside it: a button's
+    // children are presentational to assistive technology.
+    const main = document.createElement("div");
+    main.classList.add("wsp-row-main");
+    main.setAttribute("role", "button");
+    main.tabIndex = 0;
+    main.setAttribute("aria-keyshortcuts", "Alt+ArrowUp Alt+ArrowDown");
+    if (workspace.active) main.setAttribute("aria-current", "true");
+    _bindButtonKeys(main);
+    li.appendChild(main);
 
     // Container color dot (Tier 2) — always reserve space for alignment
     const dot = document.createElement("span");
@@ -760,12 +1263,13 @@ class WorkspaceUI {
     } else {
       dot.style.visibility = "hidden";
     }
-    li.appendChild(dot);
+    main.appendChild(dot);
 
     let iconEl = null;
     if (workspace.icon) {
       iconEl = _createIconElement(workspace.icon, "wsp-icon");
-      li.appendChild(iconEl);
+      iconEl.alt = ""; // decorative: the name follows
+      main.appendChild(iconEl);
     }
 
     const span1 = document.createElement("span");
@@ -773,28 +1277,39 @@ class WorkspaceUI {
     span1.spellcheck = false;
     span1.textContent = workspace.name;
     span1.title = workspace.name;
-    li.appendChild(span1);
+    main.appendChild(span1);
 
     const span2 = document.createElement("span");
     span2.classList.add("tabs-qty");
     span2.textContent = workspace.tabs.length + " tabs";
-    li.appendChild(span2);
+    main.appendChild(span2);
 
+    // Icon-only actions, in visual order (export, rename, delete) so Tab
+    // follows what the user sees. aria-label names the workspace.
     const exportBtn = document.createElement("button");
     exportBtn.type = "button";
     exportBtn.classList.add("edit-btn", "export-btn");
     exportBtn.title = "Export to bookmarks";
     li.appendChild(exportBtn);
 
-    const deleteBtn = document.createElement("button");
-    deleteBtn.type = "button";
-    deleteBtn.classList.add("edit-btn", "delete-btn");
-    li.appendChild(deleteBtn);
-
     const renameBtn = document.createElement("button");
     renameBtn.type = "button";
     renameBtn.classList.add("edit-btn", "rename-btn");
+    renameBtn.title = "Rename workspace";
     li.appendChild(renameBtn);
+
+    const deleteBtn = document.createElement("button");
+    deleteBtn.type = "button";
+    deleteBtn.classList.add("edit-btn", "delete-btn");
+    deleteBtn.title = "Delete workspace";
+    li.appendChild(deleteBtn);
+
+    const labelActions = (name) => {
+      exportBtn.setAttribute("aria-label", `Export workspace "${name}" to bookmarks`);
+      renameBtn.setAttribute("aria-label", `Rename workspace "${name}"`);
+      deleteBtn.setAttribute("aria-label", `Delete workspace "${name}"`);
+    };
+    labelActions(workspace.name);
 
     li.dataset.originalText = span1.textContent;
     li.dataset.wspIcon = workspace.icon || "";
@@ -808,36 +1323,39 @@ class WorkspaceUI {
     // ── Tab preview tooltip on hover (Tier 3) ──
     this._tooltip.attach(li, workspace.id, () => this._dragDrop.dragSrcEl !== null);
 
+    // Keyboard alternative to drag and drop: Alt+Up / Alt+Down.
+    main.addEventListener("keydown", (e) => {
+      if (!e.altKey || e.ctrlKey || e.metaKey || (e.key !== "ArrowUp" && e.key !== "ArrowDown")) return;
+      e.preventDefault();
+      this._dragDrop.moveBy(li, e.key === "ArrowUp" ? -1 : 1);
+    });
+
     // Switch workspace
     li.addEventListener("click", async () => {
       if (li.classList.contains("active")) {
-        console.log("[WorkspaceUI][switchWorkspace] already active:", workspace.id, "— no-op");
+        console.log("[WorkspaceUI][switchWorkspace] already active:", workspace.id, "-- no-op");
         return;
       }
+      // One switch at a time while the popup waits for the reply.
+      if (this._activating) return;
       console.log("[WorkspaceUI][switchWorkspace] activating:", workspace.id, workspace.name);
 
-      const lis = document.querySelectorAll("li.wsp-list-item.active");
-      for (const activeLi of lis) {
-        activeLi.classList.remove("active");
-      }
-      li.classList.add("active");
-
-      // Fire-and-forget: the background completes the activation regardless
-      // of popup lifetime (persistent MV2 page). Awaiting the full hide/show
-      // cascade here only froze the popup on large windows.
-      this._callBackgroundTask("activateWorkspace", {
-        wspId: workspace.id,
-        windowId: workspace.windowId
-      }).catch(() => {});
-      console.log("[WorkspaceUI][switchWorkspace] done — closing popup");
-      window.close();
+      // Optimistic: mark the row now, and put the mark back if refused.
+      const previousId = this.workspaces.find(w => w.active)?.id ?? null;
+      this._setActiveWorkspace(workspace.id);
+      await this._activateWorkspace(
+        { wspId: workspace.id, windowId: workspace.windowId },
+        () => this._setActiveWorkspace(previousId)
+      );
     });
 
     // Export to bookmarks
+    // Re-entrancy guards use data-busy, not `disabled`: a disabled button
+    // cannot take focus back when the dialog closes.
     exportBtn.addEventListener("click", async (e) => {
       e.stopPropagation();
-      if (exportBtn.disabled) return;
-      exportBtn.disabled = true;
+      if (exportBtn.dataset.busy) return;
+      exportBtn.dataset.busy = "1";
       try {
         console.log("[WorkspaceUI][exportBtn] clicked for workspace:", workspace.id, workspace.name);
 
@@ -854,13 +1372,20 @@ class WorkspaceUI {
         }
 
         // Single background call handles both export and optional destroy
-        const exportResult = await this._callBackgroundTask("exportWorkspaceToBookmarks", {
-          wspId: workspace.id,
-          windowId: this.currentWindowId,
-          destroyAfter: !!result.checked
-        });
-        if (!exportResult) {
+        let exportResult;
+        let exportError = null;
+        try {
+          exportResult = await this._request("exportWorkspaceToBookmarks", {
+            wspId: workspace.id,
+            windowId: this.currentWindowId,
+            destroyAfter: !!result.checked
+          });
+        } catch (err) {
+          exportError = err;
+        }
+        if (exportError || !exportResult) {
           console.log("[WorkspaceUI][exportBtn] export failed");
+          await this._showFailure(exportError, "Could not export the workspace to bookmarks.");
           return;
         }
         console.log("[WorkspaceUI][exportBtn] exported", exportResult.exported,
@@ -870,28 +1395,21 @@ class WorkspaceUI {
         // silently not closing) tabs the user believes are backed up is the
         // data-loss path this dialog exists to prevent.
         if (result.checked && !exportResult.destroyed && exportResult.destroyRefusedMessage) {
-          await showCustomDialog({ message: exportResult.destroyRefusedMessage });
+          await showCustomDialog({ message: exportResult.destroyRefusedMessage, infoOnly: true });
         } else if (exportResult.exported < exportResult.total) {
           await showCustomDialog({
             message: `Exported ${exportResult.exported} of ${exportResult.total} tabs. ` +
               `${exportResult.total - exportResult.exported} tab(s) could not be bookmarked ` +
-              `(pages like about:, file: or reader view cannot be saved as bookmarks).`
+              `(pages like about:, file: or reader view cannot be saved as bookmarks).`,
+            infoOnly: true
           });
         }
 
         if (exportResult.destroyed) {
-          const wasActive = li.classList.contains("active");
-          if (li.parentNode) {
-            const liParent = li.parentElement;
-            li.parentNode.removeChild(li);
-            if (wasActive && exportResult.activatedWspId) {
-              const targetLi = liParent.querySelector(`[data-wsp-id="${exportResult.activatedWspId}"]`);
-              if (targetLi) targetLi.classList.add("active");
-            }
-          }
+          this._dropWorkspace(li, workspace, exportResult.activatedWspId);
         }
       } finally {
-        exportBtn.disabled = false;
+        delete exportBtn.dataset.busy;
       }
     });
 
@@ -917,45 +1435,55 @@ class WorkspaceUI {
       });
 
       if (result !== false) {
-        const wspName = result.name.trim().slice(0, 100);
+        const originalName = li.dataset.originalText;
+        // An untouched name is kept as it is, never cut again (a name
+        // restored from a bookmark folder title can be longer than what
+        // the popup lets you type).
+        const wspName = result.name === originalName ? originalName : _clampWspName(result.name);
         if (wspName.length === 0) return;
         const wspIcon = result.icon || "";
 
         const wspColor = result.color;
-        const nameChanged = wspName !== li.dataset.originalText;
+        const nameChanged = wspName !== originalName;
         const iconChanged = wspIcon !== (li.dataset.wspIcon || "");
         const colorChanged = wspColor !== (workspace.color || null);
         const containerChanged = result.containerId !== undefined && result.containerId !== (workspace.containerId || null);
-        console.log("[WorkspaceUI][renameBtn] changes — name:", nameChanged,
+        console.log("[WorkspaceUI][renameBtn] changes -- name:", nameChanged,
           "icon:", iconChanged, "color:", colorChanged, "container:", containerChanged,
           "| new values: name:", wspName, "icon:", wspIcon, "color:", wspColor,
           "containerId:", result.containerId);
 
         if (!nameChanged && !iconChanged && !containerChanged && !colorChanged) {
-          console.log("[WorkspaceUI][renameBtn] no changes detected — skipping");
+          console.log("[WorkspaceUI][renameBtn] no changes detected -- skipping");
           return;
         }
 
+        // Show the new values only once the background stored them.
+        try {
+          await this._request("renameWorkspace", { wspId: workspace.id, wspName, wspIcon, wspColor });
+        } catch (err) {
+          await this._showFailure(err, "Could not save the workspace changes. Please try again.");
+          return;
+        }
+
+        workspace.name = wspName;
+        workspace.icon = wspIcon;
         li.dataset.originalText = wspName;
         li.dataset.wspIcon = wspIcon;
         span1.textContent = wspName;
+        span1.title = wspName;
+        labelActions(wspName);
 
         // Update icon element
         if (iconEl && iconEl.parentElement) iconEl.remove();
         if (wspIcon) {
           iconEl = _createIconElement(wspIcon, "wsp-icon");
-          // Insert after container dot if present
-          const firstSpan = li.querySelector("span:not(.wsp-container-dot)");
-          if (firstSpan) {
-            li.insertBefore(iconEl, firstSpan);
-          } else {
-            li.appendChild(iconEl);
-          }
+          iconEl.alt = "";
+          // Between the container dot and the name
+          span1.before(iconEl);
         } else {
           iconEl = null;
         }
-
-        await this._callBackgroundTask("renameWorkspace", { wspId: workspace.id, wspName, wspIcon, wspColor });
 
         // Update color bar
         if (colorChanged) {
@@ -965,11 +1493,16 @@ class WorkspaceUI {
 
         // Update container if changed
         if (containerChanged) {
+          try {
+            await this._request("setWorkspaceContainer", {
+              wspId: workspace.id,
+              containerId: result.containerId
+            });
+          } catch (err) {
+            await this._showFailure(err, "Could not change the workspace's container. Please try again.");
+            return;
+          }
           workspace.containerId = result.containerId;
-          await this._callBackgroundTask("setWorkspaceContainer", {
-            wspId: workspace.id,
-            containerId: result.containerId
-          });
 
           // Update container dot (always keep element for alignment)
           const existingDot = li.querySelector(".wsp-container-dot");
@@ -996,8 +1529,8 @@ class WorkspaceUI {
     // Delete
     deleteBtn.addEventListener("click", async (e) => {
       e.stopPropagation();
-      if (deleteBtn.disabled) return;
-      deleteBtn.disabled = true;
+      if (deleteBtn.dataset.busy) return;
+      deleteBtn.dataset.busy = "1";
       try {
         console.log("[WorkspaceUI][deleteBtn] clicked for workspace:", workspace.id, workspace.name);
 
@@ -1012,30 +1545,22 @@ class WorkspaceUI {
         const wasActive = li.classList.contains("active");
         console.log("[WorkspaceUI][deleteBtn] confirmed -- wasActive:", wasActive, "wspId:", workspace.id);
 
-        const destroyResult = await this._callBackgroundTask("destroyWsp", {
-          wspId: workspace.id,
-          windowId: this.currentWindowId,
-        });
-        if (!destroyResult) {
+        let destroyResult;
+        try {
+          destroyResult = await this._request("destroyWsp", {
+            wspId: workspace.id,
+            windowId: this.currentWindowId,
+          });
+        } catch (err) {
           console.log("[WorkspaceUI][deleteBtn] destroy failed");
+          await this._showFailure(err, "Could not delete the workspace. Please try again.");
           return;
         }
 
-        if (li.parentNode) {
-          const liParent = li.parentElement;
-          li.parentNode.removeChild(li);
-
-          if (wasActive && destroyResult.activatedWspId) {
-            const targetLi = liParent.querySelector(`[data-wsp-id="${destroyResult.activatedWspId}"]`);
-            if (targetLi) {
-              console.log("[WorkspaceUI][deleteBtn] marking activated:", destroyResult.activatedWspId);
-              targetLi.classList.add("active");
-            }
-          }
-        }
+        this._dropWorkspace(li, workspace, destroyResult?.activatedWspId);
         console.log("[WorkspaceUI][deleteBtn] done");
       } finally {
-        deleteBtn.disabled = false;
+        delete deleteBtn.dataset.busy;
       }
     });
 
@@ -1055,16 +1580,55 @@ class WorkspaceUI {
   _addWorkspace(workspace) {
     const wspList = document.getElementById("wsp-list");
     const li = this._createWorkspaceItem(workspace);
+    // A "could not load" notice is stale once a row exists.
+    wspList.querySelector("li.no-wsp")?.remove();
     wspList.appendChild(li);
     // No sorting — order is now controlled by drag-and-drop / backend order
     return li;
   }
 
-  _removePreviouslyActiveLi() {
-    const lis = document.querySelectorAll(".wsp-list-item.active");
-    for (const li of lis) {
-      li.classList.remove("active");
+  // Make `wspId` the active workspace in the popup's model and rows (null:
+  // none). Recently Closed and its Restore / Clear follow the model, so every
+  // popup action that changes the active workspace goes through here.
+  _setActiveWorkspace(wspId) {
+    for (const w of this.workspaces) w.active = w.id === wspId;
+    for (const row of document.querySelectorAll("#wsp-list li.wsp-list-item")) {
+      this._setRowActive(row, row.dataset.wspId === wspId);
     }
+  }
+
+  // A workspace was destroyed (delete, or export + close): drop its row and
+  // its model entry. When it was the active one, the background activated
+  // `activatedWspId`, so move the active mark there and show that
+  // workspace's Recently Closed list.
+  _dropWorkspace(li, workspace, activatedWspId) {
+    const wasActive = workspace.active || li.classList.contains("active");
+    if (li.parentNode) this._removeRow(li);
+    const i = this.workspaces.indexOf(workspace);
+    if (i !== -1) this.workspaces.splice(i, 1);
+    if (wasActive) {
+      console.log("[WorkspaceUI][_dropWorkspace] marking activated:", activatedWspId ?? null);
+      this._setActiveWorkspace(activatedWspId ?? null);
+      this.showClosedTabs();
+    }
+  }
+
+  // Keep the visual "active" class and the screen-reader state in step.
+  _setRowActive(li, active) {
+    li.classList.toggle("active", active);
+    const main = li.querySelector(".wsp-row-main");
+    if (!main) return;
+    if (active) main.setAttribute("aria-current", "true");
+    else main.removeAttribute("aria-current");
+  }
+
+  // Remove a workspace row. If it held keyboard focus, hand focus to the
+  // neighbouring row instead of letting it fall to <body>.
+  _removeRow(li) {
+    const neighbour = li.nextElementSibling || li.previousElementSibling;
+    const hadFocus = li.contains(document.activeElement);
+    li.remove();
+    if (hadFocus) neighbour?.querySelector(".wsp-row-main")?.focus();
   }
 }
 

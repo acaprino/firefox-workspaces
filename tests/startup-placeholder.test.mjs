@@ -11,9 +11,11 @@ async function startupFixture(t, url) {
   t.after(() => {
     for (const timer of env.get("TabService")._snapshotTimers.values()) clearTimeout(timer);
     clearTimeout(env.get("Brainer")._restoreRetryTimer);
+    clearTimeout(env.get("Brainer")._initRetryTimer);
     clearTimeout(env.get("WorkspaceService")._lastActiveTimer);
   });
   env.get("LIMITS").RESTORE_DELAY_MS = 5;
+  env.get("LIMITS").RESTORE_WINDOW_DELAY_MS = 5;
   const saved = {
     "primary-window-id": 1,
     "ld-wsp-window-1": [WSP_A, WSP_B],
@@ -197,14 +199,18 @@ test("giving up recovery cancels pending automatic retries", async t => {
   const result = await env.get("_handleMessage")({ action: "giveUpRestoreRetry" });
   assert.equal(result.success, true);
   assert.equal(env.storageData["primary-window-last-id"], undefined);
+  assert.equal(Brainer._pendingRestore, null);
+  const freshIds = [...env.storageData["ld-wsp-window-1"]];
+  assert.equal(freshIds.includes(WSP_B), false, "give-up starts a fresh workspace instead of adopting the old record");
   env.liveTabs[0].url = "https://example.com/saved-other";
   await fire(env.browser.tabs.onUpdated, 1, { url: env.liveTabs[0].url }, env.liveTabs[0]);
   await env.settle(30);
-  assert.equal(env.storageData["primary-window-id"], undefined);
+  assert.equal(env.storageData["primary-window-id"], 1);
+  assert.deepEqual([...env.storageData["ld-wsp-window-1"]], freshIds);
   assert.deepEqual(env.storageData[`ld-wsp-${WSP_B}`], env.saved[`ld-wsp-${WSP_B}`]);
 });
 
-test("give-up cannot discard records while automatic recovery is reading them", async t => {
+test("give-up waits for automatic recovery before touching its records", async t => {
   const env = await startupFixture(t, "about:blank");
   const Brainer = env.get("Brainer");
   await assert.rejects(Brainer._repairTabAssignments(1, true), /Refuse-to-wipe/);
@@ -220,12 +226,14 @@ test("give-up cannot discard records while automatic recovery is reading them", 
   };
   await fire(env.browser.tabs.onUpdated, 1, { url: env.liveTabs[0].url }, env.liveTabs[0]);
   await waitUntil(env, () => readingSession);
-  const result = await env.get("_handleMessage")({ action: "giveUpRestoreRetry" });
-  assert.equal(result.success, false, "refresh the warning instead of claiming to cancel an active restore");
-  assert.equal(result.stale, true);
+  const givingUp = env.get("_handleMessage")({ action: "giveUpRestoreRetry" });
+  await env.settle(5);
   assert.equal(env.storageData["primary-window-last-id"], 1);
   release();
+  const result = await givingUp;
+  assert.equal(result.success, true);
   await waitUntil(env, () => Brainer._state === "ready" && !Brainer._restoreInFlight);
+  assert.equal(env.storageData["primary-window-id"], 1);
   assert.equal(env.storageData[`ld-wsp-${WSP_B}`].name, "Other");
   assert.deepEqual([...env.storageData[`ld-wsp-${WSP_B}`].tabs], [1]);
 });

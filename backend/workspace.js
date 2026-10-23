@@ -21,7 +21,10 @@ class Workspace {
       "active:", state.active, "containerId:", state.containerId || null);
     const wsp = new Workspace(wspId, state);
     await WSPStorageManager.addWsp(wspId, state.windowId);
-    await wsp._saveState();
+    // Whole-record write under the workspace lock: restore re-creates
+    // records under reused ids, and a locked writer holding a pre-restore
+    // copy (e.g. a snapshot refresh) must not interleave with it.
+    await WSPStorageManager.withWorkspaceLock(wspId, () => wsp._saveState());
     console.log("[Workspace][create] done — wspId:", wspId);
     return wsp;
   }
@@ -55,6 +58,11 @@ class Workspace {
     // sees this wspId, so removeTabFromWorkspace becomes a no-op and cannot
     // re-create zombie state for the workspace we are about to delete.
     // deleteWspState and clearClosedTabs can come in any order after.
+    // Tombstone first: a background that dies before tabs.remove below
+    // leaves hidden tabs tagged with this id and no record, which the next
+    // init used to adopt into the active workspace -- tabs the user deleted
+    // coming back (X-96). The tombstone lets init finish the close instead.
+    await WSPStorageManager.addPendingDestroy(this.id);
     await WSPStorageManager.removeWsp(this.id, this.windowId);
     await WSPStorageManager.deleteWspState(this.id);
     await WSPStorageManager.clearClosedTabs(this.id);
@@ -78,6 +86,7 @@ class Workspace {
         }
       }
     }
+    await WSPStorageManager.removePendingDestroy(this.id);
     console.log("[Workspace][destroy] done — id:", this.id);
   }
 
@@ -88,9 +97,15 @@ class Workspace {
     console.log("[Workspace][activate] id:", this.id, "name:", this.name,
       "tabs:", this.tabs.length, "groups:", this.groups.length,
       "activeTabId param:", activeTabId, "lastActiveTabId:", this.lastActiveTabId);
+    const storedTabs = this.tabs;
     this.tabs = await Workspace._filterValidTabs(this.tabs, this.windowId,
       allTabsHint ? new Set(allTabsHint.map(t => t.id)) : null);
     console.log("[Workspace][activate] valid tabs:", this.tabs.length);
+    // Exactly the ids found closed here; the final save drops only these
+    // from the fresh record (a tab filed meanwhile is not in allTabsHint).
+    const validNow = new Set(this.tabs);
+    const staleIds = new Set(storedTabs.filter(id => !validNow.has(id)));
+    let fallbackTabId = null;
 
     // reconstruct groups
     if (this.tabs.length > 0) {
@@ -100,18 +115,24 @@ class Workspace {
         group.tabs = group.tabs.filter(tabId => validTabSet.has(tabId));
         if (group.tabs.length > 0) {
           console.log("[Workspace][activate] grouping", group.tabs.length, "tabs for group:", group.title);
-          const groupId = await browser.tabs.group({tabIds: group.tabs});
-          await browser.tabGroups.update(groupId, {
-            title: group.title,
-            color: group.color,
-            collapsed: group.collapsed
-          });
+          // Cosmetic: tabs.group rejects the whole call when one tab closed
+          // meanwhile, and that used to abort the activation (X-104, X-29).
+          try {
+            const groupId = await browser.tabs.group({tabIds: group.tabs.filter(id => !TabService.wasRemoved(id))});
+            await browser.tabGroups.update(groupId, {
+              title: group.title,
+              color: group.color,
+              collapsed: group.collapsed
+            });
+          } catch (e) {
+            console.debug("[Workspace][activate] could not regroup", group.title, ":", e.message);
+          }
         }
       }
 
-      // show tabs
+      // show tabs (tolerates a tab closing meanwhile, X-104)
       console.log("[Workspace][activate] showing", this.tabs.length, "tabs");
-      await browser.tabs.show(this.tabs);
+      await TabService.showTabs(this.tabs);
     } else {
       console.log("[Workspace][activate] no tabs to show");
     }
@@ -129,34 +150,72 @@ class Workspace {
       const tabToFocus = isValid ? tabIdToActivate : this.tabs[0];
       console.log("[Workspace][activate] activating tab:", tabToFocus,
         isValid ? "(lastActive/requested)" : "(fallback: first tab)");
-      await browser.tabs.update(tabToFocus, {active: true});
+      // A tab that closed since the query must not abort the activation
+      // (X-29): fall back to another tab of this workspace.
+      for (const id of [tabToFocus, ...this.tabs.filter(t => t !== tabToFocus)]) {
+        try {
+          await browser.tabs.update(id, {active: true});
+          break;
+        } catch (e) {
+          console.debug("[Workspace][activate] could not select tab", id, ":", e.message);
+        }
+      }
     } else {
       console.log("[Workspace][activate] no tabs at all -- creating fallback tab");
       // Guard against onCreated racing with the manual tabs.push below:
       // the reopen guard tells addTabToWorkspace to skip this tab.
       await TabService.withReopenGuard(async () => {
         const fallbackTab = await this._createTabFallback();
+        fallbackTabId = fallbackTab.id;
         this.tabs.push(fallbackTab.id);
         await TabService.setTabSessionValue(fallbackTab.id, this.id);
       });
     }
+    const shown = new Set(this.tabs);
 
-    // Save tab URL snapshot for restart resilience
+    // Live tab map for the URL snapshot (restart resilience)
+    let tabMap = null;
     try {
       const allTabs = allTabsHint
         ? allTabsHint.filter(t => !t.pinned)
         : await browser.tabs.query({windowId: this.windowId, pinned: false});
-      const tabMap = new Map(allTabs.map(t => [t.id, t]));
-      this.tabSnapshot = this.tabs
-        .map(id => tabMap.get(id))
-        .filter(t => t && t.url)
-        .map(t => t.url);
-      console.log("[Workspace][activate] snapshot saved:", this.tabSnapshot.length, "URLs");
-    } catch (e) { console.debug("[Workspace][activate] snapshot save failed:", e.message); }
+      tabMap = new Map(allTabs.map(t => [t.id, t]));
+    } catch (e) { console.debug("[Workspace][activate] snapshot query failed:", e.message); }
 
-    this.active = true;
-    await this._saveState();
+    // Persist field by field onto the fresh record under the workspace lock.
+    // Saving `this` whole reverted every locked write that landed during the
+    // awaits above: a tab filed or moved into this workspace, a rename, a
+    // container change, a tab closed mid-activation.
+    const saved = await WSPStorageManager.mutateWorkspace(this.id, (fresh) => {
+      fresh.tabs = fresh.tabs.filter(id => !staleIds.has(id));
+      if (fallbackTabId != null && !fresh.tabs.includes(fallbackTabId)) fresh.tabs.push(fallbackTabId);
+      const member = new Set(fresh.tabs);
+      for (const group of fresh.groups) group.tabs = group.tabs.filter(id => member.has(id));
+      if (tabMap) {
+        fresh.tabSnapshot = fresh.tabs
+          .map(id => tabMap.get(id))
+          .filter(t => t && t.url)
+          .map(t => t.url);
+        console.log("[Workspace][activate] snapshot saved:", fresh.tabSnapshot.length, "URLs");
+      }
+      fresh.active = true;
+    });
+    if (!saved) {
+      console.warn("[Workspace][activate] id:", this.id, "destroyed mid-activation -- nothing saved");
+      return false;
+    }
+    // Callers read the result (active cache, container, toolbar).
+    Object.assign(this, saved);
+
+    // Tabs filed here during the activation were hidden as another
+    // workspace's tabs; this workspace is active now, so show them.
+    const late = this.tabs.filter(id => !shown.has(id));
+    if (late.length > 0) {
+      console.log("[Workspace][activate] showing", late.length, "tab(s) filed during activation:", late);
+      await TabService.showTabs(late);
+    }
     console.log("[Workspace][activate] done — id:", this.id);
+    return true;
   }
 
   async updateTabGroups() {
@@ -181,35 +240,35 @@ class Workspace {
     // Persist only the groups field onto a fresh record under the workspace
     // lock: saving `this` whole would clobber any tabs[] change a concurrent
     // locked writer landed since we were constructed.
-    await WSPStorageManager.withWorkspaceLock(this.id, async () => {
-      const fresh = await WSPStorageManager.getWorkspace(this.id);
-      if (fresh.windowId == null) return; // destroyed meanwhile
+    await WSPStorageManager.mutateWorkspace(this.id, (fresh) => {
       fresh.groups = this.groups;
-      await fresh._saveState();
     });
   }
 
   static async rename(wspId, { name, icon, color } = {}) {
     console.log("[Workspace][rename] wspId:", wspId,
       "name:", name, "icon:", icon, "color:", color);
-    // Full-record read-modify-write: take the workspace lock so a concurrent
-    // tab add/remove (which also rewrites the record) cannot be lost.
-    await WSPStorageManager.withWorkspaceLock(wspId, async () => {
-      const state = await WSPStorageManager.getWspState(wspId);
-      const oldName = state.name;
-      const oldIcon = state.icon;
-      const oldColor = state.color;
-      if (name !== undefined) state.name = name;
-      if (icon !== undefined) state.icon = icon;
-      if (color !== undefined) state.color = color;
-      console.log("[Workspace][rename] changes — name:", oldName, "->", state.name,
-        "| icon:", oldIcon, "->", state.icon, "| color:", oldColor, "->", state.color);
-      // Re-construct through Workspace to apply constructor normalization
-      const wsp = new Workspace(wspId, state);
-      await wsp._saveState();
+    // Locked read-modify-write so a concurrent tab add/remove (which also
+    // rewrites the record) cannot be lost. A workspace destroyed while the
+    // rename dialog was open is reported, not resurrected as a zombie record.
+    const saved = await WSPStorageManager.mutateWorkspace(wspId, (fresh) => {
+      const oldName = fresh.name;
+      const oldIcon = fresh.icon;
+      const oldColor = fresh.color;
+      // Same normalization as the constructor
+      if (name !== undefined) fresh.name = name || 'Unnamed Workspace';
+      if (icon !== undefined) fresh.icon = icon || "";
+      if (color !== undefined) fresh.color = color ?? null;
+      console.log("[Workspace][rename] changes -- name:", oldName, "->", fresh.name,
+        "| icon:", oldIcon, "->", fresh.icon, "| color:", oldColor, "->", fresh.color);
     });
+    if (!saved) throw new Error(Workspace.NOT_FOUND_MESSAGE);
     console.log("[Workspace][rename] done — wspId:", wspId);
   }
+
+  // User-facing refusal for edits aimed at a workspace that no longer exists
+  // (handler.js surfaces errors starting with "Workspace not found").
+  static NOT_FOUND_MESSAGE = "Workspace not found - it was deleted in the meantime.";
 
   // Create a new tab for this workspace, falling back to no container if the
   // stored containerId is stale (container was deleted by the user or by Firefox).
@@ -220,21 +279,32 @@ class Workspace {
     if (this.containerId) {
       if (!await TabService._verifyContainer(this.containerId)) {
         console.warn("[Workspaces] _createTabFallback: container %s not found, clearing", this.containerId);
-        this.containerId = null;
-        await this._saveState();
+        await this._clearStaleContainer();
       } else {
         try {
           console.log("[Workspace][_createTabFallback] creating tab in container:", this.containerId);
           return await browser.tabs.create({ ...baseOpts, cookieStoreId: this.containerId });
         } catch (e) {
           console.warn("[Workspaces] _createTabFallback: tabs.create failed:", this.containerId, e.message);
-          this.containerId = null;
-          await this._saveState();
+          await this._clearStaleContainer();
         }
       }
     }
     console.log("[Workspace][_createTabFallback] creating plain tab (no container)");
     return await browser.tabs.create(baseOpts);
+  }
+
+  // Drop an unusable container binding. Only the containerId field, and only
+  // if the fresh record still names the stale container: a full save of
+  // `this` used to revert concurrent locked writes, and a concurrent
+  // setWorkspaceContainer to a working container must survive.
+  async _clearStaleContainer() {
+    const stale = this.containerId;
+    this.containerId = null;
+    await WSPStorageManager.mutateWorkspace(this.id, (fresh) => {
+      if (fresh.containerId !== stale) return false;
+      fresh.containerId = null;
+    });
   }
 
   async _saveState() {

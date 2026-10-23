@@ -99,14 +99,21 @@ class MenuService {
   static refreshTabMenu() {
     clearTimeout(MenuService._refreshTimer);
     MenuService._refreshTimer = setTimeout(async () => {
-      console.log("[MenuService][refreshTabMenu] rebuilding menu (debounced)");
-      await browser.menus.removeAll();
-      if (!MenuService._onClickedRegistered) {
-        browser.menus.onClicked.addListener(MenuService._onMenuClicked);
-        MenuService._onClickedRegistered = true;
-        console.log("[MenuService][refreshTabMenu] onClicked listener registered");
+      MenuService._refreshTimer = null;
+      try {
+        console.log("[MenuService][refreshTabMenu] rebuilding menu (debounced)");
+        await browser.menus.removeAll();
+        if (!MenuService._onClickedRegistered) {
+          browser.menus.onClicked.addListener(MenuService._onMenuClicked);
+          MenuService._onClickedRegistered = true;
+          console.log("[MenuService][refreshTabMenu] onClicked listener registered");
+        }
+        await MenuService.initializeTabMenu();
+      } catch (e) {
+        // The last window may close before this delayed refresh starts.
+        // Its failure must not escape the timer as an unhandled rejection.
+        console.debug("[MenuService][refreshTabMenu] refresh failed:", e?.message);
       }
-      await MenuService.initializeTabMenu();
     }, LIMITS.MENU_DEBOUNCE_MS);
   }
 

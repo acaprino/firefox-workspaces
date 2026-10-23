@@ -17,7 +17,7 @@ function initializedWorkspaceData() {
   };
 }
 
-async function healthyBackend() {
+async function healthyBackend(t) {
   const env = loadBackend({
     storageData: initializedWorkspaceData(),
     overrides: {
@@ -28,18 +28,23 @@ async function healthyBackend() {
       sessions: { getTabValue: async () => WSP_ID },
     },
   });
+  t.after(() => {
+    clearTimeout(env.get("Brainer")._initRetryTimer);
+    clearTimeout(env.get("Brainer")._restoreRetryTimer);
+    for (const timer of env.get("TabService")._snapshotTimers.values()) clearTimeout(timer);
+  });
   await env.settle();
   return env;
 }
 
-test("a toolbar failure after initialization keeps workspace commands available", async () => {
-  const env = await healthyBackend();
+test("a toolbar failure after initialization keeps workspace commands available", async t => {
+  const env = await healthyBackend(t);
   let titleAttempts = 0;
   env.browser.browserAction.setTitle = async () => {
     if (++titleAttempts === 1) throw new Error("Toolbar temporarily unavailable");
   };
 
-  await assert.rejects(env.get("Brainer").initialize(), /Toolbar temporarily unavailable/);
+  await env.get("Brainer").initialize();
 
   assert.equal(titleAttempts, 1, "exercise the final toolbar refresh failure");
   assert.equal(env.get("Brainer")._state, "ready");
@@ -51,16 +56,18 @@ test("a toolbar failure after initialization keeps workspace commands available"
   assert.equal(env.storageData[`ld-wsp-${WSP_ID}`].name, "Renamed");
 });
 
-test("a failure before workspace initialization still blocks workspace commands", async () => {
-  const env = await healthyBackend();
+test("a failure before workspace initialization still blocks workspace commands", async t => {
+  const env = await healthyBackend(t);
   env.get("WSPStorageManager").ensureSchemaVersion = async () => {
     throw new Error("Storage temporarily unavailable");
   };
 
-  await assert.rejects(env.get("Brainer").initialize(), /Storage temporarily unavailable/);
+  await env.get("Brainer").initialize();
 
   assert.equal(env.get("Brainer")._state, "uninitialized");
   assert.equal(env.get("Brainer")._initStarted, false);
+  assert.equal(env.storageData["ld-wsp-last-restore-error"].reason, "init-failure");
+  assert.match(env.storageData["ld-wsp-last-restore-error"].error, /Storage temporarily unavailable/);
   const result = await env.get("_handleMessage")({
     action: "renameWorkspace", wspId: WSP_ID, wspName: "Renamed",
   });
