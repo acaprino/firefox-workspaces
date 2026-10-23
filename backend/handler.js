@@ -362,6 +362,14 @@ async function _handleMessage(message) {
           return { success: false, stale: true };
         }
       }
+      // Recovery already owns the saved records. Refresh the banner rather
+      // than dropping its retry signal during the read/commit sequence.
+      if (Brainer._restoreInFlight || Brainer._initStarted || Brainer._state === 'restoring') {
+        return { success: false, stale: true };
+      }
+      // Cancel before the export awaits so late tab events cannot start a
+      // restore while this action is giving up the saved session.
+      Brainer.cancelRestoreRetry();
       // Before orphaning the old records, export their URL snapshots to
       // bookmark folders: the extension holds everything needed to rebuild
       // (names + ordered URL lists), and "give up" used to discard the only

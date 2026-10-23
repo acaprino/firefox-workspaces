@@ -64,6 +64,8 @@ Keyboard shortcuts can be customized in `about:addons` - gear icon - **Manage Ex
 
 Workspaces reassigns tabs that Firefox restores to their workspaces. It does not automatically reopen recently closed tabs at startup.
 
+If Firefox starts with only blank or new-tab pages while saved workspace lists contain content, recovery pauses to preserve those lists. It resumes automatically when content tabs arrive in the same window. If no tabs arrive, the popup keeps the recovery warning.
+
 If startup recovery detects missing workspace tabs, it attempts to save their last recorded URL lists under **Other Bookmarks > Workspaces**, then reports the export result in the popup. Review these lists before using **Restore from bookmarks**: snapshots can include tabs you intentionally closed. Restoring a folder creates a new workspace and opens its saved URLs; it does not restore browsing history or form contents.
 
 <details>

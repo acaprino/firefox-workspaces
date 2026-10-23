@@ -117,6 +117,7 @@ class TabService {
     if (existing) clearTimeout(existing);
     const timer = setTimeout(async () => {
       TabService._snapshotTimers.delete(key);
+      if (Brainer._state !== 'ready') return;
       try {
         // Acquire the per-workspace lock so a concurrent
         // addTabToWorkspace/removeTabFromWorkspace doesn't get its tabs[]
@@ -127,6 +128,9 @@ class TabService {
           // between schedule and fire. Either way, abort silently.
           if (!wsp || !wsp.id || wsp.windowId !== windowId) return;
           const tabs = await browser.tabs.query({ windowId, pinned: false });
+          // A startup guard can pause recovery while these reads are in
+          // flight. Never replace its saved evidence from an earlier timer.
+          if (Brainer._state !== 'ready') return;
           const tabMap = new Map(tabs.map(t => [t.id, t]));
           const fresh = wsp.tabs
             .map(id => tabMap.get(id))
@@ -208,18 +212,27 @@ class TabService {
           if (targetWsp) {
             console.log("[TabService][addTabToWorkspace] session value points to workspace:",
               sessionWspId, "- honouring instead of active workspace");
-            const freshTarget = await WSPStorageManager.getWorkspace(sessionWspId);
-            if (!freshTarget.tabs.includes(tab.id)) {
-              freshTarget.tabs.push(tab.id);
-              await freshTarget._saveState();
-            }
-            if (freshTarget.active) {
+            let assignedTarget = null;
+            await WSPStorageManager.withWorkspaceLock(sessionWspId, async () => {
+              const freshTarget = await WSPStorageManager.getWorkspace(sessionWspId);
+              // A destroy or window rebind may have completed during the
+              // session lookup. Never recreate its missing storage record.
+              if (freshTarget.windowId !== tab.windowId) return;
+              if (!freshTarget.tabs.includes(tab.id)) {
+                freshTarget.tabs.push(tab.id);
+                await freshTarget._saveState();
+              }
+              assignedTarget = freshTarget;
+            });
+            if (!assignedTarget) return false;
+            if (assignedTarget.active) {
               WorkspaceService.addTabToActiveCache(tab.id, sessionWspId);
             } else {
               try { await browser.tabs.hide(tab.id); }
               catch (e) { console.debug("[TabService][addTabToWorkspace] tabs.hide failed for tab", tab.id, ":", e.message); }
             }
             await TabService.setTabSessionValue(tab.id, sessionWspId);
+            TabService._scheduleSnapshotRefresh(tab.windowId, sessionWspId);
             await MenuService.refreshTabMenu();
             await UIService.updateToolbarButton(tab.windowId);
             return false;

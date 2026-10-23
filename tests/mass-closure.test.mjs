@@ -32,6 +32,9 @@ async function recoveryFixture({ exportFails = false } = {}) {
       },
     },
     overrides: {
+      storage: {
+        session: { get: async () => ({ "wsp-session-alive": true }), set: async () => {} },
+      },
       tabs: {
         query: async (query = {}) => liveTabs.filter(t =>
           (query.windowId == null || t.windowId === query.windowId) &&
@@ -66,8 +69,8 @@ async function recoveryFixture({ exportFails = false } = {}) {
       },
     },
   });
-  // Let automatic initialization finish with no live content tabs, then run
-  // one controlled startup recovery against the real services.
+  // Boot as an extension reload, then run one controlled startup recovery
+  // against the real services. A real blank-only start must pause recovery.
   await env.settle();
   assert.equal(env.get("Brainer")._state, "ready");
   const originalSet = env.browser.storage.local.set;
@@ -95,9 +98,7 @@ for (const path of ["detected restart", "undetected restart"]) {
     t.after(() => {
       for (const timer of env.get("TabService")._snapshotTimers.values()) clearTimeout(timer);
     });
-    // Regression fixture: this is Firefox's internal blank-tab URL, which
-    // the existing startup predicate counts as live content.
-    env.liveTabs.push({ id: 50, windowId: 1, url: "chrome://browser/content/blanktab.html", pinned: false });
+    env.liveTabs.push({ id: 50, windowId: 1, url: "https://example.com/new", pinned: false });
     await recover(env, path);
 
     assert.deepEqual(env.restoredIds, [], "startup must not consume undo-close history");

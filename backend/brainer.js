@@ -7,17 +7,18 @@ class Brainer {
   static _initStarted = false;
   static _lastFocusedWindowId = null;
   static _primaryWindowId = null;
-  // Set when refuse-to-wipe trips; blocks _onWindowCreated and initialize from
-  // re-entering the restore path on every new window the user opens during the
-  // recovery banner. Cleared on successful restore or via acknowledge/giveUp.
-  // In-memory only -- a fresh Firefox start naturally clears it.
+  // Blocks unrelated windows from retrying a failed restore. Placeholder-only
+  // starts can resume in the original target when real tab content arrives.
+  // Cleared on successful restore or via acknowledge/giveUp.
   static _refuseToWipeActive = false;
+  static _pendingRestore = null;
+  static _restoreRetryTimer = null;
 
   // Tabs that look like Firefox session-restore placeholders rather than real
   // user content. When refuse-to-wipe evaluates, these don't count as "live
   // tabs" -- otherwise a profile-corrupted restart that comes up with a single
   // about:newtab placeholder would bypass the guard (FMA2).
-  static _PLACEHOLDER_URL_RE = /^about:(blank|newtab|home|sessionrestore)/i;
+  static _PLACEHOLDER_URL_RE = /^(?:about:(?:blank|newtab|home|sessionrestore)(?:[?#]|$)|chrome:\/\/browser\/content\/blanktab\.html(?:[?#]|$))/i;
 
   // Set true the moment browser.runtime.onStartup fires. onStartup fires ONLY on
   // a real browser start (never on an extension reload), so it is the one
@@ -34,6 +35,14 @@ class Brainer {
   // doesn't write private state directly (banner acknowledge / give-up).
   static setRefuseToWipeActive(value) {
     Brainer._refuseToWipeActive = value === true;
+  }
+
+  // Dismissing a warning leaves recovery armed. Only completion or an
+  // explicit give-up action cancels the pending automatic retry.
+  static cancelRestoreRetry() {
+    Brainer._pendingRestore = null;
+    clearTimeout(Brainer._restoreRetryTimer);
+    Brainer._restoreRetryTimer = null;
   }
   // Guards the onStartup-fired-after-ready repair so it runs at most once.
   static _postStartupRepairDone = false;
@@ -196,6 +205,11 @@ class Brainer {
       console.log("[Brainer][initialize] done — final state:", Brainer._state);
       // C-19 sweep, fire-and-forget: must not delay or fail startup.
       Brainer._recoverOrphanWorkspaces().catch(() => {});
+    } catch (e) {
+      // Cache warming and UI refreshes run after workspace recovery is ready.
+      // Their failure must not disable workspace commands or tab listeners.
+      if (Brainer._state !== 'ready') Brainer._state = 'uninitialized';
+      throw e;
     } finally {
       // Always clear _initStarted, even on throw. Without this, any failure in
       // initialize() permanently blocks _onWindowCreated (which guards on
@@ -336,7 +350,7 @@ class Brainer {
             try {
               await Brainer._repairTabAssignments(pid, true);
             } finally {
-              Brainer._state = 'ready';
+              Brainer._state = Brainer._refuseToWipeActive ? 'uninitialized' : 'ready';
             }
           }
           return;
@@ -445,10 +459,9 @@ class Brainer {
       return;
     }
     // Refuse-to-wipe is active: don't retry the restore against a brand-new
-    // (likely empty) window. The user must dismiss the banner or restart
-    // Firefox. Without this guard, every new window would re-trigger the
-    // failed restore against a target with no real content.
-    if (Brainer._refuseToWipeActive) {
+    // (likely empty) window. Tab events can resume the original target once
+    // content arrives; a new unrelated window must not claim its workspaces.
+    if (Brainer._refuseToWipeActive || Brainer._pendingRestore) {
       console.log("[Brainer][_onWindowCreated] windowId:", window.id, "skipped -- refuse-to-wipe active");
       return;
     }
@@ -720,49 +733,20 @@ class Brainer {
     }
 
     const totalAssigned = [...assigned.values()].reduce((n, a) => n + a.length, 0);
-    const hadRecoverableData = wspData.some(w => w.tabSnapshot.length > 0);
     const snapshotUrlCount = wspData.reduce((n, w) => n + w.tabSnapshot.length, 0);
     console.log("[Brainer][_restoreWorkspaces] in-memory assignment:",
       [...assigned.entries()].map(([id, tabs]) => `${id.slice(0,8)}:${tabs.length}`).join(" "),
-      `unmatched=${unmatchedTabs.length} totalAssigned=${totalAssigned} hadRecoverable=${hadRecoverableData}`);
+      `unmatched=${unmatchedTabs.length} totalAssigned=${totalAssigned}`);
 
-    // ── Phase 3: refuse-to-wipe guard. ──
-    // The failure mode that lost the user's data was: tabs.query ran before
-    // Firefox finished session-restoring tabs, so Phase 1 saw 0 (or a single
-    // about:newtab) and Phase 4 recreated every workspace empty. We refuse
-    // when (a) we have workspaces with snapshot URLs to potentially restore,
-    // (b) zero session-tagged tabs got assigned, AND (c) no real content tabs
-    // are live in the window. Placeholder tabs (about:newtab etc.) do NOT
-    // count as live content -- otherwise FMA2 (placeholder-only restart)
-    // bypasses the guard.
+    // Phase 3: matching a saved new-tab URL is not evidence that Firefox has
+    // restored content. Protect snapshots even when that placeholder matched.
     const liveContentTabs = newTabs.filter(t => !t.pinned && t.url && !Brainer._PLACEHOLDER_URL_RE.test(t.url));
-    if (wspData.length > 0 && totalAssigned === 0 && liveContentTabs.length === 0 && hadRecoverableData) {
-      const errorPayload = {
-        when: Date.now(),
-        reason: "refuse-to-wipe",
-        oldWindowId,
-        newWindowId: window.id,
-        wspCount: wspData.length,
-        snapshotUrlCount,
-        liveTabCount: newTabs.length,
-        liveContentTabCount: liveContentTabs.length,
-        unmatchedTabCount: unmatchedTabs.length,
-        sessionTaggedCount: sessionMap.size,
-      };
-      // Log first so the diagnostic survives even if storage is full.
-      console.error("[Brainer][_restoreWorkspaces] REFUSE-TO-WIPE -- aborting restore. payload:", JSON.stringify(errorPayload));
-      // Surface as banner. Storage failure here is not fatal; we still throw.
-      try { await WSPStorageManager.setLastRestoreError(errorPayload); }
-      catch (writeErr) { console.error("[Brainer][_restoreWorkspaces] failed to surface refuse-to-wipe banner:", writeErr); }
-      // Paint the "!" badge proactively -- in this state no primary window
-      // exists, so without this only an incidental focus change would show it.
-      UIService.refreshWarnBadge().catch(() => {});
-      Brainer._refuseToWipeActive = true;
-      throw new Error(
-        `Refuse-to-wipe: would recreate ${wspData.length} workspaces with 0 tabs ` +
-        `while ${errorPayload.snapshotUrlCount} snapshot URLs exist; user data left untouched.`
-      );
-    }
+    await Brainer._assertRestoreHasContent(wspData, newTabs, {
+      oldWindowId,
+      newWindowId: window.id,
+      unmatchedTabCount: unmatchedTabs.length,
+      sessionTaggedCount: sessionMap.size,
+    });
 
     // Phase 3b: incomplete session restore. Preserve snapshots before any
     // tab activity can refresh them away, then continue with live tabs only.
@@ -874,7 +858,8 @@ class Brainer {
       Brainer._primaryWindowId = window.id;
       await WSPStorageManager.removePrimaryWindowLastId();
       await WSPStorageManager.clearLastRestoreError();
-      Brainer._refuseToWipeActive = false;
+      Brainer.setRefuseToWipeActive(false);
+      Brainer.cancelRestoreRetry();
       if (sessionLost) {
         if (sessionLossExport?.deduped) {
           // Same loss content as the last announced one (the steady state for
@@ -918,6 +903,99 @@ class Brainer {
       UIService.refreshWarnBadge().catch(() => {});
       Brainer._refuseToWipeActive = true;
       throw e;
+    }
+  }
+
+  // Both startup paths must leave saved content alone while Firefox exposes
+  // only blank placeholders. A matching/tagged placeholder is still blank.
+  // Workspaces containing only new-tab pages have no content to protect.
+  static async _assertRestoreHasContent(workspaces, tabs, details) {
+    const snapshots = workspaces.flatMap(w => w.tabSnapshot || []);
+    const hasSavedContent = snapshots.some(url => url && !Brainer._PLACEHOLDER_URL_RE.test(url));
+    const hasLiveContent = tabs.some(t => !t.pinned && t.url && !Brainer._PLACEHOLDER_URL_RE.test(t.url));
+    if (!hasSavedContent || hasLiveContent) return;
+    Brainer._refuseToWipeActive = true;
+    Brainer._state = 'uninitialized';
+    const errorPayload = {
+      when: Date.now(),
+      reason: "refuse-to-wipe",
+      wspCount: workspaces.length,
+      snapshotUrlCount: snapshots.length,
+      liveTabCount: tabs.length,
+      liveContentTabCount: 0,
+      ...details,
+    };
+    console.error("[Brainer] REFUSE-TO-WIPE -- aborting restore. payload:", JSON.stringify(errorPayload));
+    try { await WSPStorageManager.setLastRestoreError(errorPayload); }
+    catch (e) { console.error("[Brainer] failed to surface refuse-to-wipe banner:", e); }
+    // The crash-repair path still has a primary claim. Convert it to the
+    // same retry signal used by detected restarts, in crash-safe order.
+    try {
+      await WSPStorageManager.setPrimaryWindowLastId(details.oldWindowId);
+      await WSPStorageManager.removePrimaryWindowId();
+      Brainer._primaryWindowId = null;
+      Brainer._pendingRestore = {
+        oldWindowId: details.oldWindowId,
+        newWindowId: details.newWindowId,
+      };
+      // Recheck once even without a new event: content may have arrived
+      // during the awaits above, before the pending restore was armed.
+      Brainer._scheduleRestoreRetry();
+    } catch (e) {
+      console.error("[Brainer] failed to arm restore retry:", e);
+    }
+    UIService.refreshWarnBadge().catch(() => {});
+    throw new Error(
+      `Refuse-to-wipe: Firefox has no content tabs while ${snapshots.length} ` +
+      `snapshot URLs exist; user data left untouched.`
+    );
+  }
+
+  // One delayed check per burst of tab events, not continuous polling while
+  // Firefox has no session to restore. Keep snapshots protected until content
+  // exists in the original target, and serialize with the other startup paths.
+  static _scheduleRestoreRetry(windowId = null) {
+    const pending = Brainer._pendingRestore;
+    if (!pending || (windowId != null && windowId !== pending.newWindowId)) return;
+    if (Brainer._restoreRetryTimer != null) return;
+    Brainer._restoreRetryTimer = setTimeout(() => {
+      Brainer._restoreRetryTimer = null;
+      Brainer._retryPendingRestore().catch(e => {
+        console.error("[Brainer] deferred restore failed:", e);
+      });
+    }, LIMITS.RESTORE_DELAY_MS);
+  }
+
+  static async _retryPendingRestore() {
+    const pending = Brainer._pendingRestore;
+    if (!pending) return;
+    if (Brainer._initStarted || Brainer._restoreInFlight || Brainer._state === 'restoring') {
+      Brainer._scheduleRestoreRetry();
+      return;
+    }
+    Brainer._restoreInFlight = true;
+    try {
+      const lastId = await WSPStorageManager.getPrimaryWindowLastId();
+      const tabs = await browser.tabs.query({ windowId: pending.newWindowId });
+      // The retry signal may have changed while the reads awaited.
+      if (Brainer._pendingRestore !== pending || lastId !== pending.oldWindowId) return;
+      if (!tabs.some(t => !t.pinned && t.url && !Brainer._PLACEHOLDER_URL_RE.test(t.url))) return;
+
+      Brainer._state = 'restoring';
+      // A partial commit must retain its warning and require an explicit retry.
+      // Only another placeholder-only refusal may arm automatic recovery again.
+      Brainer._pendingRestore = null;
+      await Brainer._restoreWorkspaces({ id: pending.newWindowId });
+      Brainer._state = 'ready';
+      await Brainer._reconcileLateTabs(pending.newWindowId);
+      await TabService.warmTabInfoCache(pending.newWindowId);
+      await MenuService.refreshTabMenu();
+      await UIService.updateToolbarButton(pending.newWindowId);
+    } catch (e) {
+      if (Brainer._state !== 'ready') Brainer._state = 'uninitialized';
+      throw e;
+    } finally {
+      Brainer._restoreInFlight = false;
     }
   }
 
@@ -1356,6 +1434,13 @@ class Brainer {
   // leftovers, then re-apply visibility if anything moved. Idempotent: a no-op
   // when assignments already match session values.
   static async _repairTabAssignments(windowId, restartLikely = false) {
+    if (restartLikely) {
+      await Brainer._assertRestoreHasContent(
+        await WSPStorageManager.getWorkspaces(windowId),
+        await browser.tabs.query({ windowId }),
+        { oldWindowId: windowId, newWindowId: windowId },
+      );
+    }
     // Session-loss check first: _reconcileLateTabs below can assign tabs and
     // schedule snapshot refreshes, which would destroy the evidence (and the
     // last good snapshots) this check needs.
@@ -1466,6 +1551,7 @@ class Brainer {
     browser.tabs.onCreated.addListener(async (tab) => {
       try {
         TabService.cacheTabInfo(tab);
+        Brainer._scheduleRestoreRetry(tab.windowId);
         console.log("[Brainer][onTabCreated] tabId:", tab.id, "windowId:", tab.windowId,
           "pinned:", tab.pinned, "url:", tab.url, "state:", Brainer._state);
         if (Brainer._state !== 'ready') {
@@ -1564,16 +1650,27 @@ class Brainer {
 
     // Cache tab info (url/title) for closed-tab tracking — must run unconditionally
     // (no state/window guards) so the cache is always warm when onRemoved fires.
-    // Also schedule a debounced tabSnapshot refresh when a URL changes inside the
-    // active workspace, so restart resilience doesn't depend on the user
-    // activate/deactivate-cycling each workspace.
-    browser.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+    // Also refresh recovery snapshots when any tracked tab navigates. The
+    // active cache can be cold after a reload, and hidden tabs can navigate.
+    browser.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
       TabService.cacheTabInfo(tab);
+      if (changeInfo.url != null) Brainer._scheduleRestoreRetry(tab.windowId);
       if (Brainer._state !== 'ready' || changeInfo.url == null) return;
-      const cache = WorkspaceService._activeCache;
-      if (!cache || cache.windowId !== tab.windowId || !cache.tabIds.has(tabId)) return;
-      const activeWspId = cache.activeWspId;
-      if (activeWspId) TabService._scheduleSnapshotRefresh(tab.windowId, activeWspId);
+      try {
+        const cache = WorkspaceService._activeCache;
+        if (cache?.windowId === tab.windowId && cache.activeWspId && cache.tabIds.has(tabId)) {
+          TabService._scheduleSnapshotRefresh(tab.windowId, cache.activeWspId);
+          return;
+        }
+        const workspaces = await WSPStorageManager.getWorkspaces(tab.windowId);
+        // Recovery may have started while storage was being read. Its saved
+        // snapshots must survive until the startup checks finish.
+        if (Brainer._state !== 'ready') return;
+        const owner = workspaces.find(wsp => wsp.windowId === tab.windowId && wsp.tabs.includes(tabId));
+        if (owner) TabService._scheduleSnapshotRefresh(tab.windowId, owner.id);
+      } catch (e) {
+        console.debug("[Brainer][onUpdated/snapshot] owner lookup failed:", e.message);
+      }
     }, {properties: ["url", "title"]});
 
     // Navigation-time container enforcement. The creation-time force in
