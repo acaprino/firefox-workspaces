@@ -2673,12 +2673,13 @@ class Brainer {
       try {
         // Unconditional, like the url/title cache listener above
         TabService.updateCachedGroup(tabId, changeInfo.groupId);
+        const takenOutByUs = changeInfo.groupId === -1 && TabService.takeOwnUngroup(tabId);
         // A hidden tab is ours being taken apart or built back by a switch
         if (tab.hidden) return;
         // A visible tab out of its group was taken out by the user: its key
         // goes now, mid-switch or during a restore too, or the group would
         // come back around it (see Workspace.updateTabGroups).
-        if (changeInfo.groupId === -1) await TabService.clearGroupTag(tabId);
+        if (changeInfo.groupId === -1 && !takenOutByUs) await TabService.clearGroupTag(tabId);
         if (Brainer._state !== 'ready') return;
         const primaryId = await Brainer.getCachedPrimaryWindowId();
         if (primaryId !== tab.windowId) return;

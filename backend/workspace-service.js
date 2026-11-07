@@ -114,7 +114,9 @@ class WorkspaceService {
 
   // Bring the record of the workspace on screen up to date after a native group
   // changed. One pass at a time per window, plus at most one more for what
-  // changed during it: grouping N tabs fires N events.
+  // changed during it: grouping N tabs fires N events. A switch fires group
+  // events of its own, so the pass waits for it to finish, and one is enough.
+  // Never await this from inside an activation (see whenActivationsSettled).
   static _groupSyncs = new Map(); // windowId -> { again, done }
 
   static syncActiveGroups(windowId) {
@@ -129,6 +131,7 @@ class WorkspaceService {
       try {
         do {
           sync.again = false;
+          await WorkspaceService.whenActivationsSettled();
           const activeWsp = await WorkspaceService.getActiveWspFast(windowId);
           await activeWsp?.updateTabGroups();
         } while (sync.again);

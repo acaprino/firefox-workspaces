@@ -250,8 +250,10 @@ class Workspace {
 
   // Record this workspace's native groups: title, color and state in `groups`,
   // membership as a session value per tab, which survives a restart where a
-  // tab id does not (TabService.getGroupTags). A native group keeps a key its
-  // tabs already carry when no other group took it, else gets a new one.
+  // tab id does not (TabService.getGroupTags). A native group keeps a key when
+  // it holds most of the tabs carrying it and no other group took it, else gets
+  // a new one: one tab of a group pulled into another native group (by another
+  // extension, or an undo landing inside it) must not take its group's key.
   // A group not native right now stays as long as tabs carry its key: its
   // workspace is off screen, or its rebuild failed. This pass cannot tell those
   // from a group the user took apart: a tab that leaves a group drops its key
@@ -267,6 +269,8 @@ class Workspace {
       const own = (await browser.tabs.query({windowId: fresh.windowId})).filter(tab => member.has(tab.id));
       const nativeGroups = await browser.tabGroups.query({windowId: fresh.windowId});
       const carried = await TabService.getGroupTags(own.map(tab => tab.id));
+      const carriers = new Map();
+      for (const key of carried.values()) carriers.set(key, (carriers.get(key) ?? 0) + 1);
 
       const taken = new Set();
       const groups = [];
@@ -274,7 +278,12 @@ class Workspace {
       for (const native of nativeGroups) {
         const tabs = own.filter(tab => tab.groupId === native.id);
         if (tabs.length === 0) continue;
-        const key = tabs.map(tab => carried.get(tab.id)).find(k => k && !taken.has(k)) ?? crypto.randomUUID();
+        const inGroup = new Map();
+        for (const tab of tabs) {
+          const carriedKey = carried.get(tab.id);
+          if (carriedKey && !taken.has(carriedKey)) inGroup.set(carriedKey, (inGroup.get(carriedKey) ?? 0) + 1);
+        }
+        const key = [...inGroup].find(([k, count]) => count * 2 > carriers.get(k))?.[0] ?? crypto.randomUUID();
         taken.add(key);
         for (const tab of tabs) {
           if (carried.get(tab.id) === key) continue;

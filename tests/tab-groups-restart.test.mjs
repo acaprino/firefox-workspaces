@@ -292,6 +292,32 @@ test("a tab carrying the key of a live group it is not in does not join it", asy
   assert.deepEqual(groupsOf(run.world), [RESTORED]);
 });
 
+test("a tab Firefox refuses to hide stays in its group when the workspace comes back", async (t) => {
+  // A tab sharing camera, microphone or screen stays visible: our own ungroup
+  // then looks just like the user taking it out.
+  const run = await start(t);
+  await run.group(RESTORED);
+  run.world.setSharing(idOf(run.world, "h04"), true);
+  await run.world.idle();
+  await run.switchTo(FIRE);
+  assert.equal(run.world.tab(idOf(run.world, "h04")).hidden, false, "Firefox refused to hide it");
+  await run.switchTo(HOME);
+  assert.deepEqual(groupsOf(run.world), [RESTORED]);
+});
+
+test("one member pulled into another native group does not take its group's key", async (t) => {
+  // Another extension, or an undo landing inside a live group, puts one tab of
+  // an off-screen group into a native group: that is not the group.
+  const run = await start(t);
+  await run.group(RESTORED);
+  await run.switchTo(FIRE);
+  run.world.groupTabs(idOf(run.world, "h04"), { title: "Stray" });
+  await run.world.idle();
+  await run.switchTo(FIRE); // any hide pass
+  await run.switchTo(HOME);
+  assert.deepEqual(groupsOf(run.world), [["h03", "h05"], ["h04"]]);
+});
+
 test("a group keeps the order of its tabs when it comes back", async (t) => {
   const run = await start(t);
   await run.group(["h05", "h03", "h04"]);

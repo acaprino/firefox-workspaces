@@ -260,13 +260,25 @@ class TabService {
 
   // Extension-initiated ungroup. A group emptied this way fires
   // tabGroups.onRemoved exactly like a group the user saved and closed, so
-  // the time is remembered (see onTabGroupRemoved).
+  // the time is remembered (see onTabGroupRemoved). The ids are remembered
+  // too: a tab Firefox refused to hide stays visible, and its ungroup would
+  // read as the user taking it out of the group (takeOwnUngroup).
   static _ownUngroupAt = 0;
+  static _ownUngroupIds = new Set();
   static _OWN_UNGROUP_GRACE_MS = 1000;
 
   static async ungroup(tabIds) {
     TabService._ownUngroupAt = Date.now();
+    if (TabService._ownUngroupIds.size > TabService._REMOVED_IDS_MAX) TabService._ownUngroupIds.clear();
+    for (const id of [].concat(tabIds)) TabService._ownUngroupIds.add(id);
     await TabService._eachTab("ungroup", tabIds);
+  }
+
+  // Did our own ungroup take this tab out of its group? For the tab's group
+  // event, once per event.
+  static takeOwnUngroup(tabId) {
+    return TabService._ownUngroupIds.delete(tabId)
+      && Date.now() - TabService._ownUngroupAt < TabService._OWN_UNGROUP_GRACE_MS;
   }
 
   // tabs.hide / show / ungroup validate every id before acting on any. A tab
