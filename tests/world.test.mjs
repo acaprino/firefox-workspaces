@@ -276,3 +276,94 @@ test("urlCommitMs: a web URL opens as about:blank and commits later with onUpdat
   assert.equal(created[1].url, "about:blank");
   assert.ok(log.some((e) => e[0] === "tabs.onUpdated" && e[1] === tab.id && e[2].url === "https://late.test/"));
 });
+
+test("tabs.group gathers the listed tabs where the first one was and reports each change", async (t) => {
+  const { world, env, log } = await bootWithLog({
+    tabs: [1, 2, 3, 4, 5].map((id) => ({ id, url: `https://a.test/${id}`, active: id === 1 })),
+    storage: seedWorkspaces(1, [{ id: WSP_A, name: "A", active: true, tabs: [1, 2, 3, 4, 5] }]),
+  });
+  t.after(() => world.teardown());
+  const gid = await env.browser.tabs.group({ tabIds: [2, 5] });
+  assert.deepEqual(world.order(1), [1, 2, 5, 3, 4]);
+  assert.deepEqual(world.nativeGroups(1).map((g) => g.tabs), [[2, 5]]);
+  await world.idle();
+  const grouped = log.filter((e) => e[0] === "tabs.onUpdated" && "groupId" in e[2]).map((e) => [e[1], e[2].groupId]);
+  assert.deepEqual(grouped, [[2, gid], [5, gid]]);
+  assert.ok(log.some((e) => e[0] === "tabs.onMoved" && e[1] === 5), "tab 5 moved next to tab 2");
+
+  // A new group is never the old one: the listed tabs leave it, the rest stays.
+  const second = await env.browser.tabs.group({ tabIds: [5, 3] });
+  assert.notEqual(second, gid);
+  assert.deepEqual(world.nativeGroups(1).map((g) => g.tabs), [[2], [5, 3]]);
+});
+
+test("tabs.ungroup moves tabs before the group when they lead it, else after it; an empty group goes", async (t) => {
+  const { world, env } = await bootWithLog({
+    tabs: [1, 2, 3, 4, 5].map((id) => ({ id, url: `https://a.test/${id}`, active: id === 1, groupId: id > 1 && id < 5 ? 900 : -1 })),
+    storage: seedWorkspaces(1, [{ id: WSP_A, name: "A", active: true, tabs: [1, 2, 3, 4, 5] }]),
+  });
+  t.after(() => world.teardown());
+  await env.browser.tabs.ungroup(3);
+  assert.deepEqual(world.order(1), [1, 2, 4, 3, 5], "from the middle: after the group");
+  await env.browser.tabs.ungroup(2);
+  assert.deepEqual(world.order(1), [1, 2, 4, 3, 5], "the first tab: before the group");
+  assert.equal(world.tab(2).groupId, -1);
+  await env.browser.tabs.ungroup(4);
+  assert.deepEqual(world.nativeGroups(1), []);
+  await assert.rejects(env.browser.tabGroups.update(900, { title: "x" }), /No group with id: 900/);
+});
+
+test("tabs.group without a window targets the focused one and adopts the tabs there", async (t) => {
+  const { world, env } = await bootWithLog({
+    windows: [{ id: 1 }, { id: 2, focused: true }],
+    tabs: [
+      { id: 1, url: "https://a.test/1", active: true },
+      { id: 2, url: "https://a.test/2" },
+      { id: 3, windowId: 2, url: "https://b.test/3", active: true },
+    ],
+    storage: seedWorkspaces(1, [{ id: WSP_A, name: "A", active: true, tabs: [1, 2] }]),
+  });
+  t.after(() => world.teardown());
+  await env.browser.tabs.group({ tabIds: [2] });
+  assert.equal(world.tab(2).windowId, 2);
+  await env.browser.tabs.group({ tabIds: [1], createProperties: { windowId: 1 } });
+  assert.equal(world.tab(1).windowId, 1);
+});
+
+test("quit hands the next run new tab ids by position, with groups, hidden state and values", async (t) => {
+  const first = makeWorld({
+    tabs: [
+      { id: 9, url: "https://a.test/first", active: true },
+      { id: 7, url: "https://a.test/second", groupId: 900 },
+      { id: 5, url: "https://b.test/third", hidden: true },
+    ],
+    groups: [{ id: 900, windowId: 1, title: "G", color: "blue", collapsed: true }],
+    sessionValues: { 9: WSP_A, 7: WSP_A, 5: { wspId: WSP_B, other: "kept" } },
+    storage: seedWorkspaces(1, [
+      { id: WSP_A, name: "A", active: true, tabs: [9, 7] },
+      { id: WSP_B, name: "B", tabs: [5] },
+    ]),
+  });
+  await first.boot();
+  await first.idle();
+  const options = await first.quit({ firstTabId: 2 });
+  assert.equal(options.storage["primary-window-id"], undefined, "a clean quit left the restart signal");
+  assert.equal(options.storage["primary-window-last-id"], 1);
+
+  const second = makeWorld(options);
+  t.after(() => second.teardown());
+  assert.deepEqual(second.order(1), [2, 3, 4]);
+  assert.equal(second.tab(2).url, "https://a.test/first");
+  assert.equal(second.tab(2).active, true);
+  assert.equal(second.tab(4).hidden, true);
+  assert.equal(second.tabValue(4, "other"), "kept");
+  assert.deepEqual(second.nativeGroups(1).map((g) => [g.title, g.color, g.collapsed, g.tabs]), [["G", "blue", true, [3]]]);
+
+  const crashed = makeWorld(options);
+  await crashed.boot();
+  const afterCrash = await crashed.quit({ clean: false, selectedFirst: true, firstTabId: 2 });
+  assert.equal(afterCrash.storage["primary-window-id"], 1, "a crash reports nothing");
+  const third = makeWorld(afterCrash);
+  t.after(() => third.teardown());
+  assert.equal(third.tab(2).active, true, "the selected tab took the first id");
+});

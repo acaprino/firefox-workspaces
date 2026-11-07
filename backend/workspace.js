@@ -6,7 +6,10 @@ class Workspace {
     this.active = Boolean(state.active);
     this.tabs = Array.isArray(state.tabs) ? state.tabs : [];
     this.windowId = state.windowId;
-    this.groups = Array.isArray(state.groups) ? state.groups : [];
+    // Entries without a key come from older versions. They listed tab ids,
+    // which name other tabs after a restart: building a group from them
+    // grouped and moved the wrong tabs.
+    this.groups = Array.isArray(state.groups) ? state.groups.filter(group => group?.key) : [];
     this.lastActiveTabId = state.lastActiveTabId ?? null;
     this.lastActiveTabUrl = state.lastActiveTabUrl ?? null;
     this.containerId = state.containerId ?? null;
@@ -107,28 +110,8 @@ class Workspace {
     const staleIds = new Set(storedTabs.filter(id => !validNow.has(id)));
     let fallbackTabId = null;
 
-    // reconstruct groups
     if (this.tabs.length > 0) {
-      const validTabSet = new Set(this.tabs);
-      console.log("[Workspace][activate] reconstructing", this.groups.length, "tab groups");
-      for (const group of this.groups) {
-        group.tabs = group.tabs.filter(tabId => validTabSet.has(tabId));
-        if (group.tabs.length > 0) {
-          console.log("[Workspace][activate] grouping", group.tabs.length, "tabs for group:", group.title);
-          // Cosmetic: tabs.group rejects the whole call when one tab closed
-          // meanwhile, and that used to abort the activation (X-104, X-29).
-          try {
-            const groupId = await browser.tabs.group({tabIds: group.tabs.filter(id => !TabService.wasRemoved(id))});
-            await browser.tabGroups.update(groupId, {
-              title: group.title,
-              color: group.color,
-              collapsed: group.collapsed
-            });
-          } catch (e) {
-            console.debug("[Workspace][activate] could not regroup", group.title, ":", e.message);
-          }
-        }
-      }
+      if (this.groups.length > 0) await this._rebuildGroups(allTabsHint);
 
       // show tabs (tolerates a tab closing meanwhile, X-104)
       console.log("[Workspace][activate] showing", this.tabs.length, "tabs");
@@ -189,8 +172,6 @@ class Workspace {
     const saved = await WSPStorageManager.mutateWorkspace(this.id, (fresh) => {
       fresh.tabs = fresh.tabs.filter(id => !staleIds.has(id));
       if (fallbackTabId != null && !fresh.tabs.includes(fallbackTabId)) fresh.tabs.push(fallbackTabId);
-      const member = new Set(fresh.tabs);
-      for (const group of fresh.groups) group.tabs = group.tabs.filter(id => member.has(id));
       if (tabMap) {
         fresh.tabSnapshot = fresh.tabs
           .map(id => tabMap.get(id))
@@ -218,31 +199,104 @@ class Workspace {
     return true;
   }
 
+  // Build back the native groups taken apart when this workspace was hidden.
+  // A group's tabs are the ones carrying its key (TabService.getGroupTags).
+  // A group with a tab already in a native group is left alone: Firefox
+  // restored it with the session, or it never went away. tabs.group always
+  // makes a new group and pulls the listed tabs out of any other, so building
+  // on top of a restored group split it, one more at every restart.
+  async _rebuildGroups(allTabsHint) {
+    const live = new Map((allTabsHint ?? await browser.tabs.query({windowId: this.windowId}))
+      .map(tab => [tab.id, tab]));
+    const keys = await TabService.getGroupTags(this.tabs);
+    console.log("[Workspace][_rebuildGroups] id:", this.id, "groups:", this.groups.length,
+      "tabs with a key:", keys.size);
+    for (const group of this.groups) {
+      const members = this.tabs
+        .filter(id => keys.get(id) === group.key && live.has(id) && !TabService.wasRemoved(id))
+        .sort((a, b) => live.get(a).index - live.get(b).index);
+      if (members.length === 0 || members.some(id => live.get(id).groupId !== -1)) continue;
+      console.log("[Workspace][_rebuildGroups] grouping", members.length, "tabs for group:", group.title);
+      // A failure must not abort the activation (X-104, X-29). The group is not
+      // lost: its tabs keep their key, and the next activation tries again.
+      try {
+        const groupId = await this._groupTabs(members);
+        await browser.tabGroups.update(groupId, {
+          title: group.title,
+          color: group.color,
+          collapsed: group.collapsed
+        });
+      } catch (e) {
+        console.debug("[Workspace][_rebuildGroups] could not regroup", group.title, ":", e.message);
+      }
+    }
+  }
+
+  // tabs.group checks every id first, so one tab closing right now rejects the
+  // call: once more without the tabs that no longer answer. The window is
+  // explicit because the default is the window in front, and the tabs would
+  // move there.
+  async _groupTabs(tabIds) {
+    const createProperties = {windowId: this.windowId};
+    try {
+      return await browser.tabs.group({tabIds, createProperties});
+    } catch (e) {
+      const answers = await Promise.all(tabIds.map(id => browser.tabs.get(id).then(() => id, () => null)));
+      const alive = answers.filter(id => id != null);
+      if (alive.length === 0 || alive.length === tabIds.length) throw e;
+      return browser.tabs.group({tabIds: alive, createProperties});
+    }
+  }
+
+  // Record this workspace's native groups: title, color and state in `groups`,
+  // membership as a session value per tab, which survives a restart where a
+  // tab id does not (TabService.getGroupTags). A native group keeps a key its
+  // tabs already carry when no other group took it, else gets a new one.
+  // A group not native right now stays as long as tabs carry its key: its
+  // workspace is off screen, or its rebuild failed. This pass cannot tell those
+  // from a group the user took apart: a tab that leaves a group drops its key
+  // itself (tabs.onUpdated in Brainer). When the group is native, it says who
+  // is in it, and a tab carrying its key from outside left unseen.
+  // `tabs: []` in an entry is for an older build running on this data (AMO
+  // rollback, see SCHEMA_VERSION): it filters that list and finds nothing.
+  // Under the workspace lock from the first read on: two passes side by side
+  // would give one group two keys, and the tabs and the record would disagree.
   async updateTabGroups() {
-    const groups = await browser.tabGroups.query({windowId: this.windowId});
-    const tabs = await browser.tabs.query({windowId: this.windowId});
+    const saved = await WSPStorageManager.mutateWorkspace(this.id, async (fresh) => {
+      const member = new Set(fresh.tabs);
+      const own = (await browser.tabs.query({windowId: fresh.windowId})).filter(tab => member.has(tab.id));
+      const nativeGroups = await browser.tabGroups.query({windowId: fresh.windowId});
+      const carried = await TabService.getGroupTags(own.map(tab => tab.id));
 
-    this.groups = groups.map(group => {
-      const tabIds = tabs
-        .filter(tab => tab.groupId === group.id && this.tabs.includes(tab.id))
-        .map(tab => tab.id);
-
-      return {
-        title: group.title,
-        color: group.color,
-        collapsed: group.collapsed,
-        tabs: tabIds
-      };
-    }).filter(group => group.tabs.length > 0);
-
-    console.log("[Workspace][updateTabGroups] id:", this.id,
-      "found", this.groups.length, "groups with tabs");
-    // Persist only the groups field onto a fresh record under the workspace
-    // lock: saving `this` whole would clobber any tabs[] change a concurrent
-    // locked writer landed since we were constructed.
-    await WSPStorageManager.mutateWorkspace(this.id, (fresh) => {
-      fresh.groups = this.groups;
+      const taken = new Set();
+      const groups = [];
+      const retagged = [];
+      for (const native of nativeGroups) {
+        const tabs = own.filter(tab => tab.groupId === native.id);
+        if (tabs.length === 0) continue;
+        const key = tabs.map(tab => carried.get(tab.id)).find(k => k && !taken.has(k)) ?? crypto.randomUUID();
+        taken.add(key);
+        for (const tab of tabs) {
+          if (carried.get(tab.id) === key) continue;
+          carried.set(tab.id, key);
+          retagged.push(TabService.setGroupTag(tab.id, key));
+        }
+        groups.push({ key, title: native.title, color: native.color, collapsed: native.collapsed, tabs: [] });
+      }
+      const nativeIds = new Set(nativeGroups.map(native => native.id));
+      for (const tab of own) {
+        if (nativeIds.has(tab.groupId) || !taken.has(carried.get(tab.id))) continue;
+        carried.delete(tab.id);
+        retagged.push(TabService.clearGroupTag(tab.id));
+      }
+      await Promise.all(retagged);
+      const stillCarried = new Set(carried.values());
+      groups.push(...fresh.groups.filter(group => !taken.has(group.key) && stillCarried.has(group.key)));
+      console.log("[Workspace][updateTabGroups] id:", this.id, "found", groups.length, "groups with tabs");
+      if (JSON.stringify(groups) === JSON.stringify(fresh.groups)) return false;
+      fresh.groups = groups;
     });
+    if (saved) this.groups = saved.groups;
   }
 
   static async rename(wspId, { name, icon, color } = {}) {

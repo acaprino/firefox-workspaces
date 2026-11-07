@@ -1985,9 +1985,6 @@ class Brainer {
           wsp.tabs.filter(id => !openTabIds.has(id)));
         await WSPStorageManager.mutateWorkspace(wsp.id, (fresh) => {
           fresh.tabs = fresh.tabs.filter(id => openTabIds.has(id));
-          for (const group of fresh.groups) {
-            group.tabs = group.tabs.filter(id => openTabIds.has(id));
-          }
         });
         totalCleaned += staleCount;
       }
@@ -2149,9 +2146,6 @@ class Brainer {
           ...next.filter(id => !planned.has(id) || current.has(id)),
           ...fresh.tabs.filter(id => !planned.has(id) && !desiredOf.has(id)),
         ];
-        // Group membership is rebuilt on activate; just drop IDs that left.
-        const nextSet = new Set(fresh.tabs);
-        for (const g of fresh.groups) g.tabs = g.tabs.filter(id => nextSet.has(id));
       });
       summary.push(`${w.name}:${next.length}(+${movedIn})`);
     }
@@ -2679,34 +2673,42 @@ class Brainer {
       try {
         // Unconditional, like the url/title cache listener above
         TabService.updateCachedGroup(tabId, changeInfo.groupId);
+        // A hidden tab is ours being taken apart or built back by a switch
+        if (tab.hidden) return;
+        // A visible tab out of its group was taken out by the user: its key
+        // goes now, mid-switch or during a restore too, or the group would
+        // come back around it (see Workspace.updateTabGroups).
+        if (changeInfo.groupId === -1) await TabService.clearGroupTag(tabId);
         if (Brainer._state !== 'ready') return;
         const primaryId = await Brainer.getCachedPrimaryWindowId();
         if (primaryId !== tab.windowId) return;
-        if (!tab.hidden) {
-          console.log("[Brainer][onTabUpdated/groupId] tabId:", tabId, "groupId changed — updating tab groups");
-          const activeWsp = await WorkspaceService.getActiveWsp(tab.windowId);
-          if (activeWsp) await activeWsp.updateTabGroups();
-        }
+        console.log("[Brainer][onTabUpdated/groupId] tabId:", tabId, "groupId changed -- updating tab groups");
+        await WorkspaceService.syncActiveGroups(tab.windowId);
       } catch (e) { console.error("[Workspaces] onUpdated(groupId) error:", e); }
     }, {properties: ["groupId"]});
 
     // "Save and close group" / "Delete group": Firefox records the group
-    // itself, so its tabs' pending closed-tab entries are dropped.
+    // itself, so its tabs' pending closed-tab entries are dropped. The record
+    // lets the group go too, or Undo Close Tab on one tab would bring it back.
     browser.tabGroups.onRemoved?.addListener(async (group, removeInfo) => {
       try {
         if (removeInfo?.isWindowClosing) return;
         await TabService.onTabGroupRemoved(group.id);
+        if (Brainer._state !== 'ready') return;
+        const primaryId = await Brainer.getCachedPrimaryWindowId();
+        if (primaryId !== group.windowId) return;
+        await WorkspaceService.syncActiveGroups(group.windowId);
       } catch (e) { console.error("[Workspaces] onTabGroupsRemoved error:", e); }
     });
 
     browser.tabGroups.onUpdated.addListener(async (group) => {
       try {
+        if (Brainer._state !== 'ready') return;
         const primaryId = await Brainer.getCachedPrimaryWindowId();
         if (primaryId !== group.windowId) return;
         console.log("[Brainer][onTabGroupsUpdated] groupId:", group.id,
           "windowId:", group.windowId, "title:", group.title);
-        const activeWsp = await WorkspaceService.getActiveWsp(group.windowId);
-        if (activeWsp) await activeWsp.updateTabGroups();
+        await WorkspaceService.syncActiveGroups(group.windowId);
       } catch (e) { console.error("[Workspaces] onTabGroupsUpdated error:", e); }
     });
   }

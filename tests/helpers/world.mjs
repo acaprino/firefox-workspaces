@@ -19,8 +19,17 @@
 //     tabs.move ignores a move across the pinned boundary.
 //   - A tab moved to another window keeps its id and its session values,
 //     arrives visible and unselected, and fires onDetached + onAttached.
+//   - tabs.group without a groupId always makes a new group, in the window
+//     named by createProperties (default: the focused one). The listed tabs
+//     end up adjacent, in listed order, where the first listed one was.
+//     tabs.ungroup moves the tabs out before or after the group. Both fire
+//     onUpdated {groupId} per tab; tabGroups.update fires tabGroups.onUpdated.
 //   - A tab group emptied by closing or ungrouping its tabs is removed:
-//     tabGroups.onRemoved after the tabs' own events.
+//     tabGroups.onRemoved after the tabs' own events. Undo close puts a tab
+//     back in its group while that group lives.
+//   - quit() models a browser restart: the next run's makeWorld options, with
+//     tab ids handed out again by strip position, while groups, hidden state
+//     and session values come back with their tabs.
 //   - Session tab values follow the tab: across windows, into the recently
 //     closed list, and back onto the NEW tab id on undo close / restore.
 //   - API calls fire the same events as user actions. onCreated carries the
@@ -108,6 +117,7 @@ function passesFilter(ns, name, filter, args) {
 export function makeWorld({
   windows: winSeed = [{ id: 1 }],
   tabs: tabSeed = [],
+  groups: groupSeed = [],
   sessionValues = {},
   containers = [],
   storage = {},
@@ -304,7 +314,12 @@ export function makeWorld({
       lastAccessed: now(), openerTabId: props.openerTabId,
     };
     tabs.set(t.id, t);
-    w.tabIds.splice(insertIndex(w, t.pinned, props.index), 0, t.id);
+    // "New tab in group" from the tab strip: at the end of that group.
+    const lastOfGroup = props.groupId == null ? -1
+      : w.tabIds.findLastIndex((id) => tabs.get(id).groupId === props.groupId);
+    if (lastOfGroup !== -1) t.groupId = props.groupId;
+    const wantedIndex = lastOfGroup !== -1 ? lastOfGroup + 1 : props.index;
+    w.tabIds.splice(insertIndex(w, t.pinned, wantedIndex), 0, t.id);
     if (restore?.values) values.set(t.id, new Map(restore.values));
     const mustSelect = props.active !== false || !activeOf(w);
     const activated = mustSelect ? select(t, { deferEvent: true }) : null;
@@ -333,7 +348,7 @@ export function makeWorld({
     const blurTo = t.active ? findTabToBlurTo(t, exclude) : null;
     closed.unshift({
       lastModified: now(), tab: { ...closedSnap(t), active: false },
-      values: new Map(values.get(t.id) ?? []), windowId: w.id,
+      values: new Map(values.get(t.id) ?? []), windowId: w.id, groupId: t.groupId,
     });
     w.tabIds.splice(w.tabIds.indexOf(t.id), 1);
     tabs.delete(t.id);
@@ -438,6 +453,8 @@ export function makeWorld({
         t.active = false;
         t.multiselected = false;
         t.hidden = false;
+        t.groupId = -1; // the adopted tab does not stay in its old window's group
+        gcGroups();
         w.tabIds.splice(point, 0, t.id);
         lastInsertion.set(w.id, point);
         emit("tabs", "onDetached", t.id, { oldWindowId: src.id, oldPosition: from });
@@ -471,7 +488,10 @@ export function makeWorld({
   function setPinned(t, pinned) {
     if (t.pinned === pinned) return;
     const w = windows.get(t.windowId);
-    if (pinned) setHidden(t, false); // pinTab() shows the tab first
+    if (pinned) {
+      setHidden(t, false); // pinTab() shows the tab first
+      setGroup(t, -1); // a pinned tab is in no group
+    }
     const from = w.tabIds.indexOf(t.id);
     const to = pinned ? pinnedCount(w) : pinnedCount(w) - 1;
     w.tabIds.splice(from, 1);
@@ -479,6 +499,7 @@ export function makeWorld({
     t.pinned = pinned;
     if (from !== to) emit("tabs", "onMoved", t.id, { windowId: w.id, fromIndex: from, toIndex: to });
     emit("tabs", "onUpdated", t.id, { pinned }, snap(t));
+    gcGroups();
   }
 
   // An emptied group is removed (tabGroups.onRemoved, after the tabs'
@@ -489,6 +510,100 @@ export function makeWorld({
       groups.delete(gid);
       emit("tabGroups", "onRemoved", clone(g), { isWindowClosing });
     }
+  }
+
+  // The id order of window `w` changed: onMoved for every tab that moved.
+  function emitMoves(w, before) {
+    w.tabIds.forEach((id, toIndex) => {
+      const fromIndex = before.indexOf(id);
+      if (fromIndex !== toIndex && fromIndex !== -1) {
+        emit("tabs", "onMoved", id, { windowId: w.id, fromIndex, toIndex });
+      }
+    });
+  }
+
+  // Set a tab's group and report it (onUpdated {groupId}).
+  function setGroup(t, gid) {
+    if (t.groupId === gid) return;
+    t.groupId = gid;
+    emit("tabs", "onUpdated", t.id, { groupId: gid }, snap(t));
+  }
+
+  // tabs.group (ext-tabs.js group()). With a groupId the tabs join that group
+  // at its end. Without one a new group is made, placed where the first listed
+  // tab was: before that tab's own group when it led it, after that group when
+  // it sat further in. Tabs of another window are adopted first.
+  function groupTabs(ids, { groupId = null, windowId = null } = {}) {
+    const list = requireTabs(ids);
+    if (list.length === 0) throw new Error("Cannot create tab group with zero tabs");
+    let g;
+    if (groupId != null) {
+      g = groups.get(groupId);
+      if (!g) throw new Error(`No group with id: ${groupId}`);
+    } else {
+      const w = requireWindow(windowId);
+      g = { id: ++nextGroupId, windowId: w.id, title: "", color: "grey", collapsed: false };
+      groups.set(g.id, g);
+    }
+    const w = windows.get(g.windowId);
+    const foreign = list.filter((t) => t.windowId !== w.id);
+    if (foreign.length > 0) {
+      moveTabs(foreign.map((t) => t.id), { windowId: w.id });
+      for (const t of foreign) t.groupId = -1;
+    }
+    const before = [...w.tabIds];
+    const listed = new Set(list.map((t) => t.id));
+    const block = (gid) => before.filter((id) => tabs.get(id).groupId === gid);
+    const first = list[0];
+    let after = before.indexOf(first.id); // the first non-listed tab from here on follows the group
+    if (groupId != null) {
+      after = before.indexOf(block(groupId).at(-1)) + 1;
+    } else if (first.groupId !== -1 && block(first.groupId)[0] !== first.id) {
+      after = before.indexOf(block(first.groupId).at(-1)) + 1;
+    }
+    const follower = before.slice(after).find((id) => !listed.has(id));
+    w.tabIds = before.filter((id) => !listed.has(id));
+    const at = follower === undefined ? w.tabIds.length : w.tabIds.indexOf(follower);
+    w.tabIds.splice(at, 0, ...list.map((t) => t.id));
+    emitMoves(w, before);
+    for (const t of list) setGroup(t, g.id);
+    gcGroups();
+    return g.id;
+  }
+
+  // tabs.ungroup (ext-tabs.js ungroup()): per group, the listed tabs in strip
+  // order move before the group when they include its first tab, else after it.
+  function ungroupTabs(ids) {
+    const byGroup = new Map();
+    for (const t of requireTabs(ids)) {
+      if (t.groupId === -1) continue;
+      if (!byGroup.has(t.groupId)) byGroup.set(t.groupId, []);
+      byGroup.get(t.groupId).push(t);
+    }
+    for (const [gid, list] of byGroup) {
+      const w = windows.get(list[0].windowId);
+      const before = [...w.tabIds];
+      const block = before.filter((id) => tabs.get(id).groupId === gid);
+      list.sort((a, b) => before.indexOf(a.id) - before.indexOf(b.id));
+      const leaving = new Set(list.map((t) => t.id));
+      const anchor = list[0].id === block[0] ? block[0] : block.at(-1);
+      const after = list[0].id === block[0] ? before.indexOf(anchor) : before.indexOf(anchor) + 1;
+      const follower = before.slice(after).find((id) => !leaving.has(id));
+      w.tabIds = before.filter((id) => !leaving.has(id));
+      const at = follower === undefined ? w.tabIds.length : w.tabIds.indexOf(follower);
+      w.tabIds.splice(at, 0, ...list.map((t) => t.id));
+      emitMoves(w, before);
+      for (const t of list) setGroup(t, -1);
+    }
+    gcGroups();
+  }
+
+  function updateGroup(gid, props = {}) {
+    const g = groups.get(gid);
+    if (!g) throw new Error(`No group with id: ${gid}`);
+    Object.assign(g, props);
+    emit("tabGroups", "onUpdated", clone(g));
+    return clone(g);
   }
 
   function restoreClosed(sessionId) {
@@ -502,6 +617,7 @@ export function makeWorld({
       const t = createTab({
         windowId, url: entry.tab.url, title: entry.tab.title, pinned: entry.tab.pinned,
         index: entry.tab.index, cookieStoreId: entry.tab.cookieStoreId, active: true,
+        groupId: groups.has(entry.groupId) ? entry.groupId : undefined,
       }, { values: entry.values });
       return { lastModified: entry.lastModified, tab: snap(t) };
     }
@@ -552,9 +668,13 @@ export function makeWorld({
       first.active = true;
     }
   }
+  for (const g of groupSeed) {
+    groups.set(g.id, { windowId: firstWindowId, title: "", color: "grey", collapsed: false, ...g });
+  }
   for (const t of tabs.values()) if (t.groupId !== -1 && !groups.has(t.groupId)) {
     groups.set(t.groupId, { id: t.groupId, windowId: t.windowId, title: "", color: "grey", collapsed: false });
   }
+  nextGroupId = Math.max(nextGroupId, ...groups.keys());
   let nextTabId = Math.max(100, ...tabs.keys()) + 1;
   for (const [id, v] of Object.entries(sessionValues)) {
     const map = new Map();
@@ -657,28 +777,14 @@ export function makeWorld({
         return hidden;
       }),
       show: api("tabs.show", (ids) => { for (const t of requireTabs(ids)) setHidden(t, false); }),
-      group: api("tabs.group", ({ tabIds, groupId, createProperties } = {}) => {
-        const list = requireTabs(tabIds);
-        const gid = groupId ?? ++nextGroupId;
-        if (!groups.has(gid)) {
-          const windowId = createProperties?.windowId ?? list[0].windowId;
-          groups.set(gid, { id: gid, windowId, title: "", color: "grey", collapsed: false });
-        }
-        for (const t of list) t.groupId = gid;
-        gcGroups();
-        return gid;
-      }),
-      ungroup: api("tabs.ungroup", (ids) => { for (const t of requireTabs(ids)) t.groupId = -1; gcGroups(); }),
+      group: api("tabs.group", ({ tabIds, groupId, createProperties } = {}) =>
+        groupTabs(tabIds, { groupId, windowId: createProperties?.windowId })),
+      ungroup: api("tabs.ungroup", (ids) => { ungroupTabs(ids); }),
     },
     tabGroups: {
       query: api("tabGroups.query", ({ windowId } = {}) =>
         [...groups.values()].filter((g) => windowId == null || g.windowId === windowId).map(clone)),
-      update: api("tabGroups.update", (gid, props = {}) => {
-        const g = groups.get(gid);
-        if (!g) throw new Error(`No group with id: ${gid}`);
-        Object.assign(g, props);
-        return clone(g);
-      }),
+      update: api("tabGroups.update", (gid, props) => updateGroup(gid, props)),
     },
     sessions: {
       getTabValue: api("sessions.getTabValue", (tabId, key) => {
@@ -786,6 +892,48 @@ export function makeWorld({
     openWindow: (props = {}) => winSnap(createWindow(props), { populate: true }),
     closeWindow: (id) => { closeWindow(id); },
     focusWindow: (id) => { focusWindow(id); },
+    // The user makes a group from the tab strip, in the tabs' own window.
+    groupTabs: (ids, props = {}) => {
+      const gid = groupTabs(ids, { windowId: requireTab([].concat(ids)[0]).windowId });
+      updateGroup(gid, props);
+      return gid;
+    },
+    ungroupTabs: (ids) => { ungroupTabs(ids); },
+    updateGroup: (gid, props) => updateGroup(gid, props),
+
+    // The browser quits and a new run starts: makeWorld options for that run.
+    // Tab ids start over by strip position, from `firstTabId`. `selectedFirst`
+    // gives the selected tab the first id, as a real profile showed. Clean
+    // quit: the windows close first, with their events. `clean: false`
+    // is a crash: nothing is reported, the storage stays as it was.
+    async quit({ clean = true, firstTabId = 2, selectedFirst = false } = {}) {
+      const all = [...windows.values()].flatMap(tabsOf);
+      const numbering = selectedFirst ? [...all.filter((t) => t.active), ...all.filter((t) => !t.active)] : all;
+      const newId = new Map(numbering.map((t, i) => [t.id, firstTabId + i]));
+      const options = {
+        windows: [...windows.values()].map((w) => ({
+          id: w.id, type: w.type, incognito: w.incognito, state: w.state, focused: w.id === focusedId,
+        })),
+        tabs: all.map((t) => ({
+          id: newId.get(t.id), windowId: t.windowId, url: t.url, title: t.title, pinned: t.pinned,
+          hidden: t.hidden, active: t.active, groupId: t.groupId, cookieStoreId: t.cookieStoreId,
+        })),
+        groups: [...groups.values()].map(clone),
+        sessionValues: Object.fromEntries(all.filter((t) => values.has(t.id)).map((t) => [
+          newId.get(t.id),
+          Object.fromEntries([...values.get(t.id)].map(([k, raw]) => [k, JSON.parse(raw)])),
+        ])),
+        containers, storageLatencyMs, apiLatencyMs, autoEvents, closeWindowWithLastTab, urlCommitMs,
+        sessionAlive: false,
+      };
+      if (clean) {
+        for (const id of [...windows.keys()]) closeWindow(id);
+        await idle();
+      }
+      world.teardown();
+      options.storage = clone(storage);
+      return options;
+    },
 
     // ── Inspection ──
     tab: (id) => (tabs.has(id) ? snap(tabs.get(id)) : undefined),
@@ -798,6 +946,14 @@ export function makeWorld({
       return raw === undefined ? undefined : JSON.parse(raw);
     },
     record: (wspId) => storage[`ld-wsp-${wspId}`],
+    // Native groups of a window in strip order: { title, color, collapsed, tabs: [ids] }.
+    nativeGroups: (windowId = focusedId) => {
+      const order = windows.get(windowId)?.tabIds ?? [];
+      return [...groups.values()]
+        .filter((g) => g.windowId === windowId)
+        .map((g) => ({ ...clone(g), tabs: order.filter((id) => tabs.get(id).groupId === g.id) }))
+        .sort((a, b) => order.indexOf(a.tabs[0]) - order.indexOf(b.tabs[0]));
+    },
   };
   return world;
 }

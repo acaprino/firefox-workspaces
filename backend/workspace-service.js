@@ -112,6 +112,33 @@ class WorkspaceService {
     }
   }
 
+  // Bring the record of the workspace on screen up to date after a native group
+  // changed. One pass at a time per window, plus at most one more for what
+  // changed during it: grouping N tabs fires N events.
+  static _groupSyncs = new Map(); // windowId -> { again, done }
+
+  static syncActiveGroups(windowId) {
+    const running = WorkspaceService._groupSyncs.get(windowId);
+    if (running) {
+      running.again = true;
+      return running.done;
+    }
+    const sync = { again: false, done: null };
+    WorkspaceService._groupSyncs.set(windowId, sync);
+    sync.done = (async () => {
+      try {
+        do {
+          sync.again = false;
+          const activeWsp = await WorkspaceService.getActiveWspFast(windowId);
+          await activeWsp?.updateTabGroups();
+        } while (sync.again);
+      } finally {
+        WorkspaceService._groupSyncs.delete(windowId);
+      }
+    })();
+    return sync.done;
+  }
+
   // Returns true/false if the tab's membership is known, or null if cache is cold/mismatched window.
   static isTabInActiveWsp(windowId, tabId) {
     const c = WorkspaceService._activeCache;
@@ -585,7 +612,6 @@ class WorkspaceService {
           freshWsp.tabs.unshift(...added);
         });
         activeWsp.tabs.unshift(...toActiveWsp.filter(tabId => !activeWsp.tabs.includes(tabId)));
-        await activeWsp.updateTabGroups();
         await Promise.all(toActiveWsp.map(tabId => TabService.setTabSessionValue(tabId, activeWsp.id)));
       }
 
@@ -819,9 +845,6 @@ class WorkspaceService {
           freshWsp.tabs.length - freshValid.length,
           "stale tab IDs from workspace:", wsp.name);
         freshWsp.tabs = freshValid;
-        for (const group of freshWsp.groups) {
-          group.tabs = group.tabs.filter(id => openTabIds.has(id));
-        }
         // Sync in-memory object so catch-all orphan detection below uses clean data
         wsp.tabs = freshValid;
       });
@@ -829,11 +852,20 @@ class WorkspaceService {
 
     console.log("[WorkspaceService][_hideInactiveFromList] total tabs to hide:", allTabsToHide.length);
     if (allTabsToHide.length > 0) {
+      const grouped = new Set(allOpenTabs.filter(tab => tab.groupId !== -1).map(tab => tab.id));
+      // Last look at the native groups about to be taken apart: this is what
+      // comes back when the workspace does. A change no event reported (a new
+      // tab opened inside a group, a group from before an upgrade) counts too.
+      for (const wsp of workspaces) {
+        const isActive = activeWspId != null ? (wsp.id === activeWspId) : wsp.active;
+        if (isActive || !wsp.tabs.some(id => grouped.has(id))) continue;
+        try { await wsp.updateTabGroups(); }
+        catch (e) { console.debug("[WorkspaceService][_hideInactiveFromList] could not record the groups of", wsp.id, ":", e.message); }
+      }
       await TabService.hideTabs(allTabsToHide);
       // Only tabs in a group: an ungroup call also marks "our own ungroup"
       // for the closed-group bookkeeping (TabService.onTabGroupRemoved), and
       // this pass now runs at every init.
-      const grouped = new Set(allOpenTabs.filter(tab => tab.groupId !== -1).map(tab => tab.id));
       const toUngroup = allTabsToHide.filter(id => grouped.has(id));
       if (toUngroup.length > 0) await TabService.ungroup(toUngroup);
     }
@@ -1010,9 +1042,6 @@ class WorkspaceService {
     const migrateIds = new Set(toMigrate.map(t => t.id));
     await WSPStorageManager.mutateWorkspace(wspId, (freshWsp) => {
       freshWsp.tabs = freshWsp.tabs.filter(id => !migrateIds.has(id));
-      for (const group of freshWsp.groups) {
-        group.tabs = group.tabs.filter(id => !migrateIds.has(id));
-      }
       console.log("[WorkspaceService][_migrateTabsToContainer] pre-removed", migrateIds.size,
         "tabs from storage, remaining:", freshWsp.tabs.length);
     });

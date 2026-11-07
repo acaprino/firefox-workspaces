@@ -189,15 +189,53 @@ class TabService {
     }
   }
 
-  // Drop a tab's workspace tag. For tabs that leave workspace tracking while
-  // staying open (pinned, moved to another window): a tag left behind would
-  // later file the tab back into that workspace -- and hide it there.
+  // Drop a tab's workspace tag and its group key. For tabs that leave workspace
+  // tracking while staying open (pinned, moved to another window): a tag left
+  // behind would later file the tab back into that workspace -- and hide it there.
   static async clearTabSessionValue(tabId) {
     try {
       await browser.sessions.removeTabValue(tabId, "wspId");
+      await browser.sessions.removeTabValue(tabId, TabService._GROUP_TAG);
       console.log("[TabService][clearTabSessionValue] tabId:", tabId);
     } catch (e) {
       console.debug("[Workspaces] clearTabSessionValue failed (tab may be closed):", tabId);
+    }
+  }
+
+  // ── Tab group membership ──
+  // Hiding a workspace takes its native groups apart and showing it builds
+  // them back. What ties a tab to its group in between is this session value:
+  // it stays with the tab through a browser restart, like "wspId". A tab id
+  // does not: ids start over at every browser start, in practice by strip
+  // position, so a stored id soon names another tab.
+  static _GROUP_TAG = "wspGroup";
+
+  // tabId -> group key, for those of `tabIds` that carry one.
+  static async getGroupTags(tabIds) {
+    const entries = await Promise.all(tabIds.map(async (tabId) => {
+      try {
+        return [tabId, await browser.sessions.getTabValue(tabId, TabService._GROUP_TAG)];
+      } catch (e) {
+        console.debug("[TabService][getGroupTags] session lookup failed for tab", tabId, ":", e.message);
+        return [tabId, undefined];
+      }
+    }));
+    return new Map(entries.filter(([, key]) => key));
+  }
+
+  static async setGroupTag(tabId, key) {
+    try {
+      await browser.sessions.setTabValue(tabId, TabService._GROUP_TAG, key);
+    } catch (e) {
+      console.debug("[TabService][setGroupTag] failed (tab may be closed):", tabId);
+    }
+  }
+
+  static async clearGroupTag(tabId) {
+    try {
+      await browser.sessions.removeTabValue(tabId, TabService._GROUP_TAG);
+    } catch (e) {
+      console.debug("[TabService][clearGroupTag] failed (tab may be closed):", tabId);
     }
   }
 
@@ -653,9 +691,6 @@ class TabService {
         // workspace no longer writes a zombie record back.
         await WSPStorageManager.mutateWorkspace(wsp.id, (freshWsp) => {
           freshWsp.tabs = freshWsp.tabs.filter(id => id !== tabId);
-          for (const group of freshWsp.groups) {
-            group.tabs = group.tabs.filter(id => id !== tabId);
-          }
           console.log("[TabService][removeTabFromWorkspace] removed -- workspace now has", freshWsp.tabs.length, "tabs");
         });
         // Keep active-workspace cache consistent
@@ -694,9 +729,6 @@ class TabService {
     if (wasInSource) {
       const freshFrom = await WSPStorageManager.mutateWorkspace(fromWspId, (fresh) => {
         fresh.tabs = fresh.tabs.filter(id => id !== tab.id);
-        for (const group of fresh.groups) {
-          group.tabs = group.tabs.filter(id => id !== tab.id);
-        }
       });
       // Reflect the post-save source size for the empty-source check below
       if (freshFrom) fromWsp.tabs = freshFrom.tabs;
@@ -742,6 +774,12 @@ class TabService {
     if (wasInSource) TabService._scheduleSnapshotRefresh(fromWsp.windowId, fromWspId);
 
     if (wasInSource) {
+      // The tab leaves its group now: the activation and the hide below record
+      // the groups they take apart, and this tab is no longer part of them.
+      await TabService.clearGroupTag(effectiveTabId);
+      try { await TabService.ungroup(effectiveTabId); }
+      catch (e) { console.debug("[TabService][moveTabToWsp] tabs.ungroup failed for tab", effectiveTabId, ":", e.message); }
+
       const sourceDestroyed = fromWsp.tabs.length === 0;
       console.log("[TabService][moveTabToWsp] sourceDestroyed:", sourceDestroyed,
         "tab.active:", tab.active);
@@ -768,9 +806,6 @@ class TabService {
           await WorkspaceService.hideInactiveWspTabs(freshToWsp.windowId, activeWsp.id);
         }
       }
-
-      try { await TabService.ungroup(effectiveTabId); }
-      catch (e) { console.debug("[TabService][moveTabToWsp] tabs.ungroup failed for tab", effectiveTabId, ":", e.message); }
     }
 
     await MenuService.refreshTabMenu();
