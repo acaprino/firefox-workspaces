@@ -20,17 +20,12 @@
                 <label id="color-picker-label">Color</label>
                 <div class="color-swatches" id="color-swatches" role="radiogroup" aria-labelledby="color-picker-label"></div>
             </div>
-            <!-- Checkbox row (shown in export dialog) -->
+            <!-- Checkbox row (shown in diagnostics dialog) -->
             <div class="custom-dialog-checkbox-row" id="custom-dialog-checkbox-row" hidden>
                 <label>
                     <input type="checkbox" id="custom-dialog-checkbox">
                     <span id="custom-dialog-checkbox-label"></span>
                 </label>
-            </div>
-            <!-- Folder picker row (shown in restore dialog) -->
-            <div class="custom-dialog-folder-row" id="custom-dialog-folder-row" hidden>
-                <label for="custom-dialog-folder-select">Bookmark folder</label>
-                <select id="custom-dialog-folder-select" class="custom-dialog-select"></select>
             </div>
             <!-- Container picker row (shown in create/rename dialog) -->
             <div class="custom-dialog-container-row" id="custom-dialog-container-row" hidden>
@@ -60,6 +55,7 @@
         <div class="wsp-error-banner-actions">
             <button type="button" id="wsp-error-copy">Copy diagnostic dump</button>
             <button type="button" id="wsp-error-acknowledge" title="Dismiss this banner. The next Firefox restart will retry the restore.">Dismiss</button>
+            <button type="button" id="wsp-error-reopen" title="Reopen the primary window from Firefox's Recently Closed Windows." hidden>Reopen window</button>
             <button type="button" id="wsp-error-give-up" title="Permanently abandon the restore retry. Only do this if you do not need the workspaces from before the failed restart." class="wsp-error-give-up">Give up</button>
         </div>
     </div>
@@ -79,7 +75,7 @@
     </div>
     <div class="footer-container">
         <a href="#" class="footer" id="createNewWsp">New workspace</a>
-        <a href="#" class="footer" id="restoreFromBookmarks">Restore from bookmarks</a>
+        <a href="backups.html" class="footer" id="backupHistory">Backup history</a>
         <a href="#" class="footer" id="wsp-copy-diagnostics" title="Copy a diagnostic dump of the extension's data for a bug report (asks first)">Copy diagnostics</a>
     </div>
 </div>
@@ -87,6 +83,7 @@
 <script src="js/dialog.js"></script>
 <script src="js/tooltip.js"></script>
 <script src="js/drag-drop.js"></script>
+<script src="js/recovery-banner.js"></script>
 <script src="js/wsp.js"></script>
 </body>
 </html>

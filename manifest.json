@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "Workspaces",
-  "version": "2.6.59",
+  "version": "2.6.63",
   "description": "A workspace manager for Firefox",
   "icons": {
     "64": "icons/layered-64.png",
@@ -23,7 +23,8 @@
     "tabHide",
     "tabGroups",
     "storage",
-    "bookmarks",
+    "nativeMessaging",
+    "alarms",
     "menus",
     "sessions",
     "contextualIdentities",
@@ -73,13 +74,18 @@
   "background": {
     "scripts": [
       "backend/theme-utils.js",
+      "backend/recovery-data.js",
       "backend/storage.js",
+      "backend/local-backup-data.js",
+      "backend/restore-matcher.js",
       "backend/workspace.js",
       "backend/ui-service.js",
       "backend/menu-service.js",
       "backend/workspace-service.js",
       "backend/tab-service.js",
-      "backend/bookmark-service.js",
+      "backend/snapshot-service.js",
+      "backend/workspace-restore-service.js",
+      "backend/local-backup-service.js",
       "backend/brainer.js",
       "backend/handler.js"
     ]

@@ -22,7 +22,7 @@ async function outcome(p, ms = 10) {
 const DELETE = { message: 'Delete "Work"?' };
 const GIVE_UP = {
   message: "Give up the automatic restore retry?\n\nWhere possible, the saved tab lists " +
-    "will first be exported to bookmarks.\n\nIf you have not copied the diagnostic dump yet, do that first.",
+    "will first be saved as JSON.\n\nIf you have not copied the diagnostic dump yet, do that first.",
 };
 
 // ---------------------------------------------------------------- X-03
@@ -45,8 +45,8 @@ test("X-03: Enter on Cancel cancels on the animated close path too", async () =>
 test("X-03: export dialog with 'close after export' ticked, Enter on Cancel does not confirm", async () => {
   const { get, $, press } = dialogOnly();
   const p = get("showCustomDialog")({
-    message: 'Export "Work" to bookmarks?', showCheckbox: true,
-    checkboxLabel: "Close workspace after export", checkboxDefault: false,
+    message: 'Copy diagnostic information?', showCheckbox: true,
+    checkboxLabel: "Include full addresses", checkboxDefault: false,
   });
   press($("custom-dialog-checkbox"), " ");
   assert.equal($("custom-dialog-checkbox").checked, true);
@@ -213,7 +213,7 @@ test("X-57: a notice has no Cancel button and starts on OK", async () => {
 
 test("X-57: the collapsed icon picker is out of the Tab order", async () => {
   const { get, $, press, document } = dialogOnly();
-  get("showCustomDialog")({ message: 'Export "Work" to bookmarks?', showCheckbox: true, checkboxLabel: "Close" });
+  get("showCustomDialog")({ message: 'Copy diagnostic information?', showCheckbox: true, checkboxLabel: "Full" });
   const iconBtn = $("custom-dialog-icon-btn");
   const clear = $("icon-clear-btn");
   clear.focus();
@@ -262,6 +262,6 @@ test("X-49: a long confirm with a checkbox (diagnostics) grows the popup to fit"
 
   // The short export confirm keeps the old floor.
   $("custom-dialog-message").offsetHeight = 40;
-  show({ message: 'Export "Work" to bookmarks?', showCheckbox: true, checkboxLabel: "Close" });
+  show({ message: 'Copy diagnostic information?', showCheckbox: true, checkboxLabel: "Full" });
   assert.equal(document.body.style.minHeight, "180px");
 });

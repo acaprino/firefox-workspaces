@@ -120,7 +120,7 @@ test("X-25: row actions are named after their workspace and in visual order", as
   const { row } = await openPopup();
   const btns = row(B).querySelectorAll(".edit-btn");
   assert.deepEqual(btns.map((b) => [...b.classList].find((c) => c !== "edit-btn")),
-    ["export-btn", "rename-btn", "delete-btn"]);
+    ["rename-btn", "delete-btn"]);
   for (const b of btns) assert.match(b.getAttribute("aria-label") || "", /"Work"/);
   assert.match(row(B).querySelector(".delete-btn").getAttribute("aria-label"), /^Delete/);
 });
@@ -252,12 +252,10 @@ test("X-25: a slow reply for an older query does not replace newer results", asy
 // ---------------------------------------------------------------- dialogs from the popup
 
 test("X-57: notices from the popup show a lone OK button", async () => {
-  const { $, press, settle, document } = await openPopup({ getBookmarkWorkspaces: [] });
-  const link = $("restoreFromBookmarks");
-  link.focus();
-  press(link, "Enter");
+  const { $, get, settle, document } = await openPopup();
+  get("showCustomDialog")({ message: "No saved tabs found.", infoOnly: true });
   await settle(20);
-  assert.equal($("custom-dialog-message").textContent, "No saved workspaces found in bookmarks.");
+  assert.equal($("custom-dialog-message").textContent, "No saved tabs found.");
   assert.equal($("custom-dialog-cancel").hidden, true);
   assertSame(document.activeElement, $("custom-dialog-ok"));
 });

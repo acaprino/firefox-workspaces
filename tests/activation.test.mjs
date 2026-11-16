@@ -4,7 +4,7 @@
 //  - A failed activation keeps the previous workspace active (X-29), and a
 //    destroy waits for an activation already heading for its workspace.
 //  - createWorkspace switches on the activation chain (X-36); so does a
-//    bookmark restore (X-23).
+//    JSON restore (X-23).
 //  - Rapid keyboard cycling steps from the pending target (X-37).
 //  - Moving a workspace's last tab brings the destination up directly (X-38).
 //  - tabs.hide/show are all-or-nothing in Firefox: one closing tab must not
@@ -184,16 +184,11 @@ test("X-38: moving a workspace's only tab to another brings the destination up w
   assert.equal(world.activeTabId(1), 1);
 });
 
-test("X-23: a click on an old tab during a bookmark restore leaves storage, cache and screen agreeing", async (t) => {
+test("X-23: a click on an old tab during a JSON restore leaves storage, cache and screen agreeing", async (t) => {
   const world = threeWorkspaces({ apiLatencyMs: 1 });
-  world.overrides.bookmarks = {
-    search: async () => [{ id: "parent", type: "folder", parentId: "unfiled_____", title: "Workspaces" }],
-    get: async (id) => [{ id, type: "folder", parentId: "parent", title: "Saved" }],
-    getChildren: async () => Array.from({ length: 6 }, (_, i) => ({ url: `https://saved.test/${i}`, title: `s${i}` })),
-  };
   const { env, WS } = await boot(world, t);
 
-  const restore = env.get("BookmarkService").restoreWorkspace("saved", 1);
+  const restore = env.get("WorkspaceRestoreService").restore({ name: "Saved", groups: [], tabs: Array.from({ length: 6 }, (_, i) => ({ url: `https://saved.test/${i}`, title: `s${i}`, cookieStoreId: "firefox-default", groupKey: null })) }, 1);
   await new Promise((r) => setTimeout(r, 8)); // some restored tabs are open
   world.selectTab(2); // the user clicks A's still visible tab
   const result = await restore;

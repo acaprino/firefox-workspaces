@@ -1,3 +1,4 @@
+import { completeSnapshots, nativeBackup } from "./helpers/native-backup.mjs";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { loadBackend } from "./helpers/load-backend.mjs";
@@ -9,7 +10,7 @@ async function startupFixture(t, url) {
   const env = loadBackend();
   await env.settle();
   t.after(() => {
-    for (const timer of env.get("TabService")._snapshotTimers.values()) clearTimeout(timer);
+    for (const timer of env.get("SnapshotService")._timers.values()) clearTimeout(timer);
     clearTimeout(env.get("Brainer")._restoreRetryTimer);
     clearTimeout(env.get("Brainer")._initRetryTimer);
     clearTimeout(env.get("WorkspaceService")._lastActiveTimer);
@@ -83,9 +84,9 @@ for (const path of ["detected restart", "undetected restart"]) {
 
 test("a pending snapshot refresh cannot erase data after startup recovery pauses", async t => {
   const env = await startupFixture(t, "chrome://browser/content/blanktab.html");
-  const TabService = env.get("TabService");
-  TabService._SNAPSHOT_DEBOUNCE_MS = 1;
-  TabService._scheduleSnapshotRefresh(1, WSP_B);
+  const SnapshotService = env.get("SnapshotService");
+  SnapshotService.DEBOUNCE_MS = 1;
+  SnapshotService.schedule(1, WSP_B);
 
   await assert.rejects(env.get("Brainer")._repairTabAssignments(1, true), /Refuse-to-wipe/);
   await env.settle();
@@ -194,6 +195,9 @@ test("dismissing the warning keeps automatic recovery in the original window", a
 
 test("giving up recovery cancels pending automatic retries", async t => {
   const env = await startupFixture(t, "about:blank");
+  completeSnapshots(env.storageData);
+  completeSnapshots(env.saved);
+  env.browser.runtime.connectNative = nativeBackup().runtime.connectNative;
   const Brainer = env.get("Brainer");
   await assert.rejects(Brainer._repairTabAssignments(1, true), /Refuse-to-wipe/);
   const result = await env.get("_handleMessage")({ action: "giveUpRestoreRetry" });

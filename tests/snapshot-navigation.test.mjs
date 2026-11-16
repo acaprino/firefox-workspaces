@@ -39,7 +39,7 @@ async function fixture(t) {
           return { ...tab };
         },
       },
-      sessions: { getTabValue: async id => id === 1 ? WSP_A : WSP_B },
+      sessions: { getTabValue: async (id, key) => key === "wspId" ? (id === 1 ? WSP_A : WSP_B) : undefined },
     },
   });
   await env.settle();
@@ -50,10 +50,10 @@ async function fixture(t) {
   const originalSet = env.browser.storage.local.set;
   env.browser.storage.local.get = async keys => structuredClone(await originalGet(keys));
   env.browser.storage.local.set = async data => originalSet(structuredClone(data));
-  const tabService = env.get("TabService");
-  tabService._SNAPSHOT_DEBOUNCE_MS = 1;
+  const snapshots = env.get("SnapshotService");
+  snapshots.DEBOUNCE_MS = 1;
   t.after(() => {
-    for (const timer of tabService._snapshotTimers.values()) clearTimeout(timer);
+    for (const timer of snapshots._timers.values()) clearTimeout(timer);
     clearTimeout(env.get("WorkspaceService")._lastActiveTimer);
   });
   return { ...env, tabs };
@@ -105,14 +105,20 @@ test("a URL lookup finishing during restore leaves its saved snapshot untouched"
   const savedSnapshot = [...env.storageData[`ld-wsp-${WSP_A}`].tabSnapshot];
   const originalGet = env.browser.storage.local.get;
   let release;
+  let signal;
+  let intercepted = false;
+  const entered = new Promise(resolve => { signal = resolve; });
   env.browser.storage.local.get = async keys => {
-    if (keys === "ld-wsp-window-1") await new Promise(resolve => { release = resolve; });
+    if (keys === "ld-wsp-window-1" && !intercepted) {
+      intercepted = true;
+      await new Promise(resolve => { release = resolve; signal(); });
+    }
     return originalGet(keys);
   };
   const tab = env.tabs[0];
   tab.url = "https://example.test/active-after";
   const navigation = env.browser.tabs.onUpdated._listeners[0](1, { url: tab.url }, { ...tab });
-  await env.settle();
+  await entered;
   assert.equal(typeof release, "function", "owner lookup is in flight before restore starts");
   env.get("Brainer")._state = "restoring";
   release();

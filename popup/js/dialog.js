@@ -56,7 +56,30 @@ function _createIconElement(iconName, className) {
 
 // Resolves false on Cancel / Escape. On OK: the form values, or true for a
 // plain confirmation or an `infoOnly` notice (a single OK button).
-function showCustomDialog({ message, withInput = false, defaultValue = "", defaultIcon = "", showContainerPicker = false, defaultContainerId = null, containers = [], showColorPicker = false, defaultColor = null, showCheckbox = false, checkboxLabel = "", checkboxDefault = false, showFolderPicker = false, folders = [], infoOnly = false }) {
+const _dialogQueue = [];
+let _dialogActive = false;
+
+function showCustomDialog(options) {
+  return new Promise((resolve, reject) => {
+    _dialogQueue.push({ options, resolve, reject });
+    _showNextDialog();
+  });
+}
+
+function _showNextDialog() {
+  if (_dialogActive || _dialogQueue.length === 0) return;
+  _dialogActive = true;
+  const { options, resolve, reject } = _dialogQueue.shift();
+  // One invocation owns the shared controls until its close animation and
+  // focus restoration finish. A late notice must never inherit a pending
+  // destructive confirmation's OK listener.
+  _showCustomDialog(options).then(resolve, reject).finally(() => {
+    _dialogActive = false;
+    _showNextDialog();
+  });
+}
+
+function _showCustomDialog({ message, withInput = false, defaultValue = "", defaultIcon = "", showContainerPicker = false, defaultContainerId = null, containers = [], showColorPicker = false, defaultColor = null, showCheckbox = false, checkboxLabel = "", checkboxDefault = false, infoOnly = false }) {
   return new Promise((resolve) => {
     const backdrop = document.getElementById("custom-dialog-backdrop");
     const msgEl = document.getElementById("custom-dialog-message");
@@ -73,8 +96,6 @@ function showCustomDialog({ message, withInput = false, defaultValue = "", defau
     const checkboxRow = document.getElementById("custom-dialog-checkbox-row");
     const checkboxEl = document.getElementById("custom-dialog-checkbox");
     const checkboxLabelEl = document.getElementById("custom-dialog-checkbox-label");
-    const folderRow = document.getElementById("custom-dialog-folder-row");
-    const folderSelect = document.getElementById("custom-dialog-folder-select");
     const okBtn = document.getElementById("custom-dialog-ok");
     const cancelBtn = document.getElementById("custom-dialog-cancel");
     const footerEl = backdrop.querySelector(".custom-dialog-footer");
@@ -144,18 +165,6 @@ function showCustomDialog({ message, withInput = false, defaultValue = "", defau
       checkboxLabelEl.textContent = checkboxLabel;
     }
 
-    // Folder picker setup
-    folderRow.hidden = !showFolderPicker;
-    if (showFolderPicker) {
-      folderSelect.innerHTML = "";
-      for (const f of folders) {
-        const opt = document.createElement("option");
-        opt.value = f.id;
-        opt.textContent = `${f.title} (${f.bookmarkCount} tabs)`;
-        folderSelect.appendChild(opt);
-      }
-    }
-
     // Initialize icon state (scoped to this dialog invocation)
     let selectedIcon = defaultIcon || "";
     _updateIconBtn(iconBtn, selectedIcon);
@@ -177,10 +186,6 @@ function showCustomDialog({ message, withInput = false, defaultValue = "", defau
 
     // Expand popup viewport so Firefox doesn't clip the dialog
     function syncPopupHeight() {
-      if (showFolderPicker) {
-        document.body.style.minHeight = "180px";
-        return;
-      }
       if (showCheckbox) {
         // Grow for a long message (the diagnostics notice) so the checkbox
         // and the buttons stay in view.
@@ -213,7 +218,7 @@ function showCustomDialog({ message, withInput = false, defaultValue = "", defau
 
     // Toggle confirm mode class for delete dialogs (no body content)
     const dialog = backdrop.querySelector(".custom-dialog");
-    const hasBody = withInput || showCheckbox || showFolderPicker;
+    const hasBody = withInput || showCheckbox;
     if (hasBody) {
       dialog.classList.remove("dialog-confirm");
     } else {
@@ -240,8 +245,7 @@ function showCustomDialog({ message, withInput = false, defaultValue = "", defau
         inputEl.focus();
         inputEl.select();
       });
-    } else if (showFolderPicker) {
-      folderSelect.focus();
+
     } else {
       (infoOnly ? okBtn : cancelBtn).focus();
     }
@@ -366,8 +370,7 @@ function showCustomDialog({ message, withInput = false, defaultValue = "", defau
           result.containerId = containerSelect.value || null;
         }
         cleanup(result);
-      } else if (showFolderPicker) {
-        cleanup({ folderId: folderSelect.value });
+
       } else if (showCheckbox) {
         cleanup({ confirmed: true, checked: checkboxEl.checked });
       } else {
@@ -382,8 +385,7 @@ function showCustomDialog({ message, withInput = false, defaultValue = "", defau
     function updateOkButtonState() {
       if (withInput) {
         okBtn.disabled = inputEl.value.trim().length === 0;
-      } else if (showFolderPicker) {
-        okBtn.disabled = folders.length === 0;
+
       } else {
         okBtn.disabled = false;
       }

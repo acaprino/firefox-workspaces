@@ -7,7 +7,7 @@ import { createContext, runInContext } from "node:vm";
 async function renderBanner(payload) {
   const nodes = Object.fromEntries([
     "wsp-error-banner", "wsp-error-banner-text", "wsp-error-copy",
-    "wsp-error-acknowledge", "wsp-error-give-up",
+    "wsp-error-acknowledge", "wsp-error-give-up", "wsp-error-reopen",
   ].map(id => [id, { hidden: true, textContent: "", addEventListener() {} }]));
   const changes = [];
   const messages = [];
@@ -28,14 +28,16 @@ async function renderBanner(payload) {
       storage: { onChanged: { addListener: listener => changes.push(listener) } },
     },
   });
-  runInContext(readFileSync(new URL("../popup/js/wsp.js", import.meta.url), "utf8"), ctx);
+  for (const script of ["recovery-banner.js", "wsp.js"]) {
+    runInContext(readFileSync(new URL(`../popup/js/${script}`, import.meta.url), "utf8"), ctx);
+  }
   await runInContext("new WorkspaceUI()._setupRestoreErrorBanner()", ctx);
   return { nodes, messages, changes, text: () => nodes["wsp-error-banner-text"].textContent };
 }
 
 const incomplete = {
   when: 1789732764855, reason: "session-not-restored", wspCount: 3,
-  snapshotUrlCount: 31, exportedWorkspaces: 3, exportedUrls: 31,
+  backupFormat: "json", snapshotUrlCount: 31, exportedWorkspaces: 3, exportedUrls: 31,
 };
 
 function assertNeutral(text) {
@@ -47,7 +49,7 @@ test("incomplete restore banner reports backup and voluntary recovery without di
   assertNeutral(ui.text());
   assert.match(ui.text(), /not fully restored/i);
   assert.match(ui.text(), /31 URL\(s\)/);
-  assert.match(ui.text(), /Restore from bookmarks/);
+  assert.match(ui.text(), /Backup history/);
   assert.match(ui.text(), /not reopened automatically/i);
   assert.equal(ui.nodes["wsp-error-banner"].hidden, false);
   assert.equal(ui.nodes["wsp-error-give-up"].hidden, true);
@@ -56,12 +58,13 @@ test("incomplete restore banner reports backup and voluntary recovery without di
 
 test("a legacy auto-recovery banner always shows its backup even when all matched sessions reopened", async () => {
   const ui = await renderBanner({
-    ...incomplete, reason: "tabs-closed-at-startup", closedMatchCount: 25, restoredCount: 25,
+    ...incomplete, backupFormat: undefined, reason: "tabs-closed-at-startup", closedMatchCount: 25, restoredCount: 25,
   });
   assertNeutral(ui.text());
   assert.match(ui.text(), /25/);
   assert.match(ui.text(), /31 URL\(s\)/, "25 of 25 undo sessions does not mean all 31 snapshot URLs survived");
-  assert.match(ui.text(), /Restore from bookmarks/);
+  assert.match(ui.text(), /earlier version reported a bookmarks backup/i);
+  assert.doesNotMatch(ui.text(), /were saved as JSON/);
   assert.doesNotMatch(ui.text(), /All 25|not reopened automatically/i,
     "legacy payload must not claim completeness or deny past auto-recovery");
 });
@@ -69,10 +72,10 @@ test("a legacy auto-recovery banner always shows its backup even when all matche
 test("partial and failed backups report actual export results", async () => {
   const partial = await renderBanner({ ...incomplete, exportedWorkspaces: 1, exportedUrls: 7 });
   assert.match(partial.text(), /7 of 31 URL\(s\)/);
-  assert.match(partial.text(), /Restore from bookmarks/);
+  assert.match(partial.text(), /Backup history/);
 
   const failed = await renderBanner({ ...incomplete, exportedWorkspaces: 0, exportedUrls: 0 });
-  assert.match(failed.text(), /No tab list could be exported/i);
+  assert.match(failed.text(), /No new JSON backup could be saved/i);
   assert.doesNotMatch(failed.text(), /were exported to bookmarks/i);
 });
 

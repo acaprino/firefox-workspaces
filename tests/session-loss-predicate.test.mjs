@@ -21,14 +21,3 @@ test("_isSessionLost fires only on real loss evidence", async () => {
   assert.equal(Brainer._isSessionLost({ ...base, survivingUrlCount: 5 }), false, "exactly half survived: not lost");
   assert.equal(Brainer._isSessionLost({ ...base, survivingUrlCount: 4 }), true, "under half survived: lost");
 });
-
-test("_snapshotFingerprint is order-insensitive and content-sensitive", async () => {
-  const { get, settle } = loadBackend();
-  await settle();
-  const Brainer = get("Brainer");
-  const a = { id: "aaa", tabSnapshot: ["https://x/1", "https://x/2"] };
-  const b = { id: "bbb", tabSnapshot: ["https://y/1"] };
-  assert.equal(Brainer._snapshotFingerprint([a, b]), Brainer._snapshotFingerprint([b, a]));
-  const a2 = { id: "aaa", tabSnapshot: ["https://x/1", "https://x/CHANGED"] };
-  assert.notEqual(Brainer._snapshotFingerprint([a, b]), Brainer._snapshotFingerprint([a2, b]));
-});

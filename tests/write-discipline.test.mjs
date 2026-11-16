@@ -61,7 +61,7 @@ function lockCheckedStorage(seed, violations) {
   return { storage, attach: (w) => { world = w; } };
 }
 
-test("every workspace record write holds that workspace's lock (restore, activation, repair, bookmark restore, edits)", async (t) => {
+test("every workspace record write holds that workspace's lock (restore, activation, repair, JSON restore, edits)", async (t) => {
   const violations = [];
   // Restart: the workspaces were stored under old window 7; window 1 comes
   // back with the session-tagged tabs. C is empty and bound to a deleted
@@ -87,13 +87,6 @@ test("every workspace record write holds that workspace's lock (restore, activat
     autoEvents: false,
   });
   attach(world);
-  world.overrides.bookmarks = {
-    search: async () => [{ id: "parent", type: "folder", parentId: "unfiled_____", title: "Workspaces" }],
-    get: async (id) => [{ id, type: "folder", parentId: "parent", title: "Saved" }],
-    getChildren: async (id) => (id === "saved"
-      ? [{ url: "https://saved.test/1", title: "s1" }, { url: "https://saved.test/2", title: "s2" }]
-      : []),
-  };
   const env = await world.boot({ settleMs: 700 });
   t.after(() => world.teardown());
   const Brainer = env.get("Brainer");
@@ -113,7 +106,7 @@ test("every workspace record write holds that workspace's lock (restore, activat
   await Brainer._repairTabAssignments(1, true);
   assert.deepEqual(world.record(WSP_B).tabs, [3], "repair re-filed tab 3 under B");
 
-  await env.get("BookmarkService").restoreWorkspace("saved", 1);
+  await env.get("WorkspaceRestoreService").restore({ name: "Saved", groups: [], tabs: Array.from({ length: 2 }, (_, i) => ({ url: `https://saved.test/${i}`, title: `s${i}`, cookieStoreId: "firefox-default", groupKey: null })) }, 1);
   await WorkspaceService.renameWorkspace(WSP_B, { name: "B2" });
   await WorkspaceService.setWorkspaceContainer(WSP_A, "firefox-container-1");
   const extra = world.openTab({ url: "https://late.test/", active: false });
@@ -229,20 +222,20 @@ test("the repair waits for an in-flight snapshot refresh instead of being overwr
         },
       },
       sessions: {
-        getTabValue: async (id) => sv.get(id),
-        setTabValue: async (id, k, v) => { sv.set(id, v); },
+        getTabValue: async (id, key) => key === "wspId" ? sv.get(id) : undefined,
+        setTabValue: async (id, k, v) => { if (k === "wspId") sv.set(id, v); },
         getRecentlyClosed: async () => [],
       },
     },
   });
   await env.settle(100);
-  const TabService = env.get("TabService");
-  TabService._SNAPSHOT_DEBOUNCE_MS = 0;
+  const SnapshotService = env.get("SnapshotService");
+  SnapshotService.DEBOUNCE_MS = 0;
   // Tab 20 really belongs to A (the repair must move it), while a snapshot
   // refresh for B holds B's lock and awaits a slow tab query.
   sv.set(20, WSP_A);
   slow = true;
-  TabService._scheduleSnapshotRefresh(1, WSP_B);
+  SnapshotService.schedule(1, WSP_B);
   await new Promise(r => setTimeout(r, 5));
   slow = false;
   assert.equal(await env.get("Brainer")._reconcileFromSessionValues(1, true), true);
@@ -264,17 +257,17 @@ test("a repair holds back pending snapshot refreshes and re-arms them afterwards
   const env = await world.boot();
   t.after(() => world.teardown());
   const Brainer = env.get("Brainer");
-  const TabService = env.get("TabService");
-  TabService._scheduleSnapshotRefresh(1, WSP_B);
+  const SnapshotService = env.get("SnapshotService");
+  SnapshotService.schedule(1, WSP_B);
   let pendingDuringCheck = null;
   const realDetect = Brainer._detectSessionLoss;
   Brainer._detectSessionLoss = async (windowId) => {
-    pendingDuringCheck = TabService._snapshotTimers.size;
+    pendingDuringCheck = SnapshotService._timers.size;
     return realDetect.call(Brainer, windowId);
   };
   await Brainer._repairTabAssignments(1, true);
   assert.equal(pendingDuringCheck, 0, "no refresh can fire while the repair reads the snapshots");
-  assert.ok(TabService._snapshotTimers.has(`1:${WSP_B}`), "re-armed after the repair");
+  assert.ok(SnapshotService._timers.has(`1:${WSP_B}`), "re-armed after the repair");
 });
 
 test("a tab close queued behind a destroy does not write the destroyed record back", async () => {

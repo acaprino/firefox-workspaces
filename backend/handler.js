@@ -4,7 +4,7 @@ browser.runtime.onMessage.addListener(async (message, sender) => {
     return await _handleMessage(message);
   } catch (e) {
     console.error("[Workspaces] Handler error:", message.action, e);
-    return { _error: true, message: "An internal error occurred" };
+    return { _error: true, message: message.action?.startsWith("backup") ? e.message : "An internal error occurred" };
   }
 });
 
@@ -83,8 +83,7 @@ const _MUTATING_ACTIONS = new Set([
   "createWorkspace", "createWorkspaceWithTab", "renameWorkspace",
   "destroyWsp", "activateWorkspace", "hideInactiveWspTabs",
   "setWorkspaceContainer", "restoreClosedTab", "clearClosedTabs",
-  "saveWorkspaceOrder", "exportWorkspaceToBookmarks",
-  "restoreWorkspaceFromBookmarks",
+  "saveWorkspaceOrder", "backupRestore",
 ]);
 
 async function _handleMessage(message) {
@@ -275,81 +274,25 @@ async function _handleMessage(message) {
       console.log("[Handler] getTabPreviews -> previews:", result?.previews?.length, "total:", result?.total);
       return result;
 
-    // Tier 4: Bookmark export/restore
-    case "exportWorkspaceToBookmarks": {
-      _validateWspId(message.wspId);
-      result = await BookmarkService.exportWorkspace(message.wspId);
-      console.log("[Handler] exportWorkspaceToBookmarks -> exported:", result?.exported, "of", result?.total);
-      // Atomic export+destroy: if the popup requested destroy, handle it here
-      // so the operation completes even if the popup closes mid-flow.
-      if (message.destroyAfter && result) {
-        if (result.exported < result.total) {
-          // Partial export: some tabs were skipped (non-bookmarkable URLs
-          // like about:, file:, reader view) or their bookmarks.create failed.
-          // Destroying now would close tabs that have no bookmark backup.
-          console.warn("[Handler] exportWorkspaceToBookmarks destroy refused: exported",
-            result.exported, "of", result.total);
-          result.destroyed = false;
-          result.destroyRefusedMessage =
-            `Only ${result.exported} of ${result.total} tabs could be exported to bookmarks ` +
-            `(pages like about:, file: or reader view cannot be bookmarked). ` +
-            `The workspace was NOT closed, so no tab was lost.`;
-        } else {
-          if (message.windowId != null) _validateWindowId(message.windowId);
-          try {
-            const destroyResult = await WorkspaceService.destroyWsp(message.wspId, message.windowId ?? null);
-            result.destroyed = true;
-            result.activatedWspId = destroyResult?.activatedWspId;
-          } catch (e) {
-            const msg = e?.message ?? String(e);
-            console.warn("[Handler] exportWorkspaceToBookmarks destroy failed:", msg);
-            result.destroyed = false;
-            result.destroyRefusedMessage = `Export succeeded but the workspace could not be closed: ${msg}`;
-          }
-        }
-      }
-      return result;
-    }
-    case "getBookmarkWorkspaces":
-      result = await BookmarkService.getExportedWorkspaces();
-      console.log("[Handler] getBookmarkWorkspaces -> count:", result?.length);
-      return result;
-    case "restoreWorkspaceFromBookmarks":
+    case "backupStatus": return LocalBackupService.status();
+    case "backupValidate":
+      if (!LocalBackupData.read(message.archive)) throw new Error("Invalid JSON backup");
+      return { valid: true };
+    case "backupHistory": return LocalBackupService.list();
+    case "backupRead": return LocalBackupService.read(message.filename);
+    case "backupConnect": return LocalBackupService.configure(message.connection, message.limit);
+    case "backupLimit": return LocalBackupService.setLimit(message.limit);
+    case "backupDisable": return LocalBackupService.disable();
+    case "backupResume": return LocalBackupService.resume();
+    case "backupNow": return LocalBackupService.run({ manual: true });
+    case "backupRestore": {
       _validateWindowId(message.windowId);
-      if (typeof message.folderId !== "string" || !message.folderId) {
-        throw new Error("Invalid folderId");
-      }
-      try {
-        result = await BookmarkService.restoreWorkspace(message.folderId, message.windowId);
-      } catch (e) {
-        const msg = e?.message ?? String(e);
-        if (msg.startsWith("No bookmarks") || msg.startsWith("Too many") ||
-            msg.startsWith("Bookmark folder") || msg.startsWith("Folder is not") ||
-            msg.startsWith("Failed to restore")) {
-          console.log("[Handler] restoreWorkspaceFromBookmarks -> refused:", msg);
-          return { _error: true, _userFacing: true, message: msg };
-        }
-        throw e;
-      }
-      console.log("[Handler] restoreWorkspaceFromBookmarks -> wspId:", result?.wspId, "tabs:", result?.tabCount);
-      return result;
-
-    // Refuse-to-wipe error surface. Popup queries on open to render a banner
-    // when the previous restart aborted because the restore would have wiped
-    // workspace tab arrays.
-    //
-    // Two distinct user actions:
-    //   - acknowledgeLastRestoreError: dismisses the banner. Leaves
-    //     primaryWindowLastId intact so the next restart can still retry the
-    //     restore, and clears the in-memory _refuseToWipeActive flag. Then
-    //     resumes what can resume now (Brainer.resumeAfterDismiss, X-34): a
-    //     failed start is retried, and waiting workspaces are restored into
-    //     a normal window that already holds their tabs.
-    //   - giveUpRestoreRetry: destructive (Brainer.giveUpRestore). Exports
-    //     the waiting workspaces' snapshots to bookmarks, detaches their
-    //     window index, clears primaryWindowLastId and starts over at once
-    //     with a fresh default workspace in the current window. Old
-    //     `ld-wsp-{wspId}` records stay for the diagnostic dump.
+      const archive = message.archive || await LocalBackupService.read(message.filename);
+      if (message.scope === "all") return LocalBackupService.restoreAll(archive, message.windowId);
+      if (message.scope === "workspace") return LocalBackupService.restore(archive, message.workspaceIndex, message.windowId);
+      if (message.scope === "tab") return LocalBackupService.restoreTab(archive, message.workspaceIndex, message.tabIndex, message.windowId);
+      throw new Error("Invalid restore selection");
+    }
     case "getLastRestoreError":
       result = await WSPStorageManager.getLastRestoreError();
       console.log("[Handler] getLastRestoreError ->", result ? "present" : "none");
@@ -383,11 +326,10 @@ async function _handleMessage(message) {
       // Compare-and-clear, same as acknowledgeLastRestoreError: this action
       // is destructive (drops the retry signal), so a payload that changed
       // while the confirm dialog was open must not be silently discarded.
-      // Before orphaning the old records, their URL snapshots are exported
-      // to bookmark folders: the extension holds everything needed to
-      // rebuild (names + ordered URL lists), and "give up" used to discard
-      // the only user-reachable copy. Exported folders are restorable later
-      // via the normal restore-from-bookmarks flow. _exportSnapshotsSafe
+      // Before detaching the old records, export their saved URLs and any
+      // available per-tab container/group metadata. Legacy URL-only records
+      // cannot reconstruct metadata they never saved. Folders are restorable later
+      // via the normal backup-history flow. _exportSnapshotsSafe
       // never throws and dedupes against the automatic session-loss export,
       // so a loss that was already backed up is not duplicated here.
       const giveUpWhen = Number.isFinite(message.when) ? message.when : null;
@@ -395,7 +337,8 @@ async function _handleMessage(message) {
         result = await Brainer.giveUpRestore(giveUpWhen);
       } catch (e) {
         // Refused while a start or a restore runs (X-72)
-        if (e?.message === Brainer.RESTORE_BUSY_MESSAGE) {
+        if (e?.message === Brainer.RESTORE_BUSY_MESSAGE
+            || e?.message?.startsWith("Failed to save the recovery backup.")) {
           console.log("[Handler] giveUpRestoreRetry -> refused:", e.message);
           return { _error: true, _userFacing: true, retriable: true, message: e.message };
         }
@@ -407,7 +350,7 @@ async function _handleMessage(message) {
       }
       const exported = result.exported;
       console.log("[Handler] giveUpRestoreRetry -> banner + retry signal cleared,",
-        exported.folders, "workspace snapshot(s) exported to bookmarks",
+        exported.folders, "workspace snapshot(s) saved as JSON",
         exported.deduped ? "(deduped -- already exported)" : "");
       return { success: true, exportedWorkspaces: exported.folders, alreadyExported: exported.deduped };
     }

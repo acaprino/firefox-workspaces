@@ -105,7 +105,7 @@ test("X-01: a tagged tab restored in the background is hidden in its workspace a
   const world = twoWorkspaces();
   const { env, TabService } = await boot(world, t);
   const key = `1:${WSP_B}`;
-  assert.equal(TabService._snapshotTimers.has(key), false);
+  assert.equal(env.get("SnapshotService")._timers.has(key), false);
 
   const tab = world.openTab({ url: "https://b.test/back", active: false });
   await env.browser.sessions.setTabValue(tab.id, "wspId", WSP_B); // lands before onCreated is delivered
@@ -114,7 +114,7 @@ test("X-01: a tagged tab restored in the background is hidden in its workspace a
   assert.ok(world.record(WSP_B).tabs.includes(tab.id));
   assert.equal(world.tab(tab.id).hidden, true);
   assert.equal(world.record(WSP_A).active, true, "a background restore does not switch");
-  assert.equal(TabService._snapshotTimers.has(key), true, "B's snapshot refresh is scheduled");
+  assert.equal(env.get("SnapshotService")._timers.has(key), true, "B's snapshot refresh is scheduled");
   assertAllFiled(world);
 });
 

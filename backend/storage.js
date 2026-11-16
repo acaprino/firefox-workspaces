@@ -46,12 +46,6 @@ const STORAGE_KEYS = {
   // guard trips so the popup can show an explanatory banner. Cleared on
   // successful activate/restore.
   lastRestoreError: 'ld-wsp-last-restore-error',
-  // Fingerprint of the last successful session-loss snapshot export. Makes the
-  // automatic bookmark export idempotent across restarts: for a user whose
-  // session store is wiped on every start ("clear history on close"), the same
-  // loss would otherwise be re-detected and re-exported into new bookmark
-  // folders on every launch.
-  sessionLossExport: 'ld-wsp-session-loss-export',
   // Workspaces whose destroy started (records dropped) but whose tabs were
   // not closed yet. A background that dies in between leaves hidden tabs
   // tagged with a workspace that no longer exists; init closes those instead
@@ -72,8 +66,6 @@ const LIMITS = {
   // live tabs.
   SESSION_LOSS_MIN_SNAPSHOT_URLS: 2,
   SESSION_LOSS_SURVIVAL_RATIO: 0.5,
-  // How many distinct export-set fingerprints to remember for dedup.
-  MAX_EXPORT_FINGERPRINTS: 8,
   // Destroy tombstones kept (see STORAGE_KEYS.pendingDestroys).
   MAX_PENDING_DESTROYS: 20,
   // Automatic retries of a failed Brainer.initialize() pass, one delay per
@@ -289,34 +281,7 @@ class WSPStorageManager {
     if (typeof UIService !== "undefined") UIService.invalidateWarnBadgeCache();
   }
 
-  // ── Session-loss export fingerprints (idempotency for automatic exports) ──
-  // Bounded list, not a single slot: the session-loss export and the orphan
-  // sweep (C-19) export different workspace sets; one slot would let each
-  // caller evict the other's record and re-export forever.
-
-  static async getSessionLossExportFingerprints() {
-    const key = STORAGE_KEYS.sessionLossExport;
-    const result = await browser.storage.local.get(key);
-    const value = result[key];
-    if (typeof value === "string") return [value]; // pre-list dev format
-    return Array.isArray(value) ? value : [];
-  }
-
-  // Locked read-modify-write: two exporters finishing together used to drop
-  // one fingerprint, so the next start exported that content again.
-  static async addSessionLossExportFingerprint(fingerprint) {
-    return _storageMutex.run("export-fingerprints", async () => {
-      const list = await WSPStorageManager.getSessionLossExportFingerprints();
-      if (!list.includes(fingerprint)) list.push(fingerprint);
-      while (list.length > LIMITS.MAX_EXPORT_FINGERPRINTS) list.shift();
-      await browser.storage.local.set({ [STORAGE_KEYS.sessionLossExport]: list });
-    });
-  }
-
-  // Serializes whole automatic exports (fingerprint check -> bookmark export
-  // -> fingerprint record) so two exporters of the same content cannot both
-  // pass the check and create duplicate folders. Distinct key from the
-  // list's own lock above, which runs nested inside this one.
+  // Serialize emergency preservation before destructive recovery commits.
   static async withSessionLossExportLock(fn) {
     return _storageMutex.run("session-loss-export", fn);
   }

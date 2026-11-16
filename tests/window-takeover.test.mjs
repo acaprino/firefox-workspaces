@@ -3,13 +3,14 @@
 //  - closing the primary window while another stays open is not a browser
 //    restart: a new window is claimed only when it holds the workspaces'
 //    tabs, or adopts them when nothing waits in the closed window; no false
-//    refuse-to-wipe, "not fully restored" warning or bookmark export (X-11);
+//    refuse-to-wipe, "not fully restored" warning or JSON export (X-11);
 //  - only normal windows become primary or restore targets (X-118);
 //  - a take-over runs the same tail as initialize(): late tabs filed,
 //    toolbar repainted (X-35).
 import test from "node:test";
 import assert from "node:assert/strict";
 import { makeWorld, seedWorkspaces, WSP_A, WSP_B } from "./helpers/world.mjs";
+import { completeSnapshots, nativeBackup } from "./helpers/native-backup.mjs";
 import { makeStorageArea } from "./helpers/load-backend.mjs";
 
 process.on("unhandledRejection", () => {});
@@ -17,12 +18,11 @@ process.on("unhandledRejection", () => {});
 const ERROR_KEY = "ld-wsp-last-restore-error";
 const sorted = (list) => [...list].sort((a, b) => a - b);
 
-function recordBookmarks(world) {
-  const created = [];
-  world.overrides.bookmarks = {
-    create: async (b) => { created.push(b); return { id: "bm-" + created.length, type: b.url ? "bookmark" : "folder", ...b }; },
-  };
-  return created;
+function recordBackups(world) {
+  const backup = nativeBackup();
+  completeSnapshots(world.storage);
+  world.overrides.runtime = backup.runtime;
+  return backup.archives;
 }
 
 async function boot(world, t) {
@@ -49,8 +49,8 @@ function closableWorld() {
       { id: WSP_B, name: "B", tabs: [3, 4], tabSnapshot: ["https://b.test/3", "https://b.test/4"] },
     ]),
   });
-  const bookmarks = recordBookmarks(world);
-  return { world, bookmarks };
+  const backups = recordBackups(world);
+  return { world, backups };
 }
 
 // Close window 1 with its last visible tab, then dismiss the banner that
@@ -82,7 +82,7 @@ test("X-11: after the closed-window banner is dismissed, Ctrl+N does not trip re
 });
 
 test("X-11: a new window with a real first tab is not taken for the closed one; reopening it restores the workspaces", async (t) => {
-  const { world, bookmarks } = closableWorld();
+  const { world, backups } = closableWorld();
   const { B, send } = await boot(world, t);
   await closeAndDismiss(world, send);
 
@@ -93,7 +93,7 @@ test("X-11: a new window with a real first tab is not taken for the closed one; 
   assert.deepEqual(world.record(WSP_A).tabs, [1], "membership not emptied into the new window");
   assert.deepEqual(world.record(WSP_B).tabs, [3, 4]);
   assert.equal(world.storage[ERROR_KEY], undefined, "no false 'not fully restored' warning");
-  assert.equal(bookmarks.length, 0, "no bookmark export");
+  assert.equal(backups.length, 0, "no JSON export");
 
   // History > Recently Closed Windows: the workspaces' own window comes back
   const entry = world.closed.find((e) => e.window);
@@ -127,7 +127,7 @@ for (const [label, url] of [["a blank window", "about:newtab"], ["a window with 
         { id: WSP_B, name: "B", tabs: [], tabSnapshot: [] },
       ]),
     });
-    const bookmarks = recordBookmarks(world);
+    const backups = recordBackups(world);
     const { B } = await boot(world, t);
 
     world.closeWindow(1);
@@ -141,7 +141,7 @@ for (const [label, url] of [["a blank window", "about:newtab"], ["a window with 
     assert.equal(B._state, "ready");
     assert.equal(world.storage["primary-window-last-id"], undefined);
     assert.equal(world.storage[ERROR_KEY], undefined, "no refuse-to-wipe, no 'not fully restored'");
-    assert.equal(bookmarks.length, 0, "no bookmark export");
+    assert.equal(backups.length, 0, "no JSON export");
     const a = world.record(WSP_A);
     assert.equal(a.windowId, win.id);
     assert.equal(a.active, true);
@@ -168,14 +168,14 @@ test("X-11: after an extension reload the pending closed-window banner still kee
     storage,
     sessionAlive: false,
   });
-  const bookmarks = recordBookmarks(world);
+  const backups = recordBackups(world);
   const { B } = await boot(world, t);
 
   assert.equal(world.storage["primary-window-id"], undefined, "window 2 is not the workspaces' window");
   assert.equal(B._state, "uninitialized");
   assert.equal(world.storage[ERROR_KEY]?.reason, "primary-window-closed", "the banner still offers the window back");
   assert.deepEqual(world.record(WSP_B).tabs, [3, 4]);
-  assert.equal(bookmarks.length, 0);
+  assert.equal(backups.length, 0);
 });
 
 // Detected restart into a window that shows only the homepage: the restore
@@ -188,8 +188,8 @@ function refusedStartWorld({ windows = [{ id: 1 }], tabs = [{ id: 1, url: "about
   delete storage["primary-window-id"];
   storage["primary-window-last-id"] = 1;
   const world = makeWorld({ windows, tabs, storage, sessionAlive: false });
-  const bookmarks = recordBookmarks(world);
-  return { world, bookmarks };
+  const backups = recordBackups(world);
+  return { world, backups };
 }
 
 test("X-118: a pop-out window opened after Dismiss is never claimed", async (t) => {

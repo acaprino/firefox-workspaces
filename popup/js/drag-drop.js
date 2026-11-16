@@ -7,6 +7,7 @@ class DragDropHandler {
     this._callBackgroundTask = callBackgroundTask;
     this._currentWindowId = currentWindowId;
     this.dragSrcEl = null;
+    this._reorderChain = Promise.resolve();
   }
 
   // A drop is a reorder only when the drag started on a workspace row of
@@ -58,14 +59,18 @@ class DragDropHandler {
       const src = this.dragSrcEl;
       if (src === li) return;
 
-      const previous = this._order();
-      if (this._movesDown(li)) {
-        li.after(src);
-      } else {
-        li.before(src);
-      }
-
-      await this._saveOrder(previous);
+      await this._reorder(() => {
+        const rows = this._rows();
+        if (!rows.includes(src) || !rows.includes(li)) return false;
+        // dragend clears dragSrcEl before a queued drop can run. Use the
+        // captured source and target against the last settled row order.
+        if (rows.indexOf(src) < rows.indexOf(li)) {
+          li.after(src);
+        } else {
+          li.before(src);
+        }
+        return true;
+      });
     });
 
     li.addEventListener("dragend", () => {
@@ -79,15 +84,28 @@ class DragDropHandler {
   // row with its neighbour and save. The neighbour is the node that moves,
   // so the row keeps keyboard focus (moving a focused node drops focus).
   async moveBy(li, delta) {
-    const sibling = delta < 0 ? li.previousElementSibling : li.nextElementSibling;
-    if (!sibling || !sibling.classList.contains("wsp-list-item")) return;
-    const previous = this._order();
-    if (delta < 0) {
-      li.after(sibling);
-    } else {
-      li.before(sibling);
-    }
-    await this._saveOrder(previous);
+    return this._reorder(() => {
+      if (!this._rows().includes(li)) return false;
+      const sibling = delta < 0 ? li.previousElementSibling : li.nextElementSibling;
+      if (!sibling || !sibling.classList.contains("wsp-list-item")) return false;
+      if (delta < 0) {
+        li.after(sibling);
+      } else {
+        li.before(sibling);
+      }
+      return true;
+    });
+  }
+
+  _reorder(change) {
+    // A failed save must roll back before the next move chooses its starting
+    // order. Queue intentions, not snapshots of already optimistic rows.
+    const pending = this._reorderChain.then(async () => {
+      const previous = this._order();
+      if (change()) await this._saveOrder(previous);
+    });
+    this._reorderChain = pending.catch(() => {});
+    return pending;
   }
 
   _order() {

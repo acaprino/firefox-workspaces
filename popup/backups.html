@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Workspaces backup history</title><link rel="stylesheet" href="css/backups.css"></head>
+<body>
+<header><a href="wsp.html">← Workspaces</a><h1>Backup history</h1></header>
+<p id="status" role="status" aria-live="polite">Reading backup status…</p>
+<p id="directory"></p>
+<div class="actions"><button id="backup-now">Back up now</button><button id="refresh">Refresh history</button></div>
+<label for="versions">Saved versions, newest first</label>
+<select id="versions" size="5" aria-label="Backup versions"></select>
+<p id="summary"></p>
+<label for="workspaces">Workspace</label><select id="workspaces"></select>
+<label for="tabs">Tab</label><select id="tabs" size="5"></select>
+<div class="actions">
+  <button id="restore-tab" disabled>Restore selected tab</button>
+  <button id="restore-workspace" disabled>Restore workspace</button>
+  <button id="restore-all" disabled>Restore all</button>
+</div>
+<p class="hint">A tab is added to the active workspace. Workspace restores create new workspaces. Open tabs are kept. Original containers must still exist.</p>
+<details><summary>Backup settings and file import</summary>
+  <p>Backups connect to this Firefox profile automatically and are enabled by default. Changes are saved after 6 seconds, with a check every 5 minutes. JSON files in the profile are the only backup archive.</p>
+  <form id="limit-form"><label for="limit">Versions to keep (2–200)</label>
+    <input id="limit" type="number" min="2" max="200" value="50" required>
+    <button type="submit">Save limit</button>
+  </form>
+  <p class="hint">Older JSON versions are removed only after a successful backup. Default: 50 versions.</p>
+  <button id="disable">Pause automatic backups</button>
+  <label for="import">Open a backup JSON file</label><input type="file" id="import" accept="application/json,.json">
+  <p class="hint">The local helper must be installed once for this Firefox profile. File backups contain addresses and titles, without cookies, passwords, page history or form contents. Pinned tabs are outside workspace backups.</p>
+</details>
+<dialog id="confirmation"><p id="confirmation-text"></p><form method="dialog"><button value="cancel">Cancel</button><button value="restore">Restore</button></form></dialog>
+<script src="js/backups.js"></script>
+</body></html>

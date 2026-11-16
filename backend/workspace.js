@@ -15,6 +15,7 @@ class Workspace {
     this.containerId = state.containerId ?? null;
     this.color = state.color ?? null;
     this.tabSnapshot = Array.isArray(state.tabSnapshot) ? state.tabSnapshot : [];
+    this.recoverySnapshot = RecoveryData.readSnapshot(state.recoverySnapshot);
   }
 
   static async create(id, state) {
@@ -169,14 +170,14 @@ class Workspace {
     // Saving `this` whole reverted every locked write that landed during the
     // awaits above: a tab filed or moved into this workspace, a rename, a
     // container change, a tab closed mid-activation.
-    const saved = await WSPStorageManager.mutateWorkspace(this.id, (fresh) => {
+    const saved = await WSPStorageManager.mutateWorkspace(this.id, async (fresh) => {
       fresh.tabs = fresh.tabs.filter(id => !staleIds.has(id));
       if (fallbackTabId != null && !fresh.tabs.includes(fallbackTabId)) fresh.tabs.push(fallbackTabId);
       if (tabMap) {
-        fresh.tabSnapshot = fresh.tabs
+        const snapshotTabs = fresh.tabs
           .map(id => tabMap.get(id))
-          .filter(t => t && t.url)
-          .map(t => t.url);
+          .filter(t => t && t.url);
+        await SnapshotService.update(fresh, snapshotTabs);
         console.log("[Workspace][activate] snapshot saved:", fresh.tabSnapshot.length, "URLs");
       }
       fresh.active = true;
@@ -209,6 +210,7 @@ class Workspace {
     const live = new Map((allTabsHint ?? await browser.tabs.query({windowId: this.windowId}))
       .map(tab => [tab.id, tab]));
     const keys = await TabService.getGroupTags(this.tabs);
+    let complete = true;
     console.log("[Workspace][_rebuildGroups] id:", this.id, "groups:", this.groups.length,
       "tabs with a key:", keys.size);
     for (const group of this.groups) {
@@ -219,17 +221,22 @@ class Workspace {
       console.log("[Workspace][_rebuildGroups] grouping", members.length, "tabs for group:", group.title);
       // A failure must not abort the activation (X-104, X-29). The group is not
       // lost: its tabs keep their key, and the next activation tries again.
+      let groupId = null;
       try {
-        const groupId = await this._groupTabs(members);
+        groupId = await this._groupTabs(members);
         await browser.tabGroups.update(groupId, {
           title: group.title,
           color: group.color,
           collapsed: group.collapsed
         });
       } catch (e) {
+        complete = false;
+        // Keep saved metadata instead of syncing the new group's defaults.
+        if (groupId != null) await TabService.ungroup(members);
         console.debug("[Workspace][_rebuildGroups] could not regroup", group.title, ":", e.message);
       }
     }
+    return complete;
   }
 
   // tabs.group checks every id first, so one tab closing right now rejects the
@@ -268,7 +275,9 @@ class Workspace {
       const member = new Set(fresh.tabs);
       const own = (await browser.tabs.query({windowId: fresh.windowId})).filter(tab => member.has(tab.id));
       const nativeGroups = await browser.tabGroups.query({windowId: fresh.windowId});
-      const carried = await TabService.getGroupTags(own.map(tab => tab.id));
+      // Missing metadata and a failed read are different: treating an API
+      // failure as absence would permanently delete off-screen groups.
+      const carried = await TabService.getGroupTags(own.map(tab => tab.id), { strict: true });
       const carriers = new Map();
       for (const key of carried.values()) carriers.set(key, (carriers.get(key) ?? 0) + 1);
 
@@ -288,7 +297,7 @@ class Workspace {
         for (const tab of tabs) {
           if (carried.get(tab.id) === key) continue;
           carried.set(tab.id, key);
-          retagged.push(TabService.setGroupTag(tab.id, key));
+          retagged.push(TabService.setGroupTag(tab.id, key, { strict: true }));
         }
         groups.push({ key, title: native.title, color: native.color, collapsed: native.collapsed, tabs: [] });
       }
@@ -296,14 +305,16 @@ class Workspace {
       for (const tab of own) {
         if (nativeIds.has(tab.groupId) || !taken.has(carried.get(tab.id))) continue;
         carried.delete(tab.id);
-        retagged.push(TabService.clearGroupTag(tab.id));
+        retagged.push(TabService.clearGroupTag(tab.id, { strict: true }));
       }
       await Promise.all(retagged);
       const stillCarried = new Set(carried.values());
       groups.push(...fresh.groups.filter(group => !taken.has(group.key) && stillCarried.has(group.key)));
       console.log("[Workspace][updateTabGroups] id:", this.id, "found", groups.length, "groups with tabs");
-      if (JSON.stringify(groups) === JSON.stringify(fresh.groups)) return false;
+      const groupsChanged = JSON.stringify(groups) !== JSON.stringify(fresh.groups);
       fresh.groups = groups;
+      const snapshotChanged = await SnapshotService.update(fresh, own, { requireReady: true });
+      if (!groupsChanged && !snapshotChanged) return false;
     });
     if (saved) this.groups = saved.groups;
   }
@@ -383,7 +394,8 @@ class Workspace {
       lastActiveTabUrl: this.lastActiveTabUrl,
       containerId: this.containerId,
       color: this.color,
-      tabSnapshot: this.tabSnapshot
+      tabSnapshot: this.tabSnapshot,
+      recoverySnapshot: this.recoverySnapshot
     });
   }
 }

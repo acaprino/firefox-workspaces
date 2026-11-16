@@ -398,7 +398,7 @@ class WorkspaceService {
       if (filed?.tabs.includes(tab.id)) {
         WorkspaceService.addTabToActiveCache(tab.id, wsp.id);
         await TabService.setTabSessionValue(tab.id, wsp.id);
-        TabService._scheduleSnapshotRefresh(wsp.windowId, wsp.id);
+        SnapshotService.schedule(wsp.windowId, wsp.id);
         UIService.scheduleToolbarUpdate(wsp.windowId);
       }
       await WorkspaceService.hideInactiveWspTabs(wsp.windowId, wsp.id);
@@ -652,12 +652,11 @@ class WorkspaceService {
       // Final deactivation save under the workspace lock: this is a full-
       // record write after many awaits, and used to race the locked
       // add/remove writers (lost-update on tabs[]).
-      await WSPStorageManager.mutateWorkspace(leaving.id, (freshWsp) => {
+      await WSPStorageManager.mutateWorkspace(leaving.id, async (freshWsp) => {
         // Save tab URL snapshot for restart resilience
         const freshTabIds = new Set(freshWsp.tabs);
-        freshWsp.tabSnapshot = currentTabs
-          .filter(tab => freshTabIds.has(tab.id))
-          .map(tab => tab.url);
+        await SnapshotService.update(freshWsp,
+          currentTabs.filter(tab => freshTabIds.has(tab.id)));
         freshWsp.active = false;
         // Only save lastActiveTabId if the currently active tab belongs to this
         // workspace. If the user clicked a tab from another workspace (triggering
@@ -935,7 +934,7 @@ class WorkspaceService {
         });
         await Promise.all(tabs.map(tab => TabService.setTabSessionValue(tab.id, wspId)));
         // Keep tabSnapshot fresh for restart resilience (IC3).
-        TabService._scheduleSnapshotRefresh(windowId, wspId);
+        SnapshotService.schedule(windowId, wspId);
       }
 
       // Assign remaining orphaned tabs to the active workspace
@@ -955,7 +954,7 @@ class WorkspaceService {
         // opened mid-switch escaped the workspace's container.
         for (const tab of toAssign) WorkspaceService.addTabToActiveCache(tab.id, activeWspId);
         // Keep tabSnapshot fresh for restart resilience (IC3).
-        TabService._scheduleSnapshotRefresh(windowId, activeWspId);
+        SnapshotService.schedule(windowId, activeWspId);
       }
 
       if (toHide.length > 0) {
@@ -983,7 +982,12 @@ class WorkspaceService {
     }
   }
 
-  static async setWorkspaceContainer(wspId, containerId) {
+  static setWorkspaceContainer(wspId, containerId) {
+    return WorkspaceService._onActivationChain(() =>
+      WorkspaceService._setWorkspaceContainer(wspId, containerId));
+  }
+
+  static async _setWorkspaceContainer(wspId, containerId) {
     console.log("[WorkspaceService][setWorkspaceContainer] wspId:", wspId, "containerId:", containerId);
     // Locked read-modify-write: the full-record save used to race the locked
     // tab add/remove writers. A workspace destroyed while the edit dialog was
@@ -1022,91 +1026,62 @@ class WorkspaceService {
     console.log("[WorkspaceService][_migrateTabsToContainer] wspId:", wspId, "containerId:", containerId);
     const wsp = await WSPStorageManager.getWorkspace(wspId);
 
-    // Fetch live tab info for all workspace tabs
-    const liveTabs = await Promise.all(
-      wsp.tabs.map(id => browser.tabs.get(id).catch(() => null))
-    );
-
-    // Filter to tabs that need migration (wrong container)
+    // Capture group identity before removing native-group members.
+    await wsp.updateTabGroups();
+    const groupTags = await TabService.getGroupTags(wsp.tabs, { strict: true });
+    const liveTabs = await Promise.all(wsp.tabs.map(id => browser.tabs.get(id).catch(() => null)));
     const toMigrate = liveTabs.filter(tab => tab && tab.cookieStoreId !== containerId
       && TabService._canReopenInContainer(tab.url));
-    if (toMigrate.length === 0) {
-      console.log("[WorkspaceService][_migrateTabsToContainer] no tabs need migration");
-      return;
-    }
-    console.log("[WorkspaceService][_migrateTabsToContainer] migrating", toMigrate.length,
-      "of", wsp.tabs.length, "tabs");
-
-    // Save original tab order as template before modifying storage
+    if (toMigrate.length === 0) return;
     const originalOrder = [...wsp.tabs];
-
-    // Remove old tab IDs from workspace storage BEFORE reopening.
-    // This prevents onRemoved from saving them as closed tabs or removing them from workspace.
-    const migrateIds = new Set(toMigrate.map(t => t.id));
-    await WSPStorageManager.mutateWorkspace(wspId, (freshWsp) => {
-      freshWsp.tabs = freshWsp.tabs.filter(id => !migrateIds.has(id));
-      console.log("[WorkspaceService][_migrateTabsToContainer] pre-removed", migrateIds.size,
-        "tabs from storage, remaining:", freshWsp.tabs.length);
+    let migrating = [];
+    const prepared = await WSPStorageManager.mutateWorkspace(wspId, fresh => {
+      migrating = toMigrate.filter(tab => fresh.tabs.includes(tab.id));
+      const migrateIds = new Set(migrating.map(tab => tab.id));
+      fresh.tabs = fresh.tabs.filter(id => !migrateIds.has(id));
     });
+    if (!prepared) return;
 
-    // Reopen tabs in the new container
-    const oldToNew = new Map();
+    // Only migrating IDs are provisional. Other membership changes stay in
+    // the fresh record, including tabs appended or removed while Firefox waits.
+    const replacements = new Map();
+    const newTabIds = [];
     await TabService.withReopenGuard(async () => {
-      for (const tab of toMigrate) {
+      for (const tab of migrating) {
         const newTab = await TabService._reopenInContainer(tab, containerId);
         if (newTab) {
-          oldToNew.set(tab.id, newTab.id);
+          replacements.set(tab.id, newTab.retainedOriginal ? [tab.id, newTab.id] : [newTab.id]);
+          newTabIds.push(newTab.id);
+          await TabService.setTabSessionValue(newTab.id, wspId);
+          if (groupTags.has(tab.id)) await TabService.setGroupTag(newTab.id, groupTags.get(tab.id));
+        } else {
+          const alive = await browser.tabs.get(tab.id).catch(() => null);
+          replacements.set(tab.id, alive && alive.windowId === wsp.windowId && !alive.pinned ? [tab.id] : []);
         }
       }
     });
-    console.log("[WorkspaceService][_migrateTabsToContainer] reopened", oldToNew.size,
-      "tabs, failed:", toMigrate.length - oldToNew.size);
 
-    // Rebuild tab list preserving original order (swap old IDs for new IDs)
-    const rebuiltTabs = [];
-    for (const id of originalOrder) {
-      if (oldToNew.has(id)) {
-        rebuiltTabs.push(oldToNew.get(id));
-      } else if (!migrateIds.has(id)) {
-        // Tab wasn't migrated (already correct container) — keep it
-        rebuiltTabs.push(id);
+    const finalWsp = await WSPStorageManager.mutateWorkspace(wspId, fresh => {
+      for (let i = 0; i < originalOrder.length; i++) {
+        const oldId = originalOrder[i];
+        const ids = replacements.get(oldId);
+        if (!ids) continue;
+        const next = originalOrder.slice(i + 1).find(id => fresh.tabs.includes(id));
+        const prev = originalOrder.slice(0, i).reverse()
+          .flatMap(id => [...(replacements.get(id) || [id])].reverse()).find(id => fresh.tabs.includes(id));
+        const at = next != null ? fresh.tabs.indexOf(next)
+          : prev != null ? fresh.tabs.indexOf(prev) + 1 : fresh.tabs.length;
+        fresh.tabs.splice(at, 0, ...ids.filter(id => !fresh.tabs.includes(id)));
       }
-      else {
-        // Migration failed — keep original tab in workspace if it still exists
-        rebuiltTabs.push(id);
-      }
-    }
-
-    // Save rebuilt tab list (locked read-modify-write)
-    const finalWsp = await WSPStorageManager.getWorkspace(wspId);
-    await WSPStorageManager.mutateWorkspace(wspId, (fresh) => {
-      fresh.tabs = rebuiltTabs;
     });
-    finalWsp.tabs = rebuiltTabs;
+    if (!finalWsp) return;
     await finalWsp.updateTabGroups();
-    console.log("[WorkspaceService][_migrateTabsToContainer] rebuilt tab list:", rebuiltTabs.length, "tabs");
-
-    // Tag new tabs with session values
-    const newTabIds = [...oldToNew.values()];
-    await Promise.all(newTabIds.map(id => TabService.setTabSessionValue(id, wspId)));
-    // Keep tabSnapshot fresh for restart resilience (IC3) -- tabs[] was
-    // rebuilt with brand-new IDs.
-    TabService._scheduleSnapshotRefresh(wsp.windowId, wspId);
-
-    // If workspace is active: update cache
-    if (wsp.active) {
-      WorkspaceService._updateActiveCache(wsp.windowId, rebuiltTabs, wsp.id, containerId);
-      console.log("[WorkspaceService][_migrateTabsToContainer] updated active cache");
-    } else {
-      // Inactive workspace: new tabs are created visible by default — hide them
-      if (newTabIds.length > 0) {
-        await TabService.hideTabs(newTabIds);
-        console.log("[WorkspaceService][_migrateTabsToContainer] hid", newTabIds.length,
-          "tabs (inactive workspace)");
-      }
+    SnapshotService.schedule(finalWsp.windowId, wspId);
+    if (finalWsp.active) {
+      WorkspaceService._updateActiveCache(finalWsp.windowId, finalWsp.tabs, wspId, finalWsp.containerId);
+    } else if (newTabIds.length) {
+      await TabService.hideTabs(newTabIds);
     }
-
-    console.log("[WorkspaceService][_migrateTabsToContainer] done");
   }
 
   // Workspace order operations. `orderedIds` is the popup's full list as

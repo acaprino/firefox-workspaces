@@ -1,0 +1,21 @@
+:root { color-scheme: light dark; font: 13px system-ui, sans-serif; }
+body { margin: 0; padding: 16px; width: 580px; max-height: 580px; overflow-y: auto; background: Canvas; color: CanvasText; }
+header { display: flex; align-items: center; gap: 24px; }
+h1 { font-size: 18px; margin: 0; }
+a { color: LinkText; }
+label { display: block; margin: 12px 0 5px; font-weight: 600; }
+select { width: 100%; padding: 5px; }
+select option { padding: 3px; }
+button, input { font: inherit; padding: 6px 9px; }
+button { cursor: pointer; }
+button:disabled { cursor: default; opacity: .55; }
+.actions { display: flex; gap: 8px; margin: 10px 0; flex-wrap: wrap; }
+.hint { font-size: 12px; line-height: 1.5; opacity: .8; }
+#directory { overflow-wrap: anywhere; font-size: 12px; }
+#status { padding: 9px; border: 1px solid GrayText; border-radius: 5px; }
+#status[data-error="true"] { border-color: #d96845; }
+details { border-top: 1px solid GrayText; margin-top: 16px; padding-top: 12px; }
+summary { cursor: pointer; font-weight: 600; }
+dialog { max-width: 420px; border: 1px solid GrayText; border-radius: 7px; }
+dialog::backdrop { background: rgb(0 0 0 / .45); }
+dialog form { display: flex; justify-content: end; gap: 8px; }

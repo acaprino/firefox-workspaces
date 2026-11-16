@@ -120,7 +120,7 @@ li.wsp-list-item.active,
 .wsp-closed-tabs-clear:hover,
 .wsp-closed-tab-item:hover,
 .footer#createNewWsp:hover,
-.footer#restoreFromBookmarks:hover,
+.footer#backupHistory:hover,
 .footer#wsp-copy-diagnostics:hover,
 .icon-picker-btn:hover,
 .icon-grid button:hover:not(.selected),
@@ -814,7 +814,7 @@ li.no-wsp {
   background: var(--wsp-active);
 }
 
-.footer#restoreFromBookmarks {
+.footer#backupHistory {
   display: block;
   width: auto;
   padding: 6px 10px;
@@ -831,7 +831,7 @@ li.no-wsp {
   appearance: none;
 }
 
-.footer#restoreFromBookmarks::before {
+.footer#backupHistory::before {
   content: "";
   display: inline-block;
   width: 14px;
@@ -846,11 +846,11 @@ li.no-wsp {
   margin-inline-end: 6px;
 }
 
-.footer#restoreFromBookmarks:hover {
+.footer#backupHistory:hover {
   background: var(--wsp-hover);
 }
 
-.footer#restoreFromBookmarks:active {
+.footer#backupHistory:active {
   background: var(--wsp-active);
 }
 
@@ -1043,25 +1043,6 @@ li.no-wsp {
   accent-color: var(--wsp-primary);
   cursor: pointer;
   flex-shrink: 0;
-}
-
-/* Folder picker row (restore dialog) */
-.custom-dialog-folder-row {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  margin-bottom: 16px;
-  font-size: 12px;
-}
-
-.custom-dialog-folder-row label {
-  font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: 0.03em;
-  font-weight: 500;
-  color: var(--wsp-text-secondary);
-  white-space: nowrap;
-  line-height: 1;
 }
 
 /* Container picker row - vertical layout */
@@ -1472,7 +1453,7 @@ li.no-wsp {
   li.wsp-list-item .delete-btn:hover::after,
   .wsp-closed-tab-restore::after,
   .footer#createNewWsp::before,
-  .footer#restoreFromBookmarks::before,
+  .footer#backupHistory::before,
   .color-swatch-remove::after {
     forced-color-adjust: none;
     background: CanvasText;

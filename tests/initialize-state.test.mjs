@@ -25,13 +25,13 @@ async function healthyBackend(t) {
       tabs: {
         query: async () => [{ id: 1, windowId: 1, url: "https://example.com/home", pinned: false, active: true }],
       },
-      sessions: { getTabValue: async () => WSP_ID },
+      sessions: { getTabValue: async (id, key) => key === "wspId" ? WSP_ID : undefined },
     },
   });
   t.after(() => {
     clearTimeout(env.get("Brainer")._initRetryTimer);
     clearTimeout(env.get("Brainer")._restoreRetryTimer);
-    for (const timer of env.get("TabService")._snapshotTimers.values()) clearTimeout(timer);
+    for (const timer of env.get("SnapshotService")._timers.values()) clearTimeout(timer);
   });
   await env.settle();
   return env;

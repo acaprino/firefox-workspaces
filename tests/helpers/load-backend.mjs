@@ -11,18 +11,8 @@ import { dirname, join } from "node:path";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 
-const LOAD_ORDER = [
-  "backend/theme-utils.js",
-  "backend/storage.js",
-  "backend/workspace.js",
-  "backend/ui-service.js",
-  "backend/menu-service.js",
-  "backend/workspace-service.js",
-  "backend/tab-service.js",
-  "backend/bookmark-service.js",
-  "backend/brainer.js",
-  "backend/handler.js",
-];
+// The manifest is the runtime contract; tests must execute that exact order.
+const LOAD_ORDER = JSON.parse(readFileSync(join(ROOT, "manifest.json"), "utf8")).background.scripts;
 
 // `_listeners` holds the bare functions (tests call them directly);
 // `_entries` pairs each with the optional filter passed as addListener's
@@ -87,7 +77,6 @@ export function makeStorageArea(storageData = {}, { latencyMs = 0 } = {}) {
 }
 
 export function makeBrowserStub({ storageData = {}, overrides = {}, storageLatencyMs = 0 } = {}) {
-  let bookmarkSeq = 0;
   const stub = {
     storage: {
       local: makeStorageArea(storageData, { latencyMs: storageLatencyMs }),
@@ -143,18 +132,14 @@ export function makeBrowserStub({ storageData = {}, overrides = {}, storageLaten
       onInputChanged: makeEvent(), onInputEntered: makeEvent(),
       onInputStarted: makeEvent(), onInputCancelled: makeEvent(),
     },
-    bookmarks: {
-      create: async (b) => ({ id: "bm-" + (++bookmarkSeq), type: b.url ? "bookmark" : "folder", ...b }),
-      search: async () => [],
-      getChildren: async () => [],
-      get: async (id) => [{ id, type: "folder", parentId: "unfiled_____" }],
-    },
     contextualIdentities: { query: async () => [] },
     theme: { getCurrent: async () => ({}), onUpdated: makeEvent() },
     commands: { onCommand: makeEvent() },
+    alarms: { onAlarm: makeEvent(), create: async () => {}, clear: async () => true },
     runtime: {
       onMessage: makeEvent(), onInstalled: makeEvent(), onStartup: makeEvent(),
       getURL: (p) => "moz-extension://test/" + p,
+      getManifest: () => ({ version: "2.6.61" }),
       sendMessage: async () => ({}),
     },
   };
@@ -176,8 +161,9 @@ export function loadBackend({ storageData = {}, overrides = {}, storageLatencyMs
     crypto,
     // `URL` is a global in the MV2 background page (TabService._isUrlAllowed
     // parses with `new URL(...)`); a vm sandbox does not inherit it, so add it
-    // explicitly or every URL fails to parse and exports create zero folders.
+    // explicitly or every URL fails to parse and valid restores are rejected.
     URL,
+    TextEncoder,
     fetch: async () => ({ status: 200, text: async () => "<svg></svg>" }),
   };
   sandbox.globalThis = sandbox;

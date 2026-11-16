@@ -799,7 +799,6 @@ const DEFAULT_REPLIES = {
   getLastRestoreError: null,
   getClosedTabs: [],
   getWorkspaceName: "Workspace",
-  getBookmarkWorkspaces: [],
   searchTabs: [],
 };
 
@@ -814,11 +813,11 @@ const DEFAULT_REPLIES = {
 //             fires the prefers-color-scheme change listeners.
 //   cssSupports: CSS.supports(property, value); defaults to cssSupportsModel.
 export function loadPopup({
-  scripts = null, replies = {}, reducedMotion = true,
+  scripts = null, replies = {}, reducedMotion = true, page = "wsp.html",
   theme = { colors: {} }, prefersDark = false, cssSupports = cssSupportsModel,
 } = {}) {
   const doc = new Document();
-  const html = readFileSync(join(POPUP_DIR, "wsp.html"), "utf8");
+  const html = readFileSync(join(POPUP_DIR, page), "utf8");
   const roots = parseHtml(html, doc);
   const htmlEl = roots.find(e => e.tagName === "HTML");
   htmlEl.parentNode = doc;

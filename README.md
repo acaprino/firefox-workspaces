@@ -60,13 +60,17 @@ Or load temporarily via `about:debugging` - click "Load Temporary Add-on" and se
 
 Keyboard shortcuts can be customized in `about:addons` - gear icon - **Manage Extension Shortcuts**.
 
-### Recovery after a restart
+### Recovery and file history
 
-Workspaces reassigns tabs that Firefox restores to their workspaces. It does not automatically reopen recently closed tabs at startup.
+**Backup history** shows automatic JSON versions in the Firefox profile. These files are the only version archive. Keep 2..200 versions (default 50), preview them, and restore one tab, one workspace or all workspaces. Restores retain existing tabs and preserve each saved tab's container and group.
 
-If Firefox starts with only blank or new-tab pages while saved workspace lists contain content, recovery pauses to preserve those lists. It resumes automatically when content tabs arrive in the same window. If no tabs arrive, the popup keeps the recovery warning.
+Install the local Windows helper using [the profile setup guide](native/README.md). Settled changes schedule capture after six seconds following tab snapshot updates, with checks every five minutes while Firefox runs. Failed capture/writing preserves earlier files. Incomplete recovery pauses automatic capture until reviewed.
 
-If startup recovery detects missing workspace tabs, it attempts to save their last recorded URL lists under **Other Bookmarks > Workspaces**, then reports the export result in the popup. Review these lists before using **Restore from bookmarks**: snapshots can include tabs you intentionally closed. Restoring a folder creates a new workspace and opens its saved URLs; it does not restore browsing history or form contents.
+Before discarding old workspace indexes, startup recovery must save complete snapshots to JSON. A missing helper or incomplete snapshot retains the retry and old records. Review versions before restoring: they can include intentionally closed tabs. Cookies, passwords, page/form history and pinned tabs are not included.
+
+Bookmarks backup/restore has been removed. Existing folders remain accessible through Firefox's bookmarks menu. Losing the entire profile also loses its JSON history.
+
+Firefox can discard hidden workspace tabs at the next startup when closing the last visible tab also closes its last window. To keep the window open with a blank tab instead, set `browser.tabs.closeWindowWithLastTab` to `false` in `about:config`. The extension cannot change this preference through the WebExtensions API.
 
 <details>
 <summary><strong>All Features</strong></summary>
@@ -100,12 +104,19 @@ The extension places its toolbar button in the tab strip area by default. If it 
 
 ```
 backend/                     # Background scripts (loaded in manifest order)
+  theme-utils.js             # Theme helpers shared with the popup
+  recovery-data.js           # Versioned recovery schema and validation
   storage.js                 # WSPStorageManager - storage.local wrapper + async mutex
+  restore-matcher.js         # Pure restart assignment planner
   workspace.js               # Workspace entity - create, activate, hide, destroy
   ui-service.js              # Toolbar button icon, badge, SVG cache, theme detection
   menu-service.js            # Tab context menu ("Move Tab to...") + omnibox provider
   workspace-service.js       # Workspace CRUD, activate/deactivate, container binding
   tab-service.js             # Tab add/remove/move, search, closed tabs, container reopen
+  snapshot-service.js        # Snapshot acquisition and scheduled refresh
+  local-backup-data.js       # File schema validation
+  local-backup-service.js    # Capture, scheduler, file history and granular restore
+  workspace-restore-service.js # Additive workspace reconstruction
   brainer.js                 # Orchestrator - init, event listeners, restart recovery
   handler.js                 # Message router (popup -> background)
 
@@ -114,6 +125,7 @@ popup/                       # Browser action popup
   css/wsp.css                # Theme-aware styles (CSS system colors + browser.theme)
   js/
     wsp.js                   # Main popup UI (WorkspaceUI class, theme detection)
+    recovery-banner.js       # Recovery messages and available actions
     dialog.js                # Create/rename dialog (icon picker, color picker, container)
     tooltip.js               # Tab preview tooltips on workspace hover
     drag-drop.js             # Workspace reorder via drag and drop
@@ -122,7 +134,7 @@ icons/                       # layered-{light,dark}.svg: toolbar (theme-aware)
                              # layered-{64,128}.png: AMO listing + about:addons (AMO rejects SVG)
 ```
 
-**Load order matters.** The `background.scripts` array in `manifest.json` defines execution order. `storage.js` loads first (all services depend on `WSPStorageManager`). `brainer.js` and `handler.js` load last.
+**Load order matters.** The `background.scripts` array in `manifest.json` defines execution order and is also read by the test loader. `brainer.js` and `handler.js` load last. See [architecture and recovery contracts](docs/architecture.md).
 
 `WorkspaceService` and `TabService` have a bidirectional dependency - both are singletons in the same MV2 background page scope. The popup communicates with the background via `browser.runtime.sendMessage()` using an `action` field dispatched in `handler.js`.
 
@@ -151,6 +163,8 @@ To sign: copy `.env.example` to `.env` and fill in your AMO API credentials from
 | `tabs` | Query, show, hide, create, move, and close tabs across workspaces |
 | `tabHide` | Hide tabs in inactive workspaces (`browser.tabs.hide`) |
 | `tabGroups` | Reconstruct Firefox tab groups when activating a workspace |
+| `nativeMessaging` | Access the installed profile JSON helper |
+| `alarms` | Schedule automatic backup checks |
 | `storage` | Persist workspace state and tab mappings in `browser.storage.local` |
 | `menus` | "Move Tab to Another Workspace" in the tab context menu |
 | `sessions` | Tag tabs with workspace IDs for restart recovery |

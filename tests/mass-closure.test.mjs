@@ -4,6 +4,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { loadBackend } from "./helpers/load-backend.mjs";
 
+import { completeSnapshots, nativeBackup } from "./helpers/native-backup.mjs";
+
 const WSP_A = "11111111-1111-4111-8111-111111111111";
 const WSP_B = "22222222-2222-4222-8222-222222222222";
 const SNAPSHOT = ["https://example.com/a", "https://example.com/b", "https://example.com/c"];
@@ -11,7 +13,9 @@ const SNAPSHOT = ["https://example.com/a", "https://example.com/b", "https://exa
 async function recoveryFixture({ exportFails = false } = {}) {
   const liveTabs = [];
   const restoredIds = [];
-  const bookmarks = [];
+  const native = nativeBackup({ onWrite: async () => { events.push("export"); } });
+  native.fail(exportFails);
+  const backups = native.archives;
   const events = [];
   const sessionValues = new Map();
   const closedSessions = SNAPSHOT.map((url, i) => ({
@@ -19,7 +23,7 @@ async function recoveryFixture({ exportFails = false } = {}) {
     tab: { sessionId: `closed-${i}`, url, windowId: 1, index: i, pinned: false },
   }));
   const env = loadBackend({
-    storageData: {
+    storageData: completeSnapshots({
       "ld-wsp-window-1": [WSP_A, WSP_B],
       "ld-wsp-order-1": [WSP_A, WSP_B],
       [`ld-wsp-${WSP_A}`]: {
@@ -30,8 +34,9 @@ async function recoveryFixture({ exportFails = false } = {}) {
         id: WSP_B, name: "Other", tabs: [], groups: [], active: false, windowId: 1,
         tabSnapshot: SNAPSHOT.slice(2),
       },
-    },
+    }),
     overrides: {
+      runtime: native.runtime,
       storage: {
         session: { get: async () => ({ "wsp-session-alive": true }), set: async () => {} },
       },
@@ -46,7 +51,7 @@ async function recoveryFixture({ exportFails = false } = {}) {
         },
       },
       sessions: {
-        getTabValue: async id => sessionValues.get(id),
+        getTabValue: async (id, key) => key === "wspId" ? sessionValues.get(id) : undefined,
         setTabValue: async (id, key, value) => { sessionValues.set(id, value); },
         getRecentlyClosed: async () => closedSessions,
         restore: async sessionId => {
@@ -58,15 +63,7 @@ async function recoveryFixture({ exportFails = false } = {}) {
           return { tab };
         },
       },
-      bookmarks: {
-        create: async options => {
-          if (exportFails) throw new Error("Bookmarks unavailable");
-          const bookmark = { id: `bm-${bookmarks.length}`, ...options };
-          bookmarks.push(bookmark);
-          if (options.url) events.push("export");
-          return bookmark;
-        },
-      },
+
     },
   });
   // Boot as an extension reload, then run one controlled startup recovery
@@ -78,7 +75,7 @@ async function recoveryFixture({ exportFails = false } = {}) {
     if (data[`ld-wsp-${WSP_A}`]) events.push("workspace-write");
     await originalSet(data);
   };
-  return { ...env, liveTabs, restoredIds, bookmarks, events, sessionValues, closedSessions };
+  return { ...env, liveTabs, restoredIds, backups, events, sessionValues, closedSessions };
 }
 
 async function recover(env, path) {
@@ -96,7 +93,7 @@ for (const path of ["detected restart", "undetected restart"]) {
   test(`${path}: fresh closed-tab matches stay closed and snapshots are backed up first`, async t => {
     const env = await recoveryFixture();
     t.after(() => {
-      for (const timer of env.get("TabService")._snapshotTimers.values()) clearTimeout(timer);
+      for (const timer of env.get("SnapshotService")._timers.values()) clearTimeout(timer);
     });
     env.liveTabs.push({ id: 50, windowId: 1, url: "https://example.com/new", pinned: false });
     await recover(env, path);
@@ -104,7 +101,7 @@ for (const path of ["detected restart", "undetected restart"]) {
     assert.deepEqual(env.restoredIds, [], "startup must not consume undo-close history");
     assert.equal(env.closedSessions.length, 3);
     assert.deepEqual(env.liveTabs.map(t => t.id), [50], "no closed tab was reopened");
-    assert.deepEqual(env.bookmarks.filter(b => b.url).map(b => b.url), SNAPSHOT);
+    assert.deepEqual(env.backups.flatMap(a => a.workspaces.flatMap(w => w.snapshot.tabs.map(t => t.url))), SNAPSHOT);
     assert.ok(env.events.lastIndexOf("export") < env.events.indexOf("workspace-write"),
       "all snapshot exports precede workspace changes");
     const banner = env.storageData["ld-wsp-last-restore-error"];
@@ -130,7 +127,7 @@ test("normal restart keeps Firefox-restored tabs in their workspaces without rec
   assert.deepEqual([...env.storageData[`ld-wsp-${WSP_A}`].tabs], [51]);
   assert.deepEqual([...env.storageData[`ld-wsp-${WSP_B}`].tabs], [52]);
   assert.equal(env.storageData["ld-wsp-last-restore-error"], undefined);
-  assert.deepEqual(env.bookmarks, []);
+  assert.deepEqual(env.backups, []);
   assert.deepEqual(env.restoredIds, []);
 });
 
@@ -142,7 +139,7 @@ test("URL fallback reassigns already-open tabs without opening closed ones", asy
   assert.deepEqual([...env.storageData[`ld-wsp-${WSP_A}`].tabs], [51, 52]);
   assert.deepEqual([...env.storageData[`ld-wsp-${WSP_B}`].tabs], [53]);
   assert.deepEqual(env.restoredIds, []);
-  assert.deepEqual(env.bookmarks, []);
+  assert.deepEqual(env.backups, []);
   assert.equal(env.storageData["ld-wsp-last-restore-error"], undefined);
 });
 
@@ -152,12 +149,12 @@ test("repeated incomplete detection deduplicates backups and does not rearm a di
   const Brainer = env.get("Brainer");
   await Brainer._detectSessionLoss(1);
   assert.equal(env.storageData["ld-wsp-last-restore-error"].exportedUrls, 3);
-  const count = env.bookmarks.length;
+  const count = env.backups.length;
   await env.get("WSPStorageManager").clearLastRestoreError();
   await Brainer._detectSessionLoss(1);
 
   assert.deepEqual(env.restoredIds, []);
-  assert.equal(env.bookmarks.length, count);
+  assert.equal(env.backups.length, count);
   assert.equal(env.storageData["ld-wsp-last-restore-error"], undefined);
 });
 
@@ -168,19 +165,22 @@ test("a pending warning is preserved while incomplete snapshots are backed up", 
   env.liveTabs.push({ id: 50, windowId: 1, url: "https://example.com/new", pinned: false });
   await env.get("Brainer")._detectSessionLoss(1);
 
-  assert.deepEqual(env.bookmarks.filter(b => b.url).map(b => b.url), SNAPSHOT);
+  assert.deepEqual(env.backups.flatMap(a => a.workspaces.flatMap(w => w.snapshot.tabs.map(t => t.url))), SNAPSHOT);
   assert.deepEqual(env.restoredIds, []);
   assert.equal(env.storageData["ld-wsp-last-restore-error"], pending);
 });
 
-test("failed bookmark export never falls back to automatic reopening", async () => {
+test("failed JSON export never falls back to automatic reopening", async () => {
   const env = await recoveryFixture({ exportFails: true });
   env.liveTabs.push({ id: 50, windowId: 1, url: "https://example.com/new", pinned: false });
-  await env.get("Brainer")._detectSessionLoss(1);
+  const saved = [WSP_A, WSP_B].map(id => structuredClone(env.storageData[`ld-wsp-${id}`]));
+  await assert.rejects(env.get("Brainer")._detectSessionLoss(1),
+    { code: "RECOVERY_BACKUP_INCOMPLETE" });
 
   assert.deepEqual(env.restoredIds, []);
-  const banner = env.storageData["ld-wsp-last-restore-error"];
-  assert.equal(banner.reason, "session-not-restored");
-  assert.equal(banner.exportedWorkspaces, 0);
-  assert.equal(banner.exportedUrls, 0);
+  assert.deepEqual(env.backups, []);
+  assert.deepEqual([WSP_A, WSP_B].map(id => structuredClone(env.storageData[`ld-wsp-${id}`])), saved);
+  // The startup caller handles the rejected backup by entering init retry;
+  // detection must not publish a successful reconciliation warning itself.
+  assert.equal(env.storageData["ld-wsp-last-restore-error"], undefined);
 });

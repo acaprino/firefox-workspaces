@@ -192,13 +192,6 @@ test("X-46: a failed Clear keeps the Recently Closed list", async () => {
   assert.match(p.dialogText(), /Could not clear/);
 });
 
-test("X-46: a failed bookmarks read is not reported as 'no saved workspaces'", async () => {
-  const p = await openPopup({ getBookmarkWorkspaces: INTERNAL });
-  p.$("restoreFromBookmarks").click();
-  await p.settle();
-  assert.doesNotMatch(p.dialogText(), /No saved workspaces/);
-  assert.match(p.dialogText(), /Could not read/);
-});
 
 // ---------------------------------------------------------------- X-47
 
@@ -406,20 +399,6 @@ test("X-74: deleting the active workspace shows the next active one's Recently C
   assert.deepEqual(p.actions("clearClosedTabs").map((m) => m.wspId), [B]);
 });
 
-test("X-74: export and close of the active workspace moves the active mark too", async () => {
-  const p = await openPopup({
-    getClosedTabs: ({ wspId }) => CLOSED[wspId],
-    exportWorkspaceToBookmarks: { exported: 1, total: 1, folderTitle: "Home", destroyed: true, activatedWspId: B },
-  });
-  p.row(A).querySelector(".export-btn").click();
-  await p.settle();
-  p.$("custom-dialog-checkbox").click();
-  p.$("custom-dialog-ok").click();
-  await p.settle(20);
-  assert.deepEqual(p.order(), [B, C]);
-  assert.equal(p.row(B).classList.contains("active"), true);
-  assert.deepEqual(closedTitles(p), ["Closed in Work"]);
-});
 
 // ---------------------------------------------------------------- X-121
 

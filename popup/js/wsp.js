@@ -157,10 +157,6 @@ const _FF_POPUP_PROPS = [
   ['--ff-popup-border',       ['popup_border', 'toolbar_field_border']],
   ['--ff-popup-input-border', ['toolbar_field_border', 'popup_border']],
 ];
-// --ff-popup-accent, in priority order.
-// NOTE: MUST stay in sync with THEME_ACCENT_KEYS in backend/theme-utils.js
-// so the toolbar badge color matches the popup accent.
-const _FF_POPUP_ACCENT_KEYS = ['accentcolor', 'toolbar_field_focus_border', 'icons_attention', 'tab_loading', 'popup_highlight'];
 
 // Every --ff-popup-* var applyTheme may set, so a re-apply clears them all.
 const _FF_POPUP_VARS = [
@@ -254,7 +250,7 @@ function applyTheme(theme) {
   // The accent carries text only on the dialog's OK button: pick black or
   // white by the accent's own brightness. An accent whose brightness is
   // unknown is left out, so AccentColor keeps its AccentColorText partner.
-  const accent = _pickThemeColor(c, _FF_POPUP_ACCENT_KEYS);
+  const accent = _pickThemeColor(c, THEME_ACCENT_KEYS);
   const accentDark = accent ? _isDarkCssColor(accent) : null;
   if (accentDark !== null) {
     set('--ff-popup-accent', accent);
@@ -298,10 +294,10 @@ const LAST_RESTORE_ERROR_KEY = "ld-wsp-last-restore-error";
 const ACTIVATE_REPLY_GRACE_MS = 200;
 
 // Workspace names are capped at the limit the background enforces
-// (handler.js _sanitizeName, bookmark folder titles): 200 UTF-16 code units.
+// (handler.js _sanitizeName, backup workspace names): 200 UTF-16 code units.
 // Cutting at the same limit here means a name is never cut again there, and
 // the cut never ends on the first half of a surrogate pair (half an emoji is
-// stored, and exported to bookmarks, as U+FFFD). Keep in sync with the
+// stored, and saved to JSON files, as U+FFFD). Keep in sync with the
 // maxlength of #custom-dialog-input in wsp.html.
 const WSP_NAME_MAX = 200;
 function _clampWspName(name) {
@@ -367,6 +363,7 @@ class WorkspaceUI {
     this._activating = false;
     this._copyingDiagnostics = false;
     this._closedTabsSeq = 0;
+    this._restoringClosedTab = false;
   }
 
   async initialize() {
@@ -467,7 +464,6 @@ class WorkspaceUI {
   _showRestricted(primaryWindowId) {
     console.log("[WorkspaceUI][initialize] not primary window -- showing restricted UI, primary:", primaryWindowId);
     document.getElementById("createNewWsp").style.display = "none";
-    document.getElementById("restoreFromBookmarks").style.display = "none";
     document.getElementById("wsp-search").hidden = true;
     const noWspLi = document.createElement("li");
     noWspLi.className = "no-wsp";
@@ -483,7 +479,7 @@ class WorkspaceUI {
     // Undo the restricted view (this window became the primary while the
     // popup was open).
     document.getElementById("createNewWsp").style.display = "";
-    document.getElementById("restoreFromBookmarks").style.display = "";
+    document.getElementById("backupHistory").style.display = "";
     document.getElementById("wsp-search").hidden = false;
 
     this._dragDrop = new DragDropHandler(
@@ -515,23 +511,13 @@ class WorkspaceUI {
     this.displayWorkspaces();
     this._bindArrowNavigation(wspList, ".wsp-row-main");
     this._setupCreateButton();
-    this._setupRestoreButton();
     this.setupSearch();
     this.showClosedTabs();
   }
 
-  // Render an inline banner when a restore-error payload is pending (see
-  // backend/brainer.js: refuse-to-wipe, phase4-failure, session-not-restored).
-  // Also render persisted tabs-closed-at-startup payloads from older versions.
-  //
-  // User actions:
-  //   - Dismiss (acknowledgeLastRestoreError): clears the banner. For the two
-  //     retry-able reasons the restart-retry signal stays armed.
-  //   - Give up (giveUpRestoreRetry): clears the banner AND the retry signal
-  //     (destructive; old workspaces become orphaned). Confirms first. Hidden
-  //     for session-not-restored and tabs-closed-at-startup, where there is
-  //     no retry to give up on.
-  // Both actions echo the displayed payload's `when` so the background can
+  // recovery-banner.js owns the reason-to-message/action policy. This
+  // controller owns live storage, messaging and stale-response guards.
+  // Actions echo the displayed payload's `when` so the background can
   // refuse a stale dismiss (compare-and-clear): if a fresh warning replaced
   // the displayed one mid-popup, the newer payload survives and is re-shown.
   // The banner stays in sync with the background via storage.onChanged.
@@ -541,11 +527,9 @@ class WorkspaceUI {
     const copyBtn = document.getElementById("wsp-error-copy");
     const ackBtn = document.getElementById("wsp-error-acknowledge");
     const giveUpBtn = document.getElementById("wsp-error-give-up");
-    if (!banner || !text || !copyBtn || !ackBtn || !giveUpBtn) return;
+    const reopenBtn = document.getElementById("wsp-error-reopen");
+    if (!banner || !text || !copyBtn || !ackBtn || !giveUpBtn || !reopenBtn) return;
 
-    // Storage values can be edited via about:debugging; validate before
-    // formatting them into user-visible text.
-    const isFiniteNum = (v) => typeof v === "number" && Number.isFinite(v);
     // `when` of the payload currently rendered; echoed with dismiss/give-up.
     let displayedWhen = null;
     // Bumped on every render. A fetched payload is rendered only if nothing
@@ -554,61 +538,18 @@ class WorkspaceUI {
 
     const render = (payload) => {
       renderSeq++;
-      if (!payload) {
+      const model = getRecoveryBannerModel(payload);
+      if (!model) {
         displayedWhen = null;
         banner.hidden = true;
         return;
       }
-      displayedWhen = isFiniteNum(payload.when) ? payload.when : null;
-      const when = isFiniteNum(payload.when) ? new Date(payload.when).toLocaleString() : "earlier";
-      const wspCount = isFiniteNum(payload.wspCount) ? payload.wspCount : "?";
-      const urlCount = isFiniteNum(payload.snapshotUrlCount) ? payload.snapshotUrlCount : "?";
-      const exportedUrls = isFiniteNum(payload.exportedUrls) ? payload.exportedUrls : null;
-      const exportedNote = (folders) => {
-        if (folders <= 0) return `No tab list could be exported to bookmarks. `;
-        // Honest counts: the export filters non-bookmarkable URLs and can
-        // partially fail, so prefer the actual exported-URL count when the
-        // background provided it.
-        const counts = exportedUrls != null && exportedUrls !== urlCount
-          ? `${exportedUrls} of ${urlCount} URL(s)`
-          : `${urlCount} URL(s)`;
-        return `The saved tab lists (${counts}) were exported to bookmarks under ` +
-          `"Workspaces", use "Restore from bookmarks" to reopen them. `;
-      };
-      if (payload.reason === "session-not-restored" || payload.reason === "tabs-closed-at-startup") {
-        // Missing tabs and fresh undo entries do not prove when or why a tab
-        // was closed. Keep recovery voluntary and describe only known facts.
-        const exported = isFiniteNum(payload.exportedWorkspaces) ? payload.exportedWorkspaces : 0;
-        const legacyRecovery = payload.reason === "tabs-closed-at-startup";
-        const restoredCount = isFiniteNum(payload.restoredCount) ? payload.restoredCount : 0;
-        const outcome = legacyRecovery
-          ? (restoredCount > 0
-            ? `An earlier automatic recovery reopened ${restoredCount} tab(s). `
-            : `An earlier automatic recovery did not report any reopened tabs. `)
-          : `Closed tabs were not reopened automatically. `;
-        text.textContent =
-          `Workspace tabs were not fully restored when the browser started at ${when}. ` +
-          `Saved tab lists for ${wspCount} workspace(s) contained ${urlCount} URL(s). ` +
-          outcome + exportedNote(exported) +
-          `Review the saved lists before restoring - they may include tabs you intentionally closed. ` +
-          `You can also check History > Recently closed tabs in Firefox.`;
-        giveUpBtn.hidden = true;
-      } else {
-        const reason = payload.reason === "phase4-failure"
-          ? `A previous restore attempt failed mid-way at ${when}.`
-          : `Workspace restore was paused at ${when} to prevent data loss.`;
-        // A failed commit after incomplete recovery may already have a
-        // bookmark backup. Report the export counts, not a presumed cause.
-        const lossNote = payload.sessionLost === true
-          ? ` Some workspace tabs were missing during startup. ` +
-            exportedNote(isFiniteNum(payload.exportedWorkspaces) ? payload.exportedWorkspaces : 0)
-          : ` Try restarting Firefox to retry the restore. `;
-        text.textContent =
-          `${reason} ${wspCount} workspace(s) had ${urlCount} previously open URL(s) recorded. ` +
-          `User data was left untouched.` + lossNote +
-          `Use "Give up" only if you no longer need the workspaces from before the failed restart.`;
-        giveUpBtn.hidden = false;
-      }
+      displayedWhen = model.when;
+      text.textContent = model.text;
+      ackBtn.textContent = model.acknowledgeLabel;
+      ackBtn.title = model.acknowledgeTitle;
+      giveUpBtn.hidden = !model.canGiveUp;
+      reopenBtn.hidden = !model.canReopen;
       banner.hidden = false;
     };
 
@@ -642,6 +583,23 @@ class WorkspaceUI {
     copyBtn.addEventListener("click", () => {
       this._copyDiagnostics();
     });
+    reopenBtn.addEventListener("click", async () => {
+      if (banner.hidden || reopenBtn.hidden || reopenBtn.disabled) return;
+      const when = displayedWhen;
+      const seq = renderSeq;
+      reopenBtn.disabled = true;
+      try {
+        const result = await this._request("reopenClosedPrimaryWindow", { when });
+        // The restore may publish another warning. Read it back and retain
+        // any newer storage event while the read is in flight.
+        if (!(await refresh()) && !result?.stale && seq === renderSeq) banner.hidden = true;
+      } catch (error) {
+        await refresh();
+        await this._showFailure(error, "Could not reopen the primary window. Please try again.");
+      } finally {
+        reopenBtn.disabled = false;
+      }
+    });
     ackBtn.addEventListener("click", async () => {
       // Optimistic UI: hide the banner immediately so the user sees feedback
       // even if the background storage write is slow. On failure or a stale
@@ -671,9 +629,10 @@ class WorkspaceUI {
         message:
           "Give up the automatic restore retry?\n\n" +
           "Where possible, the saved tab lists of the old workspaces will first be " +
-          "exported to bookmarks (under \"Workspaces\"), so you can bring them back " +
-          "later via \"Restore from bookmarks\". The next Firefox start will create " +
-          "a fresh default workspace.\n\n" +
+          "saved as JSON files, so you can bring them back " +
+          "later via \"Backup history\". The JSON files keep containers and " +
+          "groups. If saving fails, the old workspaces and retry are kept. " +
+          "This starts a new default workspace.\n\n" +
           "If you have not copied the diagnostic dump yet, do that first."
       });
       if (!ok) return;
@@ -706,14 +665,14 @@ class WorkspaceUI {
       }
       if (result?.exportedWorkspaces > 0) {
         await showCustomDialog({
-          message: `Saved ${result.exportedWorkspaces} workspace(s) to bookmarks ` +
-            `under "Workspaces". Restore them any time via "Restore from bookmarks".`,
+          message: `Saved ${result.exportedWorkspaces} workspace(s) to JSON files ` +
+            `in the profile backup folder. Restore them via "Backup history".`,
           infoOnly: true
         });
       } else if (result?.alreadyExported) {
         await showCustomDialog({
-          message: `The workspace tab lists were already saved to bookmarks under ` +
-            `"Workspaces". Restore them any time via "Restore from bookmarks".`,
+          message: `The workspace tab lists were already saved as JSON files in ` +
+            `the profile backup folder. Restore them via "Backup history".`,
           infoOnly: true
         });
       }
@@ -865,59 +824,6 @@ class WorkspaceUI {
         this.showClosedTabs();
       } finally {
         delete btn.dataset.busy;
-      }
-    });
-  }
-
-  _setupRestoreButton() {
-    const restoreLink = document.getElementById("restoreFromBookmarks");
-    restoreLink.addEventListener("click", async (e) => {
-      e.preventDefault();
-      if (restoreLink.dataset.busy) return;
-      restoreLink.dataset.busy = "1";
-      try {
-        console.log("[WorkspaceUI][restoreFromBookmarks] clicked");
-
-        let folders;
-        try {
-          folders = await this._request("getBookmarkWorkspaces");
-        } catch (err) {
-          await this._showFailure(err, "Could not read the saved workspaces from bookmarks.");
-          return;
-        }
-        if (!folders || folders.length === 0) {
-          await showCustomDialog({ message: "No saved workspaces found in bookmarks.", infoOnly: true });
-          return;
-        }
-
-        const result = await showCustomDialog({
-          message: "Restore workspace from bookmarks:",
-          showFolderPicker: true,
-          folders
-        });
-
-        if (!result) {
-          console.log("[WorkspaceUI][restoreFromBookmarks] cancelled");
-          return;
-        }
-
-        console.log("[WorkspaceUI][restoreFromBookmarks] restoring folder:", result.folderId);
-        let restored;
-        try {
-          restored = await this._request("restoreWorkspaceFromBookmarks", {
-            folderId: result.folderId,
-            windowId: this.currentWindowId
-          });
-        } catch (err) {
-          console.log("[WorkspaceUI][restoreFromBookmarks] restore failed");
-          await this._showFailure(err, "Could not restore the workspace from bookmarks.");
-          return;
-        }
-
-        console.log("[WorkspaceUI][restoreFromBookmarks] restored:", restored?.name, "tabs:", restored?.tabCount);
-        window.close();
-      } finally {
-        delete restoreLink.dataset.busy;
       }
     });
   }
@@ -1091,7 +997,10 @@ class WorkspaceUI {
       restoreBtn.setAttribute("aria-label", `Restore "${tab.title || tab.url}"`);
 
       li.addEventListener("click", async () => {
-        // Disable all closed-tab items to prevent double clicks
+        // Pointer suppression alone does not stop Enter/Space on the focused
+        // button. Keep one restore in flight, including the list refresh.
+        if (this._restoringClosedTab) return;
+        this._restoringClosedTab = true;
         const allItems = list.querySelectorAll(".wsp-closed-tab-item");
         for (const item of allItems) item.style.pointerEvents = "none";
 
@@ -1110,8 +1019,13 @@ class WorkspaceUI {
           });
         } catch (err) {
           await this._showFailure(err, "Could not restore the tab. Please try again.");
+        } finally {
+          try {
+            await this.showClosedTabs();
+          } finally {
+            this._restoringClosedTab = false;
+          }
         }
-        this.showClosedTabs();
       });
 
       li.appendChild(restoreBtn);
@@ -1286,12 +1200,6 @@ class WorkspaceUI {
 
     // Icon-only actions, in visual order (export, rename, delete) so Tab
     // follows what the user sees. aria-label names the workspace.
-    const exportBtn = document.createElement("button");
-    exportBtn.type = "button";
-    exportBtn.classList.add("edit-btn", "export-btn");
-    exportBtn.title = "Export to bookmarks";
-    li.appendChild(exportBtn);
-
     const renameBtn = document.createElement("button");
     renameBtn.type = "button";
     renameBtn.classList.add("edit-btn", "rename-btn");
@@ -1305,7 +1213,6 @@ class WorkspaceUI {
     li.appendChild(deleteBtn);
 
     const labelActions = (name) => {
-      exportBtn.setAttribute("aria-label", `Export workspace "${name}" to bookmarks`);
       renameBtn.setAttribute("aria-label", `Rename workspace "${name}"`);
       deleteBtn.setAttribute("aria-label", `Delete workspace "${name}"`);
     };
@@ -1349,70 +1256,6 @@ class WorkspaceUI {
       );
     });
 
-    // Export to bookmarks
-    // Re-entrancy guards use data-busy, not `disabled`: a disabled button
-    // cannot take focus back when the dialog closes.
-    exportBtn.addEventListener("click", async (e) => {
-      e.stopPropagation();
-      if (exportBtn.dataset.busy) return;
-      exportBtn.dataset.busy = "1";
-      try {
-        console.log("[WorkspaceUI][exportBtn] clicked for workspace:", workspace.id, workspace.name);
-
-        const result = await showCustomDialog({
-          message: `Export "${li.dataset.originalText}" to bookmarks?`,
-          showCheckbox: true,
-          checkboxLabel: "Close workspace after export",
-          checkboxDefault: false
-        });
-
-        if (!result) {
-          console.log("[WorkspaceUI][exportBtn] export cancelled");
-          return;
-        }
-
-        // Single background call handles both export and optional destroy
-        let exportResult;
-        let exportError = null;
-        try {
-          exportResult = await this._request("exportWorkspaceToBookmarks", {
-            wspId: workspace.id,
-            windowId: this.currentWindowId,
-            destroyAfter: !!result.checked
-          });
-        } catch (err) {
-          exportError = err;
-        }
-        if (exportError || !exportResult) {
-          console.log("[WorkspaceUI][exportBtn] export failed");
-          await this._showFailure(exportError, "Could not export the workspace to bookmarks.");
-          return;
-        }
-        console.log("[WorkspaceUI][exportBtn] exported", exportResult.exported,
-          "of", exportResult.total, "tabs to:", exportResult.folderTitle);
-
-        // Surface partial exports and destroy refusals: silently closing (or
-        // silently not closing) tabs the user believes are backed up is the
-        // data-loss path this dialog exists to prevent.
-        if (result.checked && !exportResult.destroyed && exportResult.destroyRefusedMessage) {
-          await showCustomDialog({ message: exportResult.destroyRefusedMessage, infoOnly: true });
-        } else if (exportResult.exported < exportResult.total) {
-          await showCustomDialog({
-            message: `Exported ${exportResult.exported} of ${exportResult.total} tabs. ` +
-              `${exportResult.total - exportResult.exported} tab(s) could not be bookmarked ` +
-              `(pages like about:, file: or reader view cannot be saved as bookmarks).`,
-            infoOnly: true
-          });
-        }
-
-        if (exportResult.destroyed) {
-          this._dropWorkspace(li, workspace, exportResult.activatedWspId);
-        }
-      } finally {
-        delete exportBtn.dataset.busy;
-      }
-    });
-
     // Rename
     renameBtn.addEventListener("click", async (e) => {
       e.stopPropagation();
@@ -1437,7 +1280,7 @@ class WorkspaceUI {
       if (result !== false) {
         const originalName = li.dataset.originalText;
         // An untouched name is kept as it is, never cut again (a name
-        // restored from a bookmark folder title can be longer than what
+        // restored from a backup can be longer than what
         // the popup lets you type).
         const wspName = result.name === originalName ? originalName : _clampWspName(result.name);
         if (wspName.length === 0) return;

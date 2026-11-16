@@ -12,7 +12,7 @@ test("backend boots in the vm harness and defines its classes", async () => {
   await settle();
   assert.equal(typeof get("Brainer"), "function");
   assert.equal(typeof get("WSPStorageManager"), "function");
-  assert.equal(typeof get("BookmarkService"), "function");
+  assert.equal(typeof get("LocalBackupService"), "function");
   assert.equal(typeof get("LIMITS"), "object");
 });
 

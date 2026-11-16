@@ -47,34 +47,7 @@ test("saveWorkspaceOrder waits for an in-flight order append instead of racing i
     "both the reorder and the appended id survive");
 });
 
-test("concurrent exports of different sets record both fingerprints", async () => {
-  const { get, settle } = loadBackend();
-  await settle();
-  const Brainer = get("Brainer");
-  const setA = [{ id: "wsA", name: "A", tabSnapshot: ["https://a/1", "https://a/2"] }];
-  const setB = [{ id: "wsB", name: "B", tabSnapshot: ["https://b/1", "https://b/2"] }];
-  await Promise.all([Brainer._exportSnapshotsSafe(setA), Brainer._exportSnapshotsSafe(setB)]);
-  const list = await get("WSPStorageManager").getSessionLossExportFingerprints();
-  assert.equal(list.length, 2, `both fingerprints kept, got ${JSON.stringify(list)}`);
-  // Neither set is exported again.
-  assert.equal((await Brainer._exportSnapshotsSafe(setA)).deduped, true);
-  assert.equal((await Brainer._exportSnapshotsSafe(setB)).deduped, true);
-});
 
-test("two concurrent exports of the same content create one bookmark folder", async () => {
-  const { get, settle, browser } = loadBackend();
-  await settle();
-  const created = [];
-  const realCreate = browser.bookmarks.create;
-  browser.bookmarks.create = async (b) => { created.push(b); return realCreate(b); };
-  const setA = [{ id: "wsA", name: "A", tabSnapshot: ["https://a/1", "https://a/2"] }];
-  const results = await Promise.all([
-    get("Brainer")._exportSnapshotsSafe(setA),
-    get("Brainer")._exportSnapshotsSafe(setA),
-  ]);
-  assert.deepEqual(results.map(r => r.deduped).sort(), [false, true]);
-  assert.equal(created.filter(b => b.url).length, 2, "each URL bookmarked once");
-});
 
 test("clearing closed tabs while a save is in flight does not bring the cleared entries back", async () => {
   const closedKey = `ld-wsp-closed-${WSP_A}`;

@@ -29,29 +29,29 @@ async function boot() {
     autoEvents: false,
   });
   const env = await world.boot();
-  const TabService = env.get("TabService");
-  TabService._SNAPSHOT_DEBOUNCE_MS = 20;
-  return { world, env, TabService };
+  const SnapshotService = env.get("SnapshotService");
+  SnapshotService.DEBOUNCE_MS = 20;
+  return { world, env, SnapshotService };
 }
 
 const wait = (ms) => new Promise(r => setTimeout(r, ms));
 
 test("closing the primary window cancels its pending snapshot refreshes", async (t) => {
-  const { world, env, TabService } = await boot();
+  const { world, env, SnapshotService } = await boot();
   t.after(() => world.teardown());
-  TabService._scheduleSnapshotRefresh(1, WSP_A);
+  SnapshotService.schedule(1, WSP_A);
   world.closeWindow(1);
   await Promise.all(env.browser.windows.onRemoved._listeners.map(fn => fn(1)));
-  assert.equal(TabService._snapshotTimers.size, 0, "nothing left to fire");
+  assert.equal(SnapshotService._timers.size, 0, "nothing left to fire");
   await wait(60);
   assert.deepEqual(world.record(WSP_A).tabSnapshot, SNAPSHOT);
   assert.equal(world.storage["primary-window-last-id"], 1, "restart signal armed as before");
 });
 
 test("a refresh firing after its window closed keeps the snapshot even without onRemoved", async (t) => {
-  const { world, TabService } = await boot();
+  const { world, SnapshotService } = await boot();
   t.after(() => world.teardown());
-  TabService._scheduleSnapshotRefresh(1, WSP_A);
+  SnapshotService.schedule(1, WSP_A);
   world.closeWindow(1); // no listener runs (autoEvents off)
   await wait(60);
   assert.deepEqual(world.record(WSP_A).tabSnapshot, SNAPSHOT);
@@ -59,10 +59,10 @@ test("a refresh firing after its window closed keeps the snapshot even without o
 });
 
 test("control: a refresh in a live window still records the new URLs", async (t) => {
-  const { world, TabService } = await boot();
+  const { world, SnapshotService } = await boot();
   t.after(() => world.teardown());
   world.navigate(2, "https://a.test/2-next");
-  TabService._scheduleSnapshotRefresh(1, WSP_A);
+  SnapshotService.schedule(1, WSP_A);
   await wait(60);
   assert.deepEqual(world.record(WSP_A).tabSnapshot, ["https://a.test/1", "https://a.test/2-next"]);
 });

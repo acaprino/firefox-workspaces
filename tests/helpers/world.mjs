@@ -851,9 +851,10 @@ export function makeWorld({
       stopped = true;
       if (!env) return;
       const TabService = env.get("TabService");
-      TabService._scheduleSnapshotRefresh = () => {};
-      for (const timer of TabService._snapshotTimers.values()) clearTimeout(timer);
-      TabService._snapshotTimers.clear();
+      const SnapshotService = env.get("SnapshotService");
+      SnapshotService.schedule = () => {};
+      for (const timer of SnapshotService._timers.values()) clearTimeout(timer);
+      SnapshotService._timers.clear();
       const WorkspaceService = env.get("WorkspaceService");
       WorkspaceService.updateLastActiveTab = () => {};
       clearTimeout(WorkspaceService._lastActiveTimer);

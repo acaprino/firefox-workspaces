@@ -106,6 +106,7 @@ class Brainer {
       // events fire against handlers that guard on _state. The handlers
       // themselves no-op while _state is 'initializing' or 'restoring'.
       Brainer._registerListeners();
+      LocalBackupService.start().catch(e => console.warn("[LocalBackup] startup:", e.message));
       await Brainer._initializePass();
       console.log("[Brainer][initialize] done -- final state:", Brainer._state);
       // C-19 sweep, fire-and-forget: must not delay or fail startup.
@@ -612,6 +613,11 @@ class Brainer {
               // finish so it cannot show/hide from lists the repair rewrites.
               await WorkspaceService._activationChain.catch(() => {});
               await Brainer._repairTabAssignments(pid, true);
+            } catch (e) {
+              if (e?.code === "RECOVERY_BACKUP_INCOMPLETE") {
+                await Brainer._onInitializeFailed(e);
+              }
+              throw e;
             } finally {
               // Unless the primary window closed meanwhile (onWindowRemoved
               // set 'uninitialized'): ready with no primary opened the gates.
@@ -644,7 +650,7 @@ class Brainer {
           console.log("[Brainer][onWindowRemoved] primary window closed -- flushing last active tab, arming lastId, clearing primary");
           // A pending snapshot refresh would query the closed window, find
           // nothing and overwrite the last good tabSnapshot with [].
-          TabService._cancelSnapshotRefreshes(windowId);
+          SnapshotService.cancel(windowId);
           await WorkspaceService.flushLastActiveTab();
           // Arm the restart signal BEFORE dropping the primary claim. A crash
           // between these two writes then leaves BOTH keys set -- a state
@@ -853,7 +859,7 @@ class Brainer {
   // (primary window closed, restore refused or failed) takes them over.
   // Opening a window is not a browser restart (X-11): restoring into any new
   // window emptied every workspace into it and raised a false "not fully
-  // restored" warning with a bookmark export (a window with a real first
+  // restored" warning with a JSON file export (a window with a real first
   // tab), or tripped a false refuse-to-wipe (a blank one) -- and the closed
   // window, reopened from History, then came back unmanaged, its inactive
   // tabs hidden for good.
@@ -927,7 +933,9 @@ class Brainer {
   static async _noteClosedPrimaryWindow(windowId) {
     try {
       const others = (await browser.windows.getAll()).filter(w => w.id !== windowId);
-      if (others.length === 0) return false; // browser quitting: the next start restores
+      // A last-visible-tab close can exclude hidden tabs from Firefox's next
+      // restore. Keep their snapshots for explicit recovery after startup.
+      if (others.length === 0) return false;
       const workspaces = await WSPStorageManager.getWorkspaces(windowId);
       const inactive = workspaces.filter(w => !w.active && w.tabs.length > 0);
       const hiddenTabCount = inactive.reduce((n, w) => n + w.tabs.length, 0);
@@ -1093,7 +1101,7 @@ class Brainer {
   // good and start over in the current window.
   //  - Refused while a start or a restore runs (X-72): the restore commits
   //    anyway, and the give-up's clear wiped the warning it wrote.
-  //  - The waiting workspaces' snapshots are exported to bookmarks first,
+  //  - The waiting workspaces' snapshots are saved to JSON files first,
   //    then the old window's index is detached (X-71): Firefox numbers
   //    windows from low ids each session, and a later first window with
   //    the same id adopted the given-up workspaces instead of the promised
@@ -1120,7 +1128,6 @@ class Brainer {
       && Number.isFinite(pending.when) && pending.when !== when;
     if (isStale(await WSPStorageManager.getLastRestoreError())) return { stale: true };
     Brainer._restoreInFlight = true;
-    Brainer.cancelRestoreRetry();
     let exported = { folders: 0, urls: 0, deduped: false };
     try {
       const [lastId, primaryId] = await Promise.all([
@@ -1133,11 +1140,14 @@ class Brainer {
       if (lastId != null && primaryId == null) {
         const orphans = await WSPStorageManager.getWorkspaces(lastId);
         exported = await Brainer._exportSnapshotsSafe(orphans);
+        if (exported.complete === false) {
+          throw new Error("Failed to save the recovery backup. The old workspaces and restore retry have been kept.");
+        }
         const exportable = orphans.some(w => (w.tabSnapshot || []).length > 0);
         if (exported.folders > 0 || exported.deduped || !exportable) {
           await WSPStorageManager.detachWindow(lastId);
         } else {
-          console.warn("[Brainer][giveUpRestore] bookmark export failed -- keeping window", lastId,
+          console.warn("[Brainer][giveUpRestore] JSON file export failed -- keeping window", lastId,
             "index for the orphan sweep to retry");
         }
       }
@@ -1145,6 +1155,9 @@ class Brainer {
         await WSPStorageManager.clearLastRestoreError();
       }
       await WSPStorageManager.removePrimaryWindowLastId();
+      // A failed backup leaves automatic recovery armed. The in-flight
+      // guard already keeps its timer out until this operation finishes.
+      Brainer.cancelRestoreRetry();
       Brainer._refuseToWipeActive = false;
       Brainer._closedPrimary = null;
     } finally {
@@ -1346,7 +1359,8 @@ class Brainer {
       lastActiveTabId: wsp.lastActiveTabId ?? null,
       lastActiveTabUrl: wsp.lastActiveTabUrl ?? null,
       color: wsp.color ?? null,
-      tabSnapshot: wsp.tabSnapshot ?? []
+      tabSnapshot: wsp.tabSnapshot ?? [],
+      recoverySnapshot: wsp.recoverySnapshot ?? null
     }));
 
     // If storage was wiped (extension reinstall) but session values still reference
@@ -1407,16 +1421,9 @@ class Brainer {
       unmatchedTabs.push(...untaggedTabs);
     } else if (untaggedTabs.length > 0) {
       console.warn(`[Workspaces] Restore: ${untaggedTabs.length} untagged tab(s) — trying URL snapshot fallback`);
-      const snapshotByWsp = new Map();
-      for (const wsp of wspData) {
-        if (wsp.tabSnapshot.length > 0) snapshotByWsp.set(wsp.id, [...wsp.tabSnapshot]);
-      }
+      const fallback = RestoreMatcher.match(wspData, newTabs.filter(tab => !tab.pinned), sessionMap);
       for (const tab of untaggedTabs) {
-        let matchedWspId = null;
-        for (const [wspId, urls] of snapshotByWsp) {
-          const idx = urls.indexOf(tab.url);
-          if (idx !== -1) { matchedWspId = wspId; urls.splice(idx, 1); break; }
-        }
+        const matchedWspId = fallback.get(tab.id);
         if (matchedWspId) {
           if (!assigned.has(matchedWspId)) assigned.set(matchedWspId, []);
           assigned.get(matchedWspId).push(tab.id);
@@ -1472,7 +1479,7 @@ class Brainer {
     // Missing tags/URLs do not establish why tabs are absent. In particular,
     // Firefox can put intentionally closed tabs into the recently-closed
     // list with fresh timestamps at startup. Never use that list as consent
-    // to reopen tabs; recovery from the bookmark backup is user-initiated.
+    // to reopen tabs; recovery from the JSON backup is user-initiated.
     // Fingerprint dedup avoids repeated exports and warnings for the same
     // snapshot content. Placeholder-only starts still use refuse-to-wipe.
     const sessionLost = !adopt && Brainer._isSessionLost({
@@ -1488,6 +1495,7 @@ class Brainer {
         snapshotUrlCount, "snapshot URL(s) but", totalAssigned,
         "assigned and 0 session-tagged; exporting snapshots without reopening closed tabs");
       sessionLossExport = await Brainer._exportSnapshotsSafe(wspData);
+      Brainer._requireCompleteRecoveryBackup(sessionLossExport);
     }
 
     // ── Phase 4: writes. From here on we mutate storage. Wrapped in a single
@@ -1511,15 +1519,6 @@ class Brainer {
         console.log("[Brainer][_restoreWorkspaces] migrating workspace order:", oldOrder);
         await WSPStorageManager.withOrderLock(window.id,
           () => WSPStorageManager.saveWorkspaceOrder(window.id, oldOrder));
-      }
-
-      // Detach old window's metadata only. Per-workspace state was already
-      // rewritten above, so we keep the shared `ld-wsp-{wspId}` and
-      // `ld-wsp-closed-{wspId}` keys intact -- detachWindow only touches the
-      // window-keyed indexes.
-      if (oldWindowId != null && oldWindowId !== window.id) {
-        console.log("[Brainer][_restoreWorkspaces] detaching old window metadata:", oldWindowId);
-        await WSPStorageManager.detachWindow(oldWindowId);
       }
 
       await Brainer._closeDestroyLeftovers(destroyLeftovers);
@@ -1583,6 +1582,14 @@ class Brainer {
       await WSPStorageManager.setPrimaryWindowId(window.id);
       Brainer._primaryWindowId = window.id;
       await WSPStorageManager.removePrimaryWindowLastId();
+      // The old index is the retry source until both pointer writes commit.
+      // A tab/storage failure before that point must not force the retry to
+      // reconstruct anonymous workspaces from session tags. Cleanup failure
+      // after commit leaves a harmless old index for the startup orphan sweep.
+      if (oldWindowId != null && oldWindowId !== window.id) {
+        try { await WSPStorageManager.detachWindow(oldWindowId); }
+        catch (e) { console.warn("[Brainer][_restoreWorkspaces] old index cleanup failed:", e.message); }
+      }
       if (!midSession
           || !Brainer._REPORTS_KEPT_BY_TAKEOVER.has((await WSPStorageManager.getLastRestoreError())?.reason)) {
         await WSPStorageManager.clearLastRestoreError();
@@ -1592,7 +1599,7 @@ class Brainer {
       if (sessionLost) {
         if (sessionLossExport?.deduped) {
           // Same loss content as the last announced one (the steady state for
-          // a clear-history-on-close user): the bookmarks already exist and
+          // a clear-history-on-close user): the JSON files already exist and
           // the user already saw -- or dismissed -- the banner. Re-arming it
           // on every start would just train the user to ignore it.
           console.log("[Brainer][_restoreWorkspaces] session loss unchanged since last export -- banner not re-armed");
@@ -1602,6 +1609,7 @@ class Brainer {
             wspCount: wspData.length,
             snapshotUrlCount,
             exportedWorkspaces: sessionLossExport?.folders ?? 0,
+            backupFormat: "json",
             exportedUrls: sessionLossExport?.urls ?? 0,
           });
         }
@@ -1623,6 +1631,7 @@ class Brainer {
       // assuming a wiped session store or promising a retry will recover tabs.
       if (sessionLost) {
         errorPayload.sessionLost = true;
+        errorPayload.backupFormat = "json";
         errorPayload.exportedWorkspaces = sessionLossExport?.folders ?? 0;
         errorPayload.exportedUrls = sessionLossExport?.urls ?? 0;
       }
@@ -1746,52 +1755,27 @@ class Brainer {
     return survivingUrlCount < snapshotUrlCount * LIMITS.SESSION_LOSS_SURVIVAL_RATIO;
   }
 
-  // Stable fingerprint of the exportable snapshot content. Used to make the
-  // automatic bookmark export idempotent: the same loss re-observed on a later
-  // start (identical workspace ids + snapshot URLs) is not exported again.
-  static _snapshotFingerprint(workspaces) {
-    const parts = workspaces
-      .map(w => w.id + ":" + (w.tabSnapshot || []).join("\n"))
-      .sort()
-      .join("\n\n");
-    let h = 5381;
-    for (let i = 0; i < parts.length; i++) {
-      h = ((h << 5) + h + parts.charCodeAt(i)) >>> 0;
-    }
-    return h + ":" + parts.length;
-  }
-
-  // Best-effort bookmark export of workspace URL snapshots. Never throws:
-  // the export is a safety net and must not block restore/repair.
-  // Deduplicated via a persisted content fingerprint -- for a user whose
-  // session store is wiped on every start, the same loss is re-detected at
-  // every launch and would otherwise mint duplicate folders without bound.
-  // Returns { folders, urls, deduped }; a failed export returns zeros WITHOUT
-  // storing the fingerprint, so the next start retries.
-  // Check, export and record run as one step under the export lock: two
-  // exporters (startup sweep, session-loss detection, Give up) overlapping
-  // could both pass the check and export the same content twice.
+  // Preserve complete snapshots before recovery commits. Native storage owns
+  // deduplication and rotation; old bookmark fingerprints prove no JSON exists.
+  // Never throw from the startup boundary: callers gate destructive steps on
+  // complete, keeping original records and retry state when writing fails.
   static async _exportSnapshotsSafe(workspaces) {
     try {
       return await WSPStorageManager.withSessionLossExportLock(async () => {
-        const fingerprint = Brainer._snapshotFingerprint(workspaces);
-        const known = await WSPStorageManager.getSessionLossExportFingerprints();
-        if (known.includes(fingerprint)) {
-          console.log("[Brainer][_exportSnapshotsSafe] identical snapshot content already exported -- skipping");
-          return { folders: 0, urls: 0, deduped: true };
-        }
-        const result = await BookmarkService.exportSnapshots(workspaces);
-        console.log("[Brainer][_exportSnapshotsSafe] exported", result.urls,
-          "URL(s) across", result.folders, "folder(s)");
-        if (result.folders > 0) {
-          await WSPStorageManager.addSessionLossExportFingerprint(fingerprint);
-        }
-        return { ...result, deduped: false };
+        const result = await LocalBackupService.exportSnapshots(workspaces);
+        return result;
       });
     } catch (e) {
       console.error("[Brainer][_exportSnapshotsSafe] export failed:", e?.message);
-      return { folders: 0, urls: 0, deduped: false };
+      return { folders: 0, urls: 0, deduped: false, complete: false };
     }
+  }
+
+  static _requireCompleteRecoveryBackup(result) {
+    if (result.complete !== false) return;
+    const error = new Error("Failed to save the recovery backup. Saved workspaces are unchanged; startup will retry.");
+    error.code = "RECOVERY_BACKUP_INCOMPLETE";
+    throw error;
   }
 
   // Surface incomplete startup recovery via the existing session-not-restored
@@ -1876,9 +1860,10 @@ class Brainer {
         snapshotUrlCount, "snapshot URL(s),", matched, "matched, 0 session-tagged");
       // Export FIRST, before any guard can skip it: the repair that follows
       // re-tags tabs and schedules snapshot refreshes that destroy this
-      // evidence. The fingerprint inside _exportSnapshotsSafe keeps repeats
+      // evidence. Native file deduplication keeps repeats
       // cheap and duplicate-free.
       const exported = await Brainer._exportSnapshotsSafe(workspaces);
+      Brainer._requireCompleteRecoveryBackup(exported);
       // Flag only when there is something new to say: an unrelated pending
       // banner keeps priority on the single-slot surface, and a deduplicated
       // re-observation of the same loss was already announced.
@@ -1895,9 +1880,11 @@ class Brainer {
         wspCount: workspaces.length,
         snapshotUrlCount,
         exportedWorkspaces: exported.folders,
+        backupFormat: "json",
         exportedUrls: exported.urls,
       });
     } catch (e) {
+      if (e?.code === "RECOVERY_BACKUP_INCOMPLETE") throw e;
       console.warn("[Brainer][_detectSessionLoss] failed:", e?.message);
     }
   }
@@ -1927,7 +1914,7 @@ class Brainer {
   // Runs fire-and-forget after init settles: orphan records have no live
   // tabs, so nothing here races the repair or snapshot-refresh machinery.
   // Never throws. No popup banner by design -- the exported folders surface
-  // through the existing "Restore from bookmarks" flow.
+  // through the existing "Backup history" flow.
   static async _recoverOrphanWorkspaces() {
     try {
       const [snapshot, wins, primaryId, lastId] = await Promise.all([
@@ -1949,15 +1936,15 @@ class Brainer {
           "still owns", workspaces.length, "workspace(s),", exportable.length, "with snapshots");
         if (exportable.length > 0) {
           const exported = await Brainer._exportSnapshotsSafe(exportable);
-          if (exported.folders === 0 && !exported.deduped) {
+          if (exported.complete === false || (exported.folders === 0 && !exported.deduped)) {
             // Export failed outright: keep the records so the next start
-            // retries. Detaching now would strand data with no bookmark copy.
+            // retries. Detaching now would strand data with no JSON copy.
             console.warn("[Brainer][_recoverOrphanWorkspaces] export failed for window",
               windowId, "-- keeping records for retry");
             continue;
           }
         }
-        // Data (if any) is in bookmarks; drop only the window-keyed indexes.
+        // Data (if any) is in JSON files; drop only the window-keyed indexes.
         // Per-workspace ld-wsp-{id} records stay for the diagnostics dump.
         await WSPStorageManager.detachWindow(windowId);
         console.warn("[Brainer][_recoverOrphanWorkspaces] detached dead window", windowId);
@@ -2065,21 +2052,10 @@ class Brainer {
     const needsTag = []; // [tabId, wspId] for tabs we assign that had no session value
     for (const [id, sv] of sessionOf) desiredOf.set(id, sv);
 
-    const snapshotByWsp = new Map();
-    if (useUrlFallback) {
-      for (const w of workspaces) {
-        if (w.tabSnapshot && w.tabSnapshot.length > 0) snapshotByWsp.set(w.id, [...w.tabSnapshot]);
-      }
-    }
+    const fallback = useUrlFallback ? RestoreMatcher.match(workspaces, tabs, sessionOf) : new Map();
     for (const t of tabs) {
       if (sessionOf.has(t.id)) continue;
-      let target = null;
-      if (useUrlFallback && t.url) {
-        for (const [wspId, urls] of snapshotByWsp) {
-          const idx = urls.indexOf(t.url);
-          if (idx !== -1) { target = wspId; urls.splice(idx, 1); break; }
-        }
-      }
+      let target = fallback.get(t.id);
       if (!target && filedUnder.has(t.id)) target = filedUnder.get(t.id);
       if (target) {
         desiredOf.set(t.id, target);
@@ -2174,7 +2150,7 @@ class Brainer {
     // that fired after init): they would land between the repair's writes
     // and could overwrite the snapshots the session-loss check reads.
     // Re-armed once the repair is done.
-    const deferred = TabService._cancelSnapshotRefreshes(windowId);
+    const deferred = SnapshotService.cancel(windowId);
     try {
       if (restartLikely) {
         await Brainer._assertRestoreHasContent(
@@ -2194,7 +2170,7 @@ class Brainer {
       await Brainer._reconcileLateTabs(windowId);
       return corrected;
     } finally {
-      for (const wspId of deferred) TabService._scheduleSnapshotRefresh(windowId, wspId);
+      for (const wspId of deferred) SnapshotService.schedule(windowId, wspId);
     }
   }
 
@@ -2311,7 +2287,7 @@ class Brainer {
       await Promise.all(tabs.map(tab => TabService.setTabSessionValue(tab.id, wspId)));
       // Keep tabSnapshot fresh for restart resilience (IC3) -- this site
       // mutates tabs[] without going through TabService.addTabToWorkspace.
-      TabService._scheduleSnapshotRefresh(windowId, wspId);
+      SnapshotService.schedule(windowId, wspId);
       if (!wspActive) {
         toHide.push(...tabs.map(t => t.id));
       } else {
@@ -2331,7 +2307,7 @@ class Brainer {
       for (const tab of noSession) WorkspaceService.addTabToActiveCache(tab.id, activeWsp.id);
       toShow.push(...noSession.filter(t => t.hidden).map(t => t.id));
       // Keep tabSnapshot fresh for restart resilience (IC3).
-      TabService._scheduleSnapshotRefresh(windowId, activeWsp.id);
+      SnapshotService.schedule(windowId, activeWsp.id);
       console.log("[Brainer][_reconcileLateTabs] assigned", noSession.length, "untagged tabs to active workspace");
     }
 
@@ -2563,7 +2539,7 @@ class Brainer {
       try {
         const cache = WorkspaceService._activeCache;
         if (cache?.windowId === tab.windowId && cache.activeWspId && cache.tabIds.has(tabId)) {
-          TabService._scheduleSnapshotRefresh(tab.windowId, cache.activeWspId);
+          SnapshotService.schedule(tab.windowId, cache.activeWspId);
           return;
         }
         const workspaces = await WSPStorageManager.getWorkspaces(tab.windowId);
@@ -2571,7 +2547,7 @@ class Brainer {
         // snapshots must survive until the startup checks finish.
         if (Brainer._state !== 'ready') return;
         const owner = workspaces.find(wsp => wsp.windowId === tab.windowId && wsp.tabs.includes(tabId));
-        if (owner) TabService._scheduleSnapshotRefresh(tab.windowId, owner.id);
+        if (owner) SnapshotService.schedule(tab.windowId, owner.id);
       } catch (e) {
         console.debug("[Brainer][onUpdated/snapshot] owner lookup failed:", e.message);
       }

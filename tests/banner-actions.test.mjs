@@ -13,6 +13,8 @@ import { makeWorld, seedWorkspaces, WSP_A, WSP_B } from "./helpers/world.mjs";
 
 process.on("unhandledRejection", () => {});
 
+import { completeSnapshots, nativeBackup } from "./helpers/native-backup.mjs";
+
 const ERROR_KEY = "ld-wsp-last-restore-error";
 
 async function boot(world, t) {
@@ -25,7 +27,7 @@ async function boot(world, t) {
 // Detected restart into window 1, which shows only the homepage: the
 // restore is refused (refuse-to-wipe). Firefox numbered the new window 1,
 // the id the workspaces were stored under.
-function refusedStartWorld({ onBookmark = null } = {}) {
+function refusedStartWorld({ onBackup = null } = {}) {
   const storage = seedWorkspaces(1, [
     { id: WSP_A, name: "A", active: true, tabs: [51, 52], tabSnapshot: ["https://a.test/1", "https://a.test/2"] },
     { id: WSP_B, name: "B", tabs: [53], tabSnapshot: ["https://b.test/3"] },
@@ -38,19 +40,14 @@ function refusedStartWorld({ onBookmark = null } = {}) {
     storage,
     sessionAlive: false,
   });
-  const bookmarks = [];
-  world.overrides.bookmarks = {
-    create: async (b) => {
-      if (onBookmark) await onBookmark(b, bookmarks);
-      bookmarks.push(b);
-      return { id: "bm-" + bookmarks.length, type: b.url ? "bookmark" : "folder", ...b };
-    },
-  };
-  return { world, bookmarks };
+  completeSnapshots(storage);
+  const native = nativeBackup({ onWrite: onBackup || (async () => {}) });
+  world.overrides.runtime = native.runtime;
+  return { world, backups: native.archives };
 }
 
 test("X-34/X-71: Give up exports, detaches the old index and starts over in the current window at once", async (t) => {
-  const { world, bookmarks } = refusedStartWorld();
+  const { world, backups } = refusedStartWorld();
   const { B, send } = await boot(world, t);
   assert.equal(world.storage[ERROR_KEY]?.reason, "refuse-to-wipe");
   assert.equal(B._state, "uninitialized");
@@ -60,7 +57,7 @@ test("X-34/X-71: Give up exports, detaches the old index and starts over in the 
 
   assert.equal(reply.success, true);
   assert.equal(reply.exportedWorkspaces, 2);
-  assert.deepEqual(bookmarks.filter((b) => b.url).map((b) => b.url).sort(),
+  assert.deepEqual(backups.flatMap(a => a.workspaces.flatMap(w => w.snapshot.tabs.map(t => t.url))).sort(),
     ["https://a.test/1", "https://a.test/2", "https://b.test/3"]);
   assert.equal(B._state, "ready", "used to stay inert until the next Firefox start");
   assert.equal(world.storage["primary-window-id"], 1);
@@ -125,7 +122,7 @@ test("X-72: a warning written while Give up exports is not cleared with the one 
   let injected = false;
   let env;
   const { world } = refusedStartWorld({
-    onBookmark: async () => {
+    onBackup: async () => {
       if (injected) return;
       injected = true;
       await env.get("WSPStorageManager").setLastRestoreError({ when: 999, reason: "session-not-restored", wspCount: 1 });
